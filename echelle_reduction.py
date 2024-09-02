@@ -10,13 +10,13 @@ from astropy.io import fits
 from scipy.ndimage import minimum_filter, maximum_filter, median_filter, gaussian_filter, uniform_filter1d
 from scipy.interpolate import interp1d, CubicSpline
 from scipy.optimize import curve_fit
+from astropy.stats import sigma_clip
+from estimate_noise import estimate_noise
 
 two_log_two = 2 * np.sqrt(2 * np.log(2))
 
-
-def polynomial(x, a, b, c, d):  
+def polynomial(x, a, b, c, d):
     return a * x ** 3 + b * x ** 2 + c * x + d
-
 
 class SpectralOrder:
     def __init__(self, id):
@@ -34,7 +34,11 @@ class SpectralOrder:
         self.comparison = None
         self.bias = None
 
+        self.cal_pix = None
+        self.cal_wl = None
         self.wl = None
+        self.cal_pix_fwhm = None
+        self.cal_wl_fwhm = None
 
     def __len__(self):
         return len(self.pixel_x)
@@ -167,6 +171,11 @@ class SpectralSlice:
 def Gaussian(x, A, mu=0, sigma=1):
     return A * (1 / (sigma * np.sqrt(2 * np.pi))) * np.exp(-0.5 * ((x - mu) / sigma) ** 2)
 
+def Gaussian_res(x, A, mu=0, sigma=1):
+    oversample = 10
+    xfull = np.linspace(np.min(x), np.max(x), len(x)*oversample)
+    yfull = Gaussian(xfull, A, mu=mu, sigma=sigma)
+    return spectres(x, xfull, yfull, fill=0, verbose=False)
 
 def pair_generation(arr1, arr2):
     pairs = []
@@ -296,7 +305,7 @@ def parse_idcomp(file_path):
 
 
 def slice_analysis(pixel, slice_x, slice_y, MIN_WINDOW=15, MAX_WINDOW=15, NOISE_MEASURE_SECTION_WIDTH=0.05,
-                   NOISE_CUTOFF=20, CUTTOFF_MARGIN=5, ORDER_GAUSS_THRESHOLD=0.7, DEBUG_PLOTS=False, **kwargs):
+                   NOISE_CUTOFF=20, CUTTOFF_MARGIN=5, ORDER_GAUSS_THRESHOLD=0.6, DEBUG_PLOTS=False, **kwargs):
     min_slice = minimum_filter(slice_y, size=MIN_WINDOW)
 
     slice_y -= min_slice
@@ -316,7 +325,7 @@ def slice_analysis(pixel, slice_x, slice_y, MIN_WINDOW=15, MAX_WINDOW=15, NOISE_
 
     if DEBUG_PLOTS:
         plt.plot(slice_x, slice_y)
-        plt.axhline(noise_lvl)
+        plt.axhline(noise_lvl, color="orange")
         plt.axvline(lo_ind, color='r')
         plt.axvline(hi_ind, color='r')
         plt.tight_layout()
@@ -329,17 +338,16 @@ def slice_analysis(pixel, slice_x, slice_y, MIN_WINDOW=15, MAX_WINDOW=15, NOISE_
     slice_y /= max_slice
 
     filtered_indices = slice_x[slice_y > ORDER_GAUSS_THRESHOLD]
-
     peaks = np.split(filtered_indices, np.where(np.diff(filtered_indices) != 1)[0] + 1)
     peaks = [peak for peak in peaks if len(peak) > 1]
 
     peak_locations = [np.mean(p) for p in peaks]
-    #print(f"Identified {len(peaks)} orders!")
+#    print(f"Identified {len(peaks)} orders @ x = {pixel}")
 
     if DEBUG_PLOTS:
-        plt.plot(slice_x, slice_y)
         for l in peak_locations:
-            plt.axvline(l)
+            plt.axvline(l, color="gray")
+        plt.plot(slice_x, slice_y)
         plt.tight_layout()
         plt.show()
 
@@ -369,7 +377,7 @@ def slice_analysis(pixel, slice_x, slice_y, MIN_WINDOW=15, MAX_WINDOW=15, NOISE_
                                  maxfev=100000)
 
         if DEBUG_PLOTS:
-            plt.plot(x_neighborhood, Gaussian(x_neighborhood, *params))
+            plt.plot(x_neighborhood, Gaussian(x_neighborhood, *params), color="r")
         fit_params.append(params)
 
         errs = np.sqrt(np.diag(errs))
@@ -403,23 +411,27 @@ def open_or_coadd_frame(frame, get_add_info=False):
         if get_add_info:
             header = frame[0].header
             header = dict(header)
+            hreq = ["LATITUDE", "LONGITUD", "HEIGHT",
+                    "RA", "DEC", "DATE-OBS", "UT"]
+            if all(i in header for i in hreq):
+                lat = header['LATITUDE']
+                lon = header['LONGITUD']
 
-            lat = header['LATITUDE']
-            lon = header['LONGITUD']
+                height = header['HEIGHT']
+                RA = header['RA']
+                DEC = header['DEC']
 
-            height = header['HEIGHT']
-            RA = header['RA']
-            DEC = header['DEC']
+                time = Time(header["DATE-OBS"]+"T"+header["UT"], format='isot', scale='utc')
 
-            time = Time(header["DATE-OBS"]+"T"+header["UT"], format='isot', scale='utc')
+                location = EarthLocation(lat=lat, lon=lon, height=height)
+                coord = SkyCoord(ra=RA, dec=DEC, unit=(u.hourangle, u.deg))
+                radvel_corr = coord.radial_velocity_correction(obstime=time, location=location)
+                radvel_corr = radvel_corr.to(u.km / u.s)
+                radvel_corr = radvel_corr.value
 
-            location = EarthLocation(lat=lat, lon=lon, height=height)
-
-            radvel_corr = SkyCoord(ra=RA, dec=DEC, unit=(u.hourangle, u.deg)).radial_velocity_correction(obstime=time, location=location)
-            radvel_corr = radvel_corr.to(u.km / u.s)
-            radvel_corr = radvel_corr.value
-
-            return frame[0].data, radvel_corr
+                return frame[0].data, radvel_corr
+            else:
+                return frame[0].data, None
 
         else:
             frame = frame[0].data
@@ -431,58 +443,6 @@ def find_nearest(array, value):
     array = np.asarray(array)
     idx = (np.abs(array - value)).argmin()
     return array[idx]
-
-
-def markov_gaussian(x, amp, mean, std):
-    return amp * np.exp(-(x - mean) ** 2 / (2 * std ** 2))
-
-
-def get_montecarlo_results(DEBUG_PLOTS=False):
-    i = 0
-    data_list = []
-    while os.path.isfile(f"mcmkc_output{i}.txt"):
-        print(i)
-        data_list.append(np.loadtxt(f"mcmkc_output{i}.txt", delimiter=",", dtype=float))
-        i += 1
-
-    data = np.concatenate(data_list)
-
-    threshold = np.percentile(data[:, -1], 0.1)
-    data = data[data[:, -1] < threshold]
-
-    params = []
-    nbins = int(np.ceil(2 * (len(data[:, -1]) ** (1 / 3))))
-
-    for i in range(4):
-        print(i, nbins)
-        hist, bin_edges = np.histogram(data[:, i], weights=1 / data[:, -1], bins=nbins)
-        bin_centers = (bin_edges[:-1] + bin_edges[1:]) / 2
-
-        # Fit the Gaussian to the histogram data
-        popt, pcov = curve_fit(markov_gaussian, bin_centers, hist,
-                               p0=[np.max(hist), bin_centers[np.argmax(hist)], np.std(data[:, i])], maxfev=1000000)
-
-        # Extract the fitting parameters and their errors
-        amp, mean, std = popt
-        amp_err, mean_err, std_err = np.sqrt(np.diag(pcov))
-
-        # Print the fitting parameters and their errors
-        print(f"Parameter {i}")
-        print(f"Amplitude: {amp} ± {amp_err}")
-        print(f"Mean: {mean} ± {mean_err}")
-        print(f"Standard Deviation: {std} ± {std_err}")
-
-        params.append(mean)
-        if DEBUG_PLOTS:
-            plt.hist(data[:, i], weights=1 / data[:, -1], bins=nbins, alpha=0.6, label='Data')
-            x_fit = np.linspace(bin_edges[0], bin_edges[-1], 1000)
-            y_fit = markov_gaussian(x_fit, *popt)
-            plt.plot(x_fit, y_fit, color='red', label='Gaussian fit')
-            plt.xlabel('Data')
-            plt.ylabel('Frequency')
-            plt.legend()
-            plt.show()
-    return params
 
 
 class WavelenthPixelTransform():
@@ -521,12 +481,18 @@ def solve_wavelength(linetable, order: SpectralOrder, pixel_window=10, DEBUG_PLO
     pixels = np.arange(len(order.comparison)) + 1
     actual_positions = []
     actual_errors = []
+    fwhm_pix = []
+
     for l in line_px:
         px_window = np.logical_and(pixels > l - pixel_window, pixels < l + pixel_window)
         pwin = pixels[px_window]
         intensities = order.comparison[px_window]
 
-        params, errs = curve_fit(Gaussian, pwin, intensities,
+        # replace with Levenberg-Marquardt fit (lmfit)
+        # remove bad fits (assume snr = 100), cut on rchi^2
+        # possibly resample
+        # extrapolate solutions, iterative identification with ThAr lines
+        params, errs = curve_fit(Gaussian_res, pwin, intensities,
                                  p0=[1, l, pixel_window / 4],
                                  bounds=[
                                      [0, l - pixel_window / 2, 0],
@@ -538,14 +504,44 @@ def solve_wavelength(linetable, order: SpectralOrder, pixel_window=10, DEBUG_PLO
 
         actual_positions.append(params[1])
         actual_errors.append(errs[1])
+        fwhm_pix.append(params[2]*two_log_two)
         if DEBUG_PLOT:
-            plt.plot(pwin, Gaussian(pwin, *params))
+            plt.plot(pwin, Gaussian_res(pwin, *params), color="red", zorder=20)
+
     actual_positions = np.array(actual_positions)
     actual_errors = np.array(actual_errors)
+    fwhm_pix = np.array(fwhm_pix)
 
     if DEBUG_PLOT:
-        plt.plot(pixels, order.comparison)
+        plt.plot(pixels, order.comparison, zorder=10)
         plt.show()
+
+    # this depends on the spectrograph!
+    too_wide_pix = 6
+    too_narrow_pix = 2.5
+
+    mask_good = (fwhm_pix < too_wide_pix) & (fwhm_pix > too_narrow_pix)
+
+    not_enough_lines = (np.sum(mask_good) < 5)
+    if not_enough_lines:
+        mask_good = (fwhm_pix < 9) & (fwhm_pix > 2)
+    not_enough_lines = (np.sum(mask_good) < 5)
+    if not_enough_lines:
+        mask_good = np.ones(len(fwhm_pix)).astype(bool)
+    if (np.sum(mask_good) < 5):
+        raise Exception("Not enough calibration lines in order %d" % order.id)
+
+    if DEBUG_PLOT:
+        plt.scatter(actual_positions[~mask_good], fwhm_pix[~mask_good], zorder=10, color="gray")
+        plt.scatter(actual_positions[mask_good], fwhm_pix[mask_good], zorder=11, color="black")
+        plt.axhline(too_wide_pix, ls="--", c="red")
+        plt.axhline(too_narrow_pix, ls="--", c="red")
+        plt.show()
+
+    actual_positions = actual_positions[mask_good]
+    actual_errors = actual_errors[mask_good]
+    fwhm_pix = fwhm_pix[mask_good]
+    line_wls = line_wls[mask_good]
 
     # threshold = np.percentile(actual_errors, 0.9)
     # actual_positions = actual_positions[actual_errors <= threshold]
@@ -553,8 +549,19 @@ def solve_wavelength(linetable, order: SpectralOrder, pixel_window=10, DEBUG_PLO
 
     params, errs = curve_fit(polynomial, actual_positions, line_wls, sigma=actual_errors)
 
-    order.wl = polynomial(pixels, *params)
+    pix_width = [np.mean(np.diff(polynomial(np.arange(3)+i-1,*params))) for i in actual_positions]
+    pix_width = np.abs(pix_width)
+    fwhm_angstrom = fwhm_pix * np.array(pix_width)
 
+    order.wl = polynomial(pixels, *params)
+    order.cal_pix = actual_positions
+    order.cal_wl = line_wls
+    order.cal_pix_fwhm = fwhm_pix
+    order.cal_wl_fwhm = fwhm_angstrom
+
+    if DEBUG_PLOT:
+        plt.scatter(order.cal_wl, order.cal_wl/fwhm_angstrom, zorder=10)
+        plt.show()
 
 def plot_order_list(olist: list[SpectralOrder]):
     for o in olist:
@@ -581,63 +588,18 @@ def find_neighbors(arr, target):
         # Normal case, the target is between two elements
         return arr[idx - 1], arr[idx]
 
-
-def generate_wl_grid(wl, resolution=50000, sampling=2.7):
+def generate_wl_grid(wl, resolution=45000, sampling=2.7):
     temp = (2 * sampling * resolution + 1) / (2 * sampling * resolution - 1)
     nwave = np.ceil(np.log(wl.max() / wl.min()) / np.log(temp))
-    t2 = np.arange(nwave)
-    new_grid = temp ** t2 * wl.min()
+    if wl.min() > 0 and np.isfinite(nwave):
+        t2 = np.arange(nwave)
+        new_grid = temp ** t2 * wl.min()
+    else:
+        print("WARNING: could not find nwave, using old grid")
+        new_grid = wl
     return new_grid
 
-
-def resample_spectrum(wl, flx):
-    new_grid = generate_wl_grid(wl)
-
-    resampled_flux = np.zeros_like(new_grid)
-    diffs = np.diff(new_grid)
-
-    for i, nwl in enumerate(new_grid):
-        if i == 0:
-            mask = wl < nwl + diffs[0]
-            weigths = wl[mask]
-            weigths[weigths < nwl] = 1
-            weigths[weigths > nwl] = (nwl + diffs[0] - weigths[weigths > nwl]) / diffs[0]
-
-        elif i == len(new_grid) - 1:
-            mask = wl > nwl - diffs[-1]
-            weigths = wl[mask]
-            weigths[weigths < nwl] = (weigths[weigths < nwl] - (nwl - diffs[0])) / diffs[0]
-            weigths[weigths > nwl] = 1
-
-        else:
-            mask = np.logical_and(wl > nwl - diffs[i - 1], wl < nwl + diffs[i])
-            weigths = wl[mask]
-            weigths[weigths < nwl] = (weigths[weigths < nwl] - (nwl - diffs[0])) / diffs[0]
-            weigths[weigths > nwl] = (nwl + diffs[0] - weigths[weigths > nwl]) / diffs[0]
-
-        resampled_flux[i] = np.sum(flx[mask] * weigths) / np.sum(weigths)
-
-    return new_grid, resampled_flux
-
-
-def bin_median(x, y, num_bins):
-    # Sort x and y according to x
-    sorted_indices = np.argsort(x)
-    x_sorted = x[sorted_indices]
-    y_sorted = y[sorted_indices]
-
-    # Bin the data
-    bins = np.linspace(x_sorted.min(), x_sorted.max(), num_bins + 1)
-    bin_indices = np.digitize(x_sorted, bins)
-
-    # Compute the binned x and y arrays
-    x_binned = np.array([x_sorted[bin_indices == i].mean() for i in range(1, len(bins))])
-    y_binned = np.array([np.median(y_sorted[bin_indices == i]) for i in range(1, len(bins))])
-
-    return x_binned, y_binned
-
-
-def filter_intervals(x, y, intervals):
+def mask_intervals(x, intervals):
     # Initialize a mask that is True for all elements
     mask = np.ones_like(x, dtype=bool)
 
@@ -646,36 +608,56 @@ def filter_intervals(x, y, intervals):
         lower_bound, upper_bound = interval
         mask &= ~((x >= lower_bound) & (x <= upper_bound))
 
-    # Apply the mask to filter x and y
-    x_filtered = x[mask]
-    y_filtered = y[mask]
+    return mask
 
-    return x_filtered, y_filtered
+def proper_normalization(wls, flxs,
+                         ignore_windows=[(4090, 4110), (4320, 4355),
+                                         (4842, 4888), (6540, 6590),
+                                         (6860, 6880),
+                                         (6888.1, 6890.5), (6892,6893.6),
+                                         (7590, 7617), (7622.8, 7625)],
+                         DEBUG_PLOTS=False):
 
-
-def proper_normalization(wls, flxs, ignore_windows=[(4090, 4110), (4320,4360), (4840, 4890), (6540,6590), (6860, 6880), (7590, 7620)], med_window_size=200, min_window_size=4, DEBUG_PLOTS=False):
     for i, wl in enumerate(wls):
         flx = flxs[i]
 
-        wl_for_interpol, flx_for_interpol = bin_median(wl, flx, int(len(flx) / med_window_size))
-        wl_for_interpol, flx_for_interpol = filter_intervals(wl_for_interpol, flx_for_interpol, ignore_windows)
+        mask = mask_intervals(wl, ignore_windows)
+        wl_for_interpol = wl[mask]
+        flx_for_interpol = flx[mask]
 
-        if DEBUG_PLOTS:
-            plt.scatter(wl_for_interpol, flx_for_interpol, color="red", marker="x", zorder=10)
+        # clip some extreme outliers before the first fit
+        mask = ~sigma_clip(flx_for_interpol,
+                           sigma_lower=10,
+                           sigma_upper=10,
+                           axis=0, masked=True).mask
 
-        #spline = CubicSpline(wl_for_interpol, flx_for_interpol)
-        params, errs = curve_fit(polynomial,
-                                 wl_for_interpol,
-                                 flx_for_interpol)
-        
-        
-        
-        if DEBUG_PLOTS:
-            lins = np.linspace(wl.min(), wl.max(), 10000)
-            plt.plot(lins, spline(lins), color="blue")
-        #flx /= spline(wl)
-        flx /= polynomial(wl, *params)
+        sigmas_lo = [6, 4, 3, 2, 1.7]
+        sigmas_hi = [6, 5, 4, 4, 3]
+        nit = len(sigmas_lo)
+        for k in range(nit):
+            params, errs = curve_fit(polynomial,
+                                     wl_for_interpol[mask],
+                                     flx_for_interpol[mask])
+            flx_cont = polynomial(wl_for_interpol, *params)
+            mask = ~sigma_clip(flx_for_interpol/flx_cont,
+                               sigma_lower=sigmas_lo[k],
+                               sigma_upper=sigmas_hi[k],
+                               masked=True,
+                               axis=0).mask
+        flx_cont = polynomial(wl, *params)
+        flx /= flx_cont
         flxs[i] = flx
+
+        if DEBUG_PLOTS:
+            colors_good = ["navy", "black"]
+            color_bad = ["cadetblue", "gray"]
+            color_model = ["darkorange", "red"]
+            plt.scatter(wl_for_interpol[~mask], flx_for_interpol[~mask],
+                        marker=".", zorder=10, color=color_bad[i%2])
+            plt.scatter(wl_for_interpol[mask], flx_for_interpol[mask],
+                        marker=".", zorder=11, color=colors_good[i%2])
+            plt.plot(wl, flx_cont, color=color_model[i%2], zorder=12)
+
 
         # hiflx = flx[int(0.8*len(flx)):int(0.9*len(flx))]
         # loflx = flx[int(0.1*len(flx)):int(0.2*len(flx))]
@@ -700,10 +682,14 @@ def proper_normalization(wls, flxs, ignore_windows=[(4090, 4110), (4320,4360), (
 
         # flxs[i+1] *= fac
 
+    if DEBUG_PLOTS:
+        plt.show()
+
     return flxs
 
 
-def puzzle_orders_together(olist: list[SpectralOrder], normalize=False, margin=20, uppermost_wl=8500, DEBUG_PLOTS=False):
+def merge_orders(olist: list[SpectralOrder], normalize=False, margin=20, uppermost_wl=8500,
+                 resolution=50000, DEBUG_PLOTS=False):
     common_wl_array = [o.wl[margin:-margin] for o in olist if o.wl.min() < uppermost_wl]
     common_flx_array = [o.science[margin:-margin] for o in olist if o.wl.min() < uppermost_wl]
 
@@ -719,8 +705,7 @@ def puzzle_orders_together(olist: list[SpectralOrder], normalize=False, margin=2
     common_wl_array = common_wl_array[mask]
     common_flx_array = common_flx_array[mask]
 
-    # common_wl_array, common_flx_array = resample_spectrum(common_wl_array, common_flx_array)
-    new_grid = generate_wl_grid(common_wl_array)
+    new_grid = generate_wl_grid(common_wl_array, resolution=resolution)
     common_flx_array = spectres(new_grid, common_wl_array, common_flx_array)
     common_wl_array = new_grid
 
@@ -742,14 +727,14 @@ def rolling_std(arr, window):
 def rmcosmics(wl, flx):
     mean_filtered = uniform_filter1d(flx, size=10)
     std_filtered = rolling_std(flx, window=50)
-    
-    mask = flx < 3*std_filtered+mean_filtered
-    
+    mask = flx < 3 * std_filtered + mean_filtered
     return wl[mask], flx[mask]
-    
 
-
-def extract_spectrum(spectrum, flats, comps, biases, idcomp_offset=-15, normalize=False, idcomp_dir="idcomp", sampling=75, min_order_samples=10, DEBUG_PLOTS=False, **kwargs):
+def extract_spectrum(spectrum, flats, comps, biases, idcomp_offset=-15,
+                     normalize=False, idcomp_dir="idcomp",
+                     sampling=75, min_order_samples=10,
+                     apply_barycorr=True,
+                     DEBUG_PLOTS=False, **kwargs):
     spectrum, radvel = open_or_coadd_frame(spectrum, True)
     flats = open_or_coadd_frame(flats)
     comps = open_or_coadd_frame(comps)
@@ -762,11 +747,10 @@ def extract_spectrum(spectrum, flats, comps, biases, idcomp_offset=-15, normaliz
         pixel = i * int(flats.shape[1] / sampling) + int(flats.shape[1] / (2 * sampling)) + 1
         slice_y = flats[:, pixel - 1].astype(float)
         slice_x = np.arange(flats.shape[1])
-
         slices.append(slice_analysis(pixel - 1, slice_x, slice_y), **kwargs)
 
     if DEBUG_PLOTS:
-        plt.imshow(flats, zorder=1, cmap='gray')
+        plt.imshow(flats, zorder=1, cmap='gray', norm="log")
         for slice in slices:
             plt.scatter([np.repeat(slice.x, len(slice.ys))], slice.ys, marker="x", zorder=2)
         plt.tight_layout()
@@ -798,10 +782,12 @@ def extract_spectrum(spectrum, flats, comps, biases, idcomp_offset=-15, normaliz
 
     orders = [item for i, item in enumerate(orders) if i not in o_to_be_removed]
 
-    print(f"{len(orders)} orders found!")
+    print(f"{len(orders)} orders found")
 
     if DEBUG_PLOTS:
         plt.imshow(flats, zorder=1, cmap='gray')
+        for slice in slices:
+            plt.scatter([np.repeat(slice.x, len(slice.ys))], slice.ys, marker="x", zorder=2)
         for o in orders:
             # plt.scatter(o.pixel_x, o.pixel_y, marker="x", zorder=2)
             plt.plot(np.linspace(0, flats.shape[1], 2000), o.evaluate(np.linspace(0, flats.shape[1], 2000)))
@@ -846,11 +832,71 @@ def extract_spectrum(spectrum, flats, comps, biases, idcomp_offset=-15, normaliz
 
         solve_wavelength(linelist, o)
 
+    if DEBUG_PLOTS:
+        for o in orders:
+            plt.scatter(o.cal_pix, np.log10(o.cal_wl), zorder=10, lw=1)
+            plt.plot(np.arange(len(o.wl))+1, np.log10(o.wl), zorder=11, lw=1)
+        plt.show()
+
+    p = 0.6827
+    pl = 0.+0.5*(1.-p)
+    ph = 1.-0.5*(1.-p)
+    if DEBUG_PLOTS:
+        wl_med = []
+        res_med = []
+        res_qlo = []
+        res_qhi = []
+        res = []
+        for o in orders:
+            res_o = o.cal_wl/o.cal_wl_fwhm
+
+#            plt.scatter(o.cal_wl, o.cal_wl_fwhm, zorder=10, lw=1)
+            plt.scatter(o.cal_wl, res_o, zorder=10, lw=1)
+
+            quantile_lo = np.quantile(res_o, pl)
+            quantile_hi = np.quantile(res_o, ph)
+            wl_med.append(np.median(o.cal_wl))
+            res_med.append(np.median(res_o))
+            res_qlo.append(quantile_lo)
+            res_qhi.append(quantile_hi)
+        plt.plot(wl_med, res_med, color="black", lw=2, zorder=20, ls="-")
+        plt.plot(wl_med, res_qlo, color="black", lw=2, zorder=20, ls="--")
+        plt.plot(wl_med, res_qhi, color="black", lw=2, zorder=20, ls="--")
+        plt.xlabel(r"Wavelength  /  $\mathrm{\AA}$")
+        plt.ylabel(r"$\lambda$  /  $\Delta \lambda$")
+        plt.show()
+
+
+    # get rid of bad orders at edges
+    order_ltrim = 0
+#    order_rtrim = -10
+    order_rtrim = 47
+    orders = orders[order_ltrim:order_rtrim]
+    print("> using %d orders" % len(orders))
+
+    # estimate the median resolving power
+    res = []
+    for o in orders:
+        res_o = o.cal_wl/o.cal_wl_fwhm
+        res.extend(res_o)
+    res_qlo = np.quantile(res, pl)
+    res_qhi = np.quantile(res, ph)
+    res_med = np.median(res)
+
     # plot_order_list(orders)
-    wl_final, wl_flux = puzzle_orders_together(orders)
-    wl_final = wlshift(wl_final, radvel)
-    
-    wl_final, wl_flux = rmcosmics(wl_final, wl_flux)
+    print("R = %.0f^{+%.0f}_{-%.0f}" % (res_med, res_qhi-res_med, res_med-res_qlo))
+    wl_final, wl_flux = merge_orders(orders, resolution=res_qhi, DEBUG_PLOTS=DEBUG_PLOTS)
+
+    if apply_barycorr and (radvel is not None):
+        wl_final = wlshift(wl_final, radvel)
+
+    # this may remove all pixels ...
+#    wl_final, wl_flux = rmcosmics(wl_final, wl_flux)
+
+    mask = np.isfinite(wl_flux)
+
+    wl_final = wl_final[mask]
+    wl_flux = wl_flux[mask]
 
     return wl_final, wl_flux
 
