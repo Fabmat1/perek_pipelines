@@ -74,13 +74,15 @@ class SpectralOrder:
     def extract_along_order(self, image, type, times_sigma=2):
         if self.solution is None:
             raise Exception("Generate a solution first!")
-        self.generate_width_fcn()
+        if self.w_fcn is None:
+            self.generate_width_fcn()
 
         intensities = []
 
         for pixel in np.arange(image.shape[1]):
             sigma = self.w_fcn(pixel) / two_log_two
             width = times_sigma * sigma
+            width = np.clip(width, a_min=1, a_max=4)
             y_ind = self.evaluate(pixel)
             top = int(np.floor(y_ind + width))
             bot = int(np.ceil(y_ind - width))
@@ -308,8 +310,6 @@ def slice_analysis(pixel, slice_x, slice_y, MIN_WINDOW=15, MAX_WINDOW=15, NOISE_
                    NOISE_CUTOFF=20, CUTTOFF_MARGIN=5, ORDER_GAUSS_THRESHOLD=0.6, DEBUG_PLOTS=False, **kwargs):
     min_slice = minimum_filter(slice_y, size=MIN_WINDOW)
 
-    DEBUG_PLOTS = False
-
     slice_y -= min_slice
 
     lower_section = slice_y[:int(len(slice_y) * NOISE_MEASURE_SECTION_WIDTH)]
@@ -333,8 +333,8 @@ def slice_analysis(pixel, slice_x, slice_y, MIN_WINDOW=15, MAX_WINDOW=15, NOISE_
         plt.tight_layout()
         plt.show()
 
-    slice_y = slice_y[lo_ind:hi_ind]
     slice_x = slice_x[lo_ind:hi_ind]
+    slice_y = slice_y[lo_ind:hi_ind]
 
     max_slice = maximum_filter(slice_y, size=MAX_WINDOW)
     slice_y /= max_slice
@@ -347,9 +347,12 @@ def slice_analysis(pixel, slice_x, slice_y, MIN_WINDOW=15, MAX_WINDOW=15, NOISE_
 #    print(f"Identified {len(peaks)} orders @ x = {pixel}")
 
     if DEBUG_PLOTS:
-        for l in peak_locations:
+        for idx, l in enumerate(peak_locations):
             plt.axvline(l, color="gray")
+            plt.text(s=str(idx), x=l, y=1.1, rotation=90,
+                     va="center", ha="center")
         plt.plot(slice_x, slice_y)
+        plt.ylim(-0.05, 1.15)
         plt.tight_layout()
         plt.show()
 
@@ -379,6 +382,8 @@ def slice_analysis(pixel, slice_x, slice_y, MIN_WINDOW=15, MAX_WINDOW=15, NOISE_
                                  maxfev=100000)
 
         if DEBUG_PLOTS:
+            plt.text(s=str(i), x=peak_location, y=1.1, rotation=90,
+                     va="center", ha="center")
             plt.plot(x_neighborhood, Gaussian(x_neighborhood, *params), color="r")
         fit_params.append(params)
 
@@ -390,6 +395,7 @@ def slice_analysis(pixel, slice_x, slice_y, MIN_WINDOW=15, MAX_WINDOW=15, NOISE_
 
     if DEBUG_PLOTS:
         plt.plot(slice_x, slice_y)
+        plt.ylim(-0.05, 1.15)
         plt.tight_layout()
         plt.show()
 
@@ -755,7 +761,7 @@ def extract_spectrum(spectrum, flats, comps, biases, idcomp_offset=-15,
     slices = []
 
     # Get orders and stuff from flat
-    if verbose: print("- extracting orders")
+    if verbose: print("- identifying orders")
     for i in range(sampling):
         pixel = i * int(flats.shape[1] / sampling) + int(flats.shape[1] / (2 * sampling)) + 1
         slice_y = flats[:, pixel - 1].astype(float)
@@ -798,13 +804,22 @@ def extract_spectrum(spectrum, flats, comps, biases, idcomp_offset=-15,
 
     if verbose: print(f"- {len(orders)} orders found")
 
+    times_sigma = 2
+
     if DEBUG_PLOTS:
         plt.imshow(flats, zorder=1, cmap='gray')
         for slice in slices:
             plt.scatter([np.repeat(slice.x, len(slice.ys))], slice.ys, marker="x", zorder=2)
         for o in orders:
             # plt.scatter(o.pixel_x, o.pixel_y, marker="x", zorder=2)
-            plt.plot(np.linspace(0, flats.shape[1], 2000), o.evaluate(np.linspace(0, flats.shape[1], 2000)))
+            x = np.arange(flats.shape[1])
+            o.generate_width_fcn()
+            sigma = o.w_fcn(x) / two_log_two
+            width = times_sigma * sigma
+            width = np.clip(width, a_min=1, a_max=4)
+            pc = plt.plot(x, o.evaluate(x))
+            plt.plot(x, o.evaluate(x)-width, c=pc[0]._color, ls="--")
+            plt.plot(x, o.evaluate(x)+width, c=pc[0]._color, ls="--")
         plt.tight_layout()
         plt.show()
 
@@ -813,11 +828,8 @@ def extract_spectrum(spectrum, flats, comps, biases, idcomp_offset=-15,
     for file in os.listdir(idcomp_dir):
         if "idiazcomp" in file:
             aplo, aphi, table = parse_idcomp(idcomp_dir + "/" + file)
-
             avg_ap = (aplo + aphi) / 2
-
             linelists[avg_ap+idcomp_offset] = table
-
     avg_aps = np.array(list(linelists.keys()))
 
     if DEBUG_PLOTS:
@@ -826,12 +838,13 @@ def extract_spectrum(spectrum, flats, comps, biases, idcomp_offset=-15,
             plt.scatter([len(spectrum) / 2], [key], marker="x", zorder=2, color="red")
         plt.show()
 
+    if verbose: print("- extracting orders + solving dispersion relations")
     for o in orders:
         if verbose: print("- order", o.id, end="\r")
-        o.extract_along_order(spectrum, "science")
-        o.extract_along_order(flats, "flat")
-        o.extract_along_order(biases, "bias")
-        o.extract_along_order(comps, "comp")
+        o.extract_along_order(spectrum, "science", times_sigma=times_sigma)
+        o.extract_along_order(flats, "flat", times_sigma=times_sigma)
+        o.extract_along_order(biases, "bias", times_sigma=times_sigma)
+        o.extract_along_order(comps, "comp", times_sigma=times_sigma)
 
         o.apply_corrections()
 
@@ -899,6 +912,7 @@ def extract_spectrum(spectrum, flats, comps, biases, idcomp_offset=-15,
 
     # plot_order_list(orders)
     if verbose: print("- R = %.0f^{+%.0f}_{-%.0f}" % (res_med, res_qhi-res_med, res_med-res_qlo))
+    if verbose: print("- merging orders")
     wl_final, wl_flux = merge_orders(orders, resolution=res_qhi, DEBUG_PLOTS=DEBUG_PLOTS)
 
     if apply_barycorr and (radvel is not None):

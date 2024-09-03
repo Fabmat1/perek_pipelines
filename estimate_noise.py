@@ -42,26 +42,29 @@ def fill_nan(y):
 
     return y
 
-def estimate_noise(wave, flux, winsizeaa='guess'):
+def estimate_noise(wave, flux, winsize_aa='guess'):
     '''
-    Estimate uncertainty for each wavelength/flux point
-    by applying est_SNR() in window around each point
-    winsizeaa: window size in Angstrom (max: 10% of wave array
-                                        min: 20 pixel)
+    Estimate the uncertainty for each wavelength
+    by applying "estimate_noise_scalar" in a window around each pixel
+    winsize_aa: window size in Angstrom (max: 10% of wave array
+                                         min: 20 pixel)
+    if winsize_aa == "guess":
+        winsize_aa = 150 * (np.max(wave) - np.min(wave)) / len(wave)
+        -> widow width is set to 1/150 of the spectral range
     '''
 
     flux = np.array(flux)
 
-    if winsizeaa == 'guess':
-        winsizeaa = 150 * (np.max(wave) - np.min(wave)) / len(wave)
+    if winsize_aa == 'guess':
+        winsize_aa = 150 * (np.max(wave) - np.min(wave)) / len(wave)
 
     # for symmetric window, otherwise noise column is shifted
-    winsizeaa_half = winsizeaa / 2
+    winsize_aa_half = winsize_aa / 2
 
     # approx. translate Angstrom to pixel using average spacing
     avspacing = np.median([wave[i+1] - wave[i] for i in range(len(wave)-1)])
 
-    winsize_pix_av = int(winsizeaa_half / avspacing)
+    winsize_pix_av = int(winsize_aa_half / avspacing)
     winsize_min = 20
     winsize_max = int(len(wave)/10)
     winsize = max(min(winsize_pix_av, winsize_max), winsize_min)
