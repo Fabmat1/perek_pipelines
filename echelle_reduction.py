@@ -308,6 +308,8 @@ def slice_analysis(pixel, slice_x, slice_y, MIN_WINDOW=15, MAX_WINDOW=15, NOISE_
                    NOISE_CUTOFF=20, CUTTOFF_MARGIN=5, ORDER_GAUSS_THRESHOLD=0.6, DEBUG_PLOTS=False, **kwargs):
     min_slice = minimum_filter(slice_y, size=MIN_WINDOW)
 
+    DEBUG_PLOTS = False
+
     slice_y -= min_slice
 
     lower_section = slice_y[:int(len(slice_y) * NOISE_MEASURE_SECTION_WIDTH)]
@@ -610,7 +612,7 @@ def mask_intervals(x, intervals):
 
     return mask
 
-def proper_normalization(wls, flxs,
+def poly_normalization(wls, flxs,
                          ignore_windows=[(4090, 4110), (4320, 4355),
                                          (4842, 4888), (6540, 6590),
                                          (6860, 6880),
@@ -690,31 +692,40 @@ def proper_normalization(wls, flxs,
 
 def merge_orders(olist: list[SpectralOrder], normalize=False, margin=20, uppermost_wl=8500,
                  resolution=50000, DEBUG_PLOTS=False):
-    common_wl_array = [o.wl[margin:-margin] for o in olist if o.wl.min() < uppermost_wl]
-    common_flx_array = [o.science[margin:-margin] for o in olist if o.wl.min() < uppermost_wl]
+    common_wl = [o.wl[margin:-margin] for o in olist if o.wl.min() < uppermost_wl]
+    common_flx = [o.science[margin:-margin] for o in olist if o.wl.min() < uppermost_wl]
 
     if DEBUG_PLOTS:
-        for w, f in zip(common_wl_array, common_flx_array):
+        for w, f in zip(common_wl, common_flx):
             plt.plot(w, f)
-    common_flx_array = proper_normalization(common_wl_array, common_flx_array)
+    common_flx = poly_normalization(common_wl, common_flx, DEBUG_PLOTS=DEBUG_PLOTS)
 
-    common_wl_array = np.concatenate(common_wl_array)
-    common_flx_array = np.concatenate(common_flx_array)
+    # estimate noise for each order, to be used for the weights when merging
+#    common_noise = [estimate_noise(common_wl[k], common_flx[k]) for k in range(len(common_flx))]
 
-    mask = np.argsort(common_wl_array)
-    common_wl_array = common_wl_array[mask]
-    common_flx_array = common_flx_array[mask]
+    common_wl = np.concatenate(common_wl)
+    common_flx = np.concatenate(common_flx)
 
-    new_grid = generate_wl_grid(common_wl_array, resolution=resolution)
-    common_flx_array = spectres(new_grid, common_wl_array, common_flx_array)
-    common_wl_array = new_grid
+    mask = np.argsort(common_wl)
+    common_wl = common_wl[mask]
+    common_flx = common_flx[mask]
+
+    mask = np.isfinite(common_flx)
+    common_wl = common_wl[mask]
+    common_flx = common_flx[mask]
+
+    new_grid = generate_wl_grid(common_wl, resolution=resolution)
+    # this can only compute a "combined noise", but does not weigh pixels by SNR
+    common_flx  = spectres(new_grid, common_wl, common_flx,
+                           verbose=False)
+    common_wl = new_grid
 
     if DEBUG_PLOTS:
-        plt.plot(common_wl_array, common_flx_array)
+        plt.plot(common_wl, common_flx)
         plt.tight_layout()
         plt.show()
 
-    return common_wl_array, common_flx_array
+    return common_wl, common_flx
 
 def rolling_std(arr, window):
     cumsum = np.cumsum(np.insert(arr, 0, 0))
@@ -734,6 +745,7 @@ def extract_spectrum(spectrum, flats, comps, biases, idcomp_offset=-15,
                      normalize=False, idcomp_dir="idcomp",
                      sampling=75, min_order_samples=10,
                      apply_barycorr=True,
+                     verbose=False,
                      DEBUG_PLOTS=False, **kwargs):
     spectrum, radvel = open_or_coadd_frame(spectrum, True)
     flats = open_or_coadd_frame(flats)
@@ -743,11 +755,13 @@ def extract_spectrum(spectrum, flats, comps, biases, idcomp_offset=-15,
     slices = []
 
     # Get orders and stuff from flat
+    if verbose: print("- extracting orders")
     for i in range(sampling):
         pixel = i * int(flats.shape[1] / sampling) + int(flats.shape[1] / (2 * sampling)) + 1
         slice_y = flats[:, pixel - 1].astype(float)
         slice_x = np.arange(flats.shape[1])
-        slices.append(slice_analysis(pixel - 1, slice_x, slice_y), **kwargs)
+        slice = slice_analysis(pixel - 1, slice_x, slice_y, DEBUG_PLOTS=DEBUG_PLOTS, **kwargs)
+        slices.append(slice)
 
     if DEBUG_PLOTS:
         plt.imshow(flats, zorder=1, cmap='gray', norm="log")
@@ -782,7 +796,7 @@ def extract_spectrum(spectrum, flats, comps, biases, idcomp_offset=-15,
 
     orders = [item for i, item in enumerate(orders) if i not in o_to_be_removed]
 
-    print(f"{len(orders)} orders found")
+    if verbose: print(f"- {len(orders)} orders found")
 
     if DEBUG_PLOTS:
         plt.imshow(flats, zorder=1, cmap='gray')
@@ -795,7 +809,6 @@ def extract_spectrum(spectrum, flats, comps, biases, idcomp_offset=-15,
         plt.show()
 
     # Extract different spectra
-
     linelists = {}
     for file in os.listdir(idcomp_dir):
         if "idiazcomp" in file:
@@ -814,6 +827,7 @@ def extract_spectrum(spectrum, flats, comps, biases, idcomp_offset=-15,
         plt.show()
 
     for o in orders:
+        if verbose: print("- order", o.id, end="\r")
         o.extract_along_order(spectrum, "science")
         o.extract_along_order(flats, "flat")
         o.extract_along_order(biases, "bias")
@@ -872,7 +886,7 @@ def extract_spectrum(spectrum, flats, comps, biases, idcomp_offset=-15,
 #    order_rtrim = -10
     order_rtrim = 47
     orders = orders[order_ltrim:order_rtrim]
-    print("> using %d orders" % len(orders))
+    if verbose: print("- using %d orders" % len(orders))
 
     # estimate the median resolving power
     res = []
@@ -884,7 +898,7 @@ def extract_spectrum(spectrum, flats, comps, biases, idcomp_offset=-15,
     res_med = np.median(res)
 
     # plot_order_list(orders)
-    print("R = %.0f^{+%.0f}_{-%.0f}" % (res_med, res_qhi-res_med, res_med-res_qlo))
+    if verbose: print("- R = %.0f^{+%.0f}_{-%.0f}" % (res_med, res_qhi-res_med, res_med-res_qlo))
     wl_final, wl_flux = merge_orders(orders, resolution=res_qhi, DEBUG_PLOTS=DEBUG_PLOTS)
 
     if apply_barycorr and (radvel is not None):
@@ -898,8 +912,15 @@ def extract_spectrum(spectrum, flats, comps, biases, idcomp_offset=-15,
     wl_final = wl_final[mask]
     wl_flux = wl_flux[mask]
 
-    return wl_final, wl_flux
+    noise = estimate_noise(wl_final, wl_flux)
+
+    dout = {"wave": wl_final,
+            "flux": wl_flux,
+            "error": noise}
+
+    return dout
 
 
 if __name__ == "__main__":
-    extract_spectrum("e202109060016.fit", "e202109060010.fit", "e202109060011.fit", "e202109060004.fit")
+    spec = extract_spectrum("e202109060016.fit", "e202109060010.fit", "e202109060011.fit", "e202109060004.fit")
+    print(spec)
