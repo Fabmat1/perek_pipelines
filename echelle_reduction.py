@@ -9,7 +9,7 @@ import numpy as np
 from astropy.io import fits
 from scipy.ndimage import minimum_filter, maximum_filter, median_filter, gaussian_filter, uniform_filter1d
 from scipy.interpolate import interp1d, CubicSpline
-from scipy.optimize import curve_fit
+from scipy.optimize import curve_fit, least_squares
 from astropy.stats import sigma_clip
 from estimate_noise import estimate_noise
 
@@ -29,26 +29,57 @@ class SpectralOrder:
         self.solution_errors = None
         self.w_fcn = None
 
+        self.pixel_y_cen = None
+
         self.science = None
         self.flat = None
         self.comparison = None
         self.bias = None
 
+        self.wl = None
+        self.pix = None
+
+        self.cal_rms = None
         self.cal_pix = None
         self.cal_wl = None
-        self.wl = None
         self.cal_pix_fwhm = None
         self.cal_wl_fwhm = None
 
     def __len__(self):
         return len(self.pixel_x)
 
-    def generate_polynomial_solution(self):
+    def generate_polynomial_solution(self, yerr_default=1.5):
+        # yerr_default -> maximum rms (in pix) for an acceptable fit
+
         params, errs = curve_fit(polynomial, self.pixel_x, self.pixel_y, sigma=self.pixel_y_err)
         errs = np.sqrt(np.diag(errs))
 
-        self.solution = params
-        self.solution_errors = errs
+        nresid = len(self.pixel_y)
+
+        ypoly = polynomial(self.pixel_x, *params)
+        # root mean squared
+        rms = np.sqrt(np.sum(np.square(self.pixel_y - ypoly)) / nresid)
+
+        self.rms = rms
+
+        """
+        # estimate reduced chi2
+        nfree = 4
+        dof = nresid - nfree
+        # self.pixel_y_err
+        resid = (self.pixel_y - ypoly) / yerr_default
+        chi2 = np.sqrt(np.sum(np.square(resid)))
+        rchi2 = chi2 / dof
+        """
+
+        # only save decent fits
+        if rms < yerr_default:
+            self.solution = params
+            self.solution_errors = errs
+        else:
+            print("- identification failed for order", self.id)
+            self.solution = None
+            self.solution_errors = None
 
     def generate_width_fcn(self):
         self.w_fcn = interp1d(self.pixel_x, self.order_width, bounds_error=False, fill_value=np.mean(self.order_width))
@@ -173,23 +204,39 @@ class SpectralSlice:
 def Gaussian(x, A, mu=0, sigma=1):
     return A * (1 / (sigma * np.sqrt(2 * np.pi))) * np.exp(-0.5 * ((x - mu) / sigma) ** 2)
 
+
 def Gaussian_res(x, A, mu=0, sigma=1):
     oversample = 10
     xfull = np.linspace(np.min(x), np.max(x), len(x)*oversample)
     yfull = Gaussian(xfull, A, mu=mu, sigma=sigma)
     return spectres(x, xfull, yfull, fill=0, verbose=False)
 
-def pair_generation(arr1, arr2):
-    pairs = []
+
+def pair_generation(arr1, arr2, thres_max=5.5):
+    arr1 = np.array(arr1)
+    arr2 = np.array(arr2)
 
     distance_matrix = np.abs(arr1[:, np.newaxis] - arr2[np.newaxis, :])
+    # -> shape = (len(arr1), len(arr2))
 
+    pairs = []
+    pair_dists = []
     for i, row in enumerate(distance_matrix):
         next_index = np.argmin(row)
-        if np.min(distance_matrix[:, next_index]) == row[next_index]:
-            pairs.append((i, int(next_index)))
+        min_dist = np.min(distance_matrix[:, next_index])
+        if min_dist == row[next_index]:
+            pairs.append([i, int(next_index)])
+            pair_dists.append(min_dist)
         else:
-            pairs.append((i, None))
+            pairs.append([i, None])
+            pair_dists.append(np.nan)
+
+    mean_dist = np.nanmean(pair_dists)
+    std_dist = np.nanstd(pair_dists)
+
+    for i in range(len(pairs)):
+        if (pair_dists[i] > mean_dist+thres_max*std_dist):
+            pairs[i][1] = None
 
     return pairs
 
@@ -203,16 +250,18 @@ def assign_orders(slicelist: list[SpectralSlice], max_ind, DEBUG_PLOTS=False, **
     while curr_slice.next_slice is not None:
         curr_slice.clean_ownership()
 
-        results = pair_generation(curr_slice.ys, curr_slice.next_slice.ys)
+        # a slice (or column) is defined by a fixed x pixel and a number of y pixels
+        pair_idx = pair_generation(curr_slice.ys, curr_slice.next_slice.ys)
 
         curr_slice.next_slice.gen_empty_ownership()
 
-        for p in results:
+        for p in pair_idx:
             if p[1] is None:
                 continue
             curr_slice.next_slice.order_ownership[p[1]] = curr_slice.order_ownership[p[0]]
             if DEBUG_PLOTS:
-                plt.plot([curr_slice.x, curr_slice.next_slice.x], [curr_slice.ys[p[0]], curr_slice.next_slice.ys[p[1]]], color="red")
+                plt.plot([curr_slice.x, curr_slice.next_slice.x],
+                         [curr_slice.ys[p[0]], curr_slice.next_slice.ys[p[1]]], color="red")
 
         curr_slice = curr_slice.next_slice
     else:
@@ -223,19 +272,28 @@ def assign_orders(slicelist: list[SpectralSlice], max_ind, DEBUG_PLOTS=False, **
     while curr_slice.previous_slice is not None:
         curr_slice.clean_ownership()
 
-        results = pair_generation(curr_slice.ys, curr_slice.previous_slice.ys)
+        pair_idx = pair_generation(curr_slice.ys, curr_slice.previous_slice.ys)
         curr_slice.previous_slice.gen_empty_ownership()
 
-        for p in results:
+        for p in pair_idx:
             if p[1] is None:
                 continue
             curr_slice.previous_slice.order_ownership[p[1]] = curr_slice.order_ownership[p[0]]
             if DEBUG_PLOTS:
-                plt.plot([curr_slice.x, curr_slice.previous_slice.x], [curr_slice.ys[p[0]], curr_slice.previous_slice.ys[p[1]]], color="red")
+                plt.plot([curr_slice.x, curr_slice.previous_slice.x],
+                         [curr_slice.ys[p[0]], curr_slice.previous_slice.ys[p[1]]],
+                         color="blue", ls="--")
 
         curr_slice = curr_slice.previous_slice
     else:
         curr_slice.clean_ownership()
+
+    if DEBUG_PLOTS:
+        for s in slicelist:
+            plt.scatter(s.x*np.ones(len(s.ys)), s.ys, color="k", marker="x")
+
+        plt.gca().invert_yaxis()
+        plt.show()
 
     orders = {}
     for o in slicelist[max_ind].order_ownership:
@@ -244,14 +302,13 @@ def assign_orders(slicelist: list[SpectralSlice], max_ind, DEBUG_PLOTS=False, **
 
     for s in slicelist:
         for i, y in enumerate(s.ys):
+            this_owner = int(s.order_ownership[i])
             try:
-                this_owner = int(s.order_ownership[i])
                 orders[this_owner].pixel_y.append(y)
                 orders[this_owner].pixel_x.append(s.x)
                 orders[this_owner].pixel_y_err.append(s.y_errs[i])
                 orders[this_owner].order_width.append(s.widths[i])
             except KeyError:
-                this_owner = int(s.order_ownership[i])
                 orders[this_owner] = SpectralOrder(this_owner)
                 orders[this_owner].pixel_y.append(y)
                 orders[this_owner].pixel_x.append(s.x)
@@ -264,6 +321,52 @@ def assign_orders(slicelist: list[SpectralSlice], max_ind, DEBUG_PLOTS=False, **
         o.sort_self()
 
     return olist
+
+def assign_orders_polyfit(orders, slicelist: list[SpectralSlice], thres_ydist = 0.5, DEBUG_PLOTS=False):
+    # thres_ydist is in pixels
+
+    y_best_plot = []
+    for o in orders:
+        lold = len(o.pixel_y)
+        if DEBUG_PLOTS:
+            plt.scatter(o.pixel_x, o.pixel_y, marker="o")
+        o.pixel_x = []
+        o.pixel_y = []
+        o.pixel_y_err = []
+        o.order_width = []
+
+        for s in slicelist:
+            ypred = polynomial(s.x, *o.solution)
+            ydist = np.abs(s.ys - ypred)
+            idx_best = np.argmin(ydist)
+            if ydist[idx_best] < thres_ydist:
+                o.pixel_x.append(s.x)
+                o.pixel_y.append(s.ys[idx_best])
+                o.pixel_y_err.append(s.y_errs[idx_best])
+                o.order_width.append(s.widths[idx_best])
+            y_best_plot.append(ydist[idx_best])
+        lnew = len(o.pixel_y)
+#        print(lold, lnew)
+
+    o.pixel_x = np.array(o.pixel_x)
+    o.pixel_y = np.array(o.pixel_y)
+
+    if DEBUG_PLOTS:
+        crot = ["black", "gray"]
+        for i, o in enumerate(orders):
+            plt.scatter(o.pixel_x, o.pixel_y, marker="x", s=6**2, color=crot[i%len(crot)])
+#            print(o.pixel_x)
+#            print(o.pixel_y)
+        plt.show()
+
+    if DEBUG_PLOTS:
+        plt.hist(y_best_plot, bins=100, range=(0, 10))
+        plt.show()
+
+    for o in orders:
+        o.sort_self()
+
+    return orders
 
 
 def parse_idcomp(file_path):
@@ -306,26 +409,117 @@ def parse_idcomp(file_path):
     return aplow, aphigh, np.array(table_data)
 
 
+# sort and mask the sections based on flux thresholds
+def mask_section(section, tlo=0.05, thi=0.05, return_mask=False):
+    sorted_section = np.sort(section)
+    lsec = len(section)
+    mask = (section > sorted_section[int(tlo*lsec)]) & \
+           (section < sorted_section[int((1-thi)*lsec)])
+    if return_mask:
+        return mask
+    else:
+        return section[mask]
+
 def slice_analysis(pixel, slice_x, slice_y, MIN_WINDOW=15, MAX_WINDOW=15, NOISE_MEASURE_SECTION_WIDTH=0.05,
                    NOISE_CUTOFF=20, CUTTOFF_MARGIN=5, ORDER_GAUSS_THRESHOLD=0.6, DEBUG_PLOTS=False, **kwargs):
-    min_slice = minimum_filter(slice_y, size=MIN_WINDOW)
 
-    slice_y -= min_slice
+#    if abs(pixel-1437) < 2:
+#        DEBUG_PLOTS = True
+#    else:
+#        DEBUG_PLOTS = False
 
-    lower_section = slice_y[:int(len(slice_y) * NOISE_MEASURE_SECTION_WIDTH)]
-    upper_section = slice_y[int(len(slice_y) * (1 - NOISE_MEASURE_SECTION_WIDTH)):]
+    # remove "bias"
+    bias_lvl = minimum_filter(slice_y, size=MIN_WINDOW)
+    slice_y -= bias_lvl
+
+    ny = len(slice_y)
+    NOISE_WIDTH_IDX = int(ny * NOISE_MEASURE_SECTION_WIDTH)
+
+    # select noise at top and bottom of the slice
+    upper_section = slice_y[:NOISE_WIDTH_IDX]
+    lower_section = slice_y[-NOISE_WIDTH_IDX:]
+
+
+    upper_section = mask_section(upper_section, tlo=0.05, thi=0.15)
+    lower_section = mask_section(lower_section, tlo=0.05, thi=0.15)
+
+    # remove "bias"
+    bias_lvl = (np.median(lower_section) + np.median(upper_section)) / 2
+    slice_y -= bias_lvl
+    lower_section -= bias_lvl
+    upper_section -= bias_lvl
 
     noise_lvl = (np.std(lower_section) + np.std(upper_section)) / 2
     noise_lvl *= NOISE_CUTOFF
 
     noise_indices = np.where(slice_y > noise_lvl)[0]
-    first_cross = noise_indices[0]
-    last_cross = noise_indices[-1]
+
+    # hot pixels or other artefacts are usually isolated
+    # -> find groups of high-flux pixels (the orders)
+    def group_consecutive(arr):
+        diffs = np.diff(arr)
+        # identify the points where the difference is not 1, meaning the sequence breaks
+        break_points = np.where(diffs != 1)[0] + 1
+        # return indices to split the array at the break points
+        isplit = np.split(np.arange(len(arr)), break_points)
+        return isplit
+
+    isplit_groups = group_consecutive(noise_indices)
+    groups_ipeak = [noise_indices[i] for i in isplit_groups]
+    groups_ipeak = [np.mean(i) for i in groups_ipeak]
+
+    # estimate distances between orders
+    def min_adjacent_distance(a):
+        adjacent_diff = np.abs(np.diff(a))
+        min_distances = np.zeros(len(a))
+        min_distances[0] = adjacent_diff[0]
+        min_distances[-1] = adjacent_diff[-1]
+        min_distances[1:-1] = np.minimum(adjacent_diff[:-1], adjacent_diff[1:])
+        return min_distances
+
+    ipeak_dist = min_adjacent_distance(groups_ipeak)
+
+    # remove outliers for standard deviation
+    ipeak_dist_cut = mask_section(ipeak_dist, tlo=0, thi=0.1)
+    median_dist = np.median(ipeak_dist_cut)
+    std_dist = np.std(ipeak_dist_cut)
+
+    # remove peaks that are isolated to more than 10 sigma
+    thres_dist = median_dist + std_dist * 10
+
+    # remove pixels that belong to a 'bad' group
+    igroup_bad = np.where(ipeak_dist > thres_dist)[0]
+    if DEBUG_PLOTS:
+        print(igroup_bad)
+    if (len(igroup_bad) > 0):
+        isplit_groups = np.array(isplit_groups, dtype=object)
+        ibad = np.concatenate(isplit_groups[igroup_bad])
+        mask_good = np.ones(len(noise_indices)).astype(bool)
+        mask_good[ibad] = False
+        noise_indices = noise_indices[mask_good]
+
+    if DEBUG_PLOTS:
+        plt.hist(np.diff(groups_ipeak), bins=15, range=(0,50))
+        plt.axvline(median_dist)
+        plt.axvline(median_dist+10*std_dist)
+        plt.show()
+#        exit()
+
+    # assume that "real" orders only start at pixles > 'idx_peak_min'
+    idx_peak_min = 700
+    idx_peak_max = 1750
+    noise_indices = noise_indices[noise_indices>idx_peak_min]
+    noise_indices = noise_indices[noise_indices<idx_peak_max]
+    n_cross = 2
+    first_cross = noise_indices[n_cross] - n_cross
+    last_cross = noise_indices[-1-n_cross] + n_cross
 
     lo_ind = first_cross - CUTTOFF_MARGIN
     hi_ind = last_cross + CUTTOFF_MARGIN
 
+
     if DEBUG_PLOTS:
+        plt.title(pixel)
         plt.plot(slice_x, slice_y)
         plt.axhline(noise_lvl, color="orange")
         plt.axvline(lo_ind, color='r')
@@ -347,8 +541,9 @@ def slice_analysis(pixel, slice_x, slice_y, MIN_WINDOW=15, MAX_WINDOW=15, NOISE_
 #    print(f"Identified {len(peaks)} orders @ x = {pixel}")
 
     if DEBUG_PLOTS:
+        plt.title(str(pixel))
         for idx, l in enumerate(peak_locations):
-            plt.axvline(l, color="gray")
+            plt.axvline(l, ymin=0, ymax=0.93, color="gray")
             plt.text(s=str(idx), x=l, y=1.1, rotation=90,
                      va="center", ha="center")
         plt.plot(slice_x, slice_y)
@@ -394,6 +589,7 @@ def slice_analysis(pixel, slice_x, slice_y, MIN_WINDOW=15, MAX_WINDOW=15, NOISE_
         widths.append(two_log_two * params[2])
 
     if DEBUG_PLOTS:
+        plt.title(pixel)
         plt.plot(slice_x, slice_y)
         plt.ylim(-0.05, 1.15)
         plt.tight_layout()
@@ -450,7 +646,8 @@ def open_or_coadd_frame(frame, get_add_info=False):
 def find_nearest(array, value):
     array = np.asarray(array)
     idx = (np.abs(array - value)).argmin()
-    return array[idx]
+    return idx
+#    return array[idx]
 
 
 class WavelenthPixelTransform():
@@ -619,7 +816,7 @@ def mask_intervals(x, intervals):
     return mask
 
 def poly_normalization(wls, flxs,
-                         ignore_windows=[(4090, 4110), (4320, 4355),
+                         ignore_windows=[(4090, 4115), (4320, 4355),
                                          (4842, 4888), (6540, 6590),
                                          (6860, 6880),
                                          (6888.1, 6890.5), (6892,6893.6),
@@ -696,14 +893,15 @@ def poly_normalization(wls, flxs,
     return flxs
 
 
-def merge_orders(olist: list[SpectralOrder], normalize=False, margin=20, uppermost_wl=8500,
+def merge_orders(olist: list[SpectralOrder], normalize=False, margin=2, max_wl=8900,
                  resolution=50000, DEBUG_PLOTS=False):
-    common_wl = [o.wl[margin:-margin] for o in olist if o.wl.min() < uppermost_wl]
-    common_flx = [o.science[margin:-margin] for o in olist if o.wl.min() < uppermost_wl]
+    common_wl = [o.wl[margin:-margin] for o in olist if o.wl.min() < max_wl]
+    common_flx = [o.science[margin:-margin] for o in olist if o.wl.min() < max_wl]
 
     if DEBUG_PLOTS:
         for w, f in zip(common_wl, common_flx):
             plt.plot(w, f)
+        plt.show()
     common_flx = poly_normalization(common_wl, common_flx, DEBUG_PLOTS=DEBUG_PLOTS)
 
     # estimate noise for each order, to be used for the weights when merging
@@ -749,7 +947,7 @@ def rmcosmics(wl, flx):
 
 def extract_spectrum(spectrum, flats, comps, biases, idcomp_offset=-15,
                      normalize=False, idcomp_dir="idcomp",
-                     sampling=75, min_order_samples=10,
+                     sampling=200, min_order_samples=6,
                      apply_barycorr=True,
                      verbose=False,
                      DEBUG_PLOTS=False, **kwargs):
@@ -762,9 +960,15 @@ def extract_spectrum(spectrum, flats, comps, biases, idcomp_offset=-15,
 
     # Get orders and stuff from flat
     if verbose: print("- identifying orders")
+    npix_x = flats.shape[1]
+    pixels = np.linspace(5, npix_x-5, sampling).astype(int)
     for i in range(sampling):
-        pixel = i * int(flats.shape[1] / sampling) + int(flats.shape[1] / (2 * sampling)) + 1
-        slice_y = flats[:, pixel - 1].astype(float)
+        pixel = pixels[i]
+#        slice_y = flats[:, pixel - 1].astype(float)
+        # average 3 pixels in x direction
+        xidx = np.arange(3) + pixel - 1
+        xidx = xidx[(xidx>=0) & (xidx<npix_x)]
+        slice_y = np.sum(flats[:, xidx].astype(float), axis=1) / len(xidx)
         slice_x = np.arange(flats.shape[1])
         slice = slice_analysis(pixel - 1, slice_x, slice_y, DEBUG_PLOTS=DEBUG_PLOTS, **kwargs)
         slices.append(slice)
@@ -791,18 +995,46 @@ def extract_spectrum(spectrum, flats, comps, biases, idcomp_offset=-15,
             max_slice = i
             norder = len(slice.ys)
 
+    # max_slice is the slice that has the largest number of order identifications
     orders = assign_orders(slices, max_slice, **kwargs)
 
+    if verbose: print(f"- {len(orders)} orders found")
+
+    # fit orders with polynomials
+    for i, o in enumerate(orders):
+        if len(o) > min_order_samples:
+            o.generate_polynomial_solution()
+
+    if DEBUG_PLOTS:
+        for o in orders:
+            plt.hist(o.rms, bins=10)
+        plt.show()
+
+    # remove bad orders
+    orders = [o for o in orders if o.solution is not None]
+
+    # estimate y-pos of each order at the center of the x axis
+    ap_measure = []
+    for o in orders:
+        ap = float(polynomial(len(spectrum) / 2, *o.solution))
+        o.pixel_y_cen = ap
+        ap_measure.append(ap)
+
+    """
+    # re-assign slices based on first polynomial fit
+    orders = assign_orders_polyfit(orders, slices, max_slice, **kwargs)
+    # re-fit orders with polynomials
     o_to_be_removed = []
     for i, o in enumerate(orders):
         if len(o) > min_order_samples:
             o.generate_polynomial_solution()
         else:
-            o_to_be_removed.append(i)
+            o.solution = None
+    # remove bad orders
+    orders = [o for o in orders if o.solution is not None]
+    """
 
-    orders = [item for i, item in enumerate(orders) if i not in o_to_be_removed]
-
-    if verbose: print(f"- {len(orders)} orders found")
+    if verbose: print(f"- {len(orders)} orders identified")
 
     times_sigma = 2
 
@@ -823,22 +1055,9 @@ def extract_spectrum(spectrum, flats, comps, biases, idcomp_offset=-15,
         plt.tight_layout()
         plt.show()
 
+    if verbose: print("- extracting orders")
+
     # Extract different spectra
-    linelists = {}
-    for file in os.listdir(idcomp_dir):
-        if "idiazcomp" in file:
-            aplo, aphi, table = parse_idcomp(idcomp_dir + "/" + file)
-            avg_ap = (aplo + aphi) / 2
-            linelists[avg_ap+idcomp_offset] = table
-    avg_aps = np.array(list(linelists.keys()))
-
-    if DEBUG_PLOTS:
-        plt.imshow(flats)
-        for key in linelists.keys():
-            plt.scatter([len(spectrum) / 2], [key], marker="x", zorder=2, color="red")
-        plt.show()
-
-    if verbose: print("- extracting orders + solving dispersion relations")
     for o in orders:
         if verbose: print("- order", o.id, end="\r")
         o.extract_along_order(spectrum, "science", times_sigma=times_sigma)
@@ -847,27 +1066,82 @@ def extract_spectrum(spectrum, flats, comps, biases, idcomp_offset=-15,
         o.extract_along_order(comps, "comp", times_sigma=times_sigma)
 
         o.apply_corrections()
-
         # o.plot_frame("science")
         # o.plot_frame("flat")
         # o.plot_frame("bias")
         # o.plot_frame("comp")
 
-        ap_measure = polynomial(len(spectrum) / 2, *o.solution)
-        key = find_nearest(avg_aps, ap_measure)
-        linelist = linelists[key]
 
-        solve_wavelength(linelist, o)
+    linelists = {}
+    fp_idcomp = sorted(os.listdir(idcomp_dir))
+    for file in fp_idcomp:
+        if "idiazcomp" in file:
+            aplo, aphi, table = parse_idcomp(idcomp_dir + "/" + file)
+            avg_ap = (aplo + aphi) / 2
+            linelists[avg_ap+idcomp_offset] = table
+    avg_aps = np.array(list(linelists.keys()))
+    nlist = len(avg_aps)
+
+    if DEBUG_PLOTS:
+        plt.imshow(flats)
+        for key in linelists.keys():
+            plt.scatter([len(spectrum) / 2], [key], marker="x", zorder=2, color="red")
+        plt.show()
+
+#    print(avg_aps)
+#    print(ap_measure)
+    # find the best-matching orders
+    id_order_pairs = pair_generation(avg_aps, ap_measure, thres_max=np.inf)
+#    print(id_order_pairs)
+    id_order_pairs = [p for p in id_order_pairs if (p[0] is not None) and (p[1] is not None)]
+#    print(id_order_pairs)
+    if verbose: print("- found %d pairs" % len(id_order_pairs))
+
+#    orders = orders[[i[1] for i in id_order_pairs]]
+
+    if verbose: print("- solving dispersion relations")
+    for p in id_order_pairs:
+        idx_id = p[0]
+        idx_order = p[1]
+        o = orders[idx_order]
+        if verbose: print("- order", o.id, end="\r")
+        key = avg_aps[idx_id]
+        linelist_o = linelists[key]
+        solve_wavelength(linelist_o, o)
+
+    orders = [o for o in orders if o.wl is not None]
+
+    # sort wavelengths
+    for o in orders:
+        o.pix = np.arange(len(o.wl))
+        isort = np.argsort(o.wl)
+        o.wl = o.wl[isort]
+        o.science = o.science[isort]
+        o.flat = o.flat[isort]
+        o.comparison = o.comparison[isort]
+        o.bias = o.bias[isort]
+        o.pix = o.pix[isort]
+
+    if DEBUG_PLOTS:
+        for o in orders:
+            plt.plot(o.wl, o.science)
+            plt.plot(o.wl, o.flat)
+            plt.plot(o.wl, o.comparison)
+            plt.plot(o.wl, o.bias)
+#            print(o.wl)
+        plt.show()
+
+    if verbose: print("- done")
 
     if DEBUG_PLOTS:
         for o in orders:
             plt.scatter(o.cal_pix, np.log10(o.cal_wl), zorder=10, lw=1)
-            plt.plot(np.arange(len(o.wl))+1, np.log10(o.wl), zorder=11, lw=1)
+            plt.plot(o.pix, np.log10(o.wl), zorder=11, lw=1)
         plt.show()
 
     p = 0.6827
-    pl = 0.+0.5*(1.-p)
-    ph = 1.-0.5*(1.-p)
+    pl = 0. + 0.5 * (1. - p)
+    ph = 1. - 0.5 * (1. - p)
     if DEBUG_PLOTS:
         wl_med = []
         res_med = []
@@ -893,13 +1167,14 @@ def extract_spectrum(spectrum, flats, comps, biases, idcomp_offset=-15,
         plt.ylabel(r"$\lambda$  /  $\Delta \lambda$")
         plt.show()
 
-
+    """
     # get rid of bad orders at edges
     order_ltrim = 0
 #    order_rtrim = -10
     order_rtrim = 47
     orders = orders[order_ltrim:order_rtrim]
     if verbose: print("- using %d orders" % len(orders))
+    """
 
     # estimate the median resolving power
     res = []
@@ -915,6 +1190,7 @@ def extract_spectrum(spectrum, flats, comps, biases, idcomp_offset=-15,
     if verbose: print("- merging orders")
     wl_final, wl_flux = merge_orders(orders, resolution=res_qhi, DEBUG_PLOTS=DEBUG_PLOTS)
 
+
     if apply_barycorr and (radvel is not None):
         wl_final = wlshift(wl_final, radvel)
 
@@ -922,7 +1198,10 @@ def extract_spectrum(spectrum, flats, comps, biases, idcomp_offset=-15,
 #    wl_final, wl_flux = rmcosmics(wl_final, wl_flux)
 
     mask = np.isfinite(wl_flux)
+    wl_final = wl_final[mask]
+    wl_flux = wl_flux[mask]
 
+    mask = mask_section(wl_flux, tlo=0, thi=0.01, return_mask=True)
     wl_final = wl_final[mask]
     wl_flux = wl_flux[mask]
 
@@ -938,3 +1217,4 @@ def extract_spectrum(spectrum, flats, comps, biases, idcomp_offset=-15,
 if __name__ == "__main__":
     spec = extract_spectrum("e202109060016.fit", "e202109060010.fit", "e202109060011.fit", "e202109060004.fit")
     print(spec)
+
