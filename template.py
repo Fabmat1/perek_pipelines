@@ -10,7 +10,7 @@ def reduce_night(dir, idcomp_dir, fn_science=None,
                  verbose=True,
                  save_as_fits=True,
                  save_as_ascii=True,
-                 plot_spectr=False):
+                 plot_spectra=False):
 
     flats = []
     biases = []
@@ -88,7 +88,7 @@ def reduce_night(dir, idcomp_dir, fn_science=None,
             print("> skipped %s (%s)" % (fp, name))
 
 def main():
-    dir = "20240901"
+    dir = "20240830"
     idcomp_dir = "idcomp_2307/"
     fn_science = None
     #fn_science = "e202408300035.fit"
@@ -102,7 +102,7 @@ def main():
                  verbose=verbose,
                  save_as_fits=save_as_fits,
                  save_as_ascii=save_as_ascii,
-                 plot_spectr=plot_spectra)
+                 plot_spectra=plot_spectra)
 
 if __name__ == "__main__":
     main()
