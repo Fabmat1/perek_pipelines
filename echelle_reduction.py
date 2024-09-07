@@ -59,7 +59,7 @@ class SpectralOrder:
     def __len__(self):
         return len(self.pixel_x)
 
-    def generate_polynomial_solution(self, yerr_default=1.5):
+    def generate_polynomial_solution(self, yerr_default=1.5, verbose=True):
         # yerr_default -> maximum rms (in pix) for an acceptable fit
 
         params, errs = curve_fit(polynomial, self.pixel_x, self.pixel_y, sigma=self.pixel_y_err)
@@ -88,7 +88,7 @@ class SpectralOrder:
             self.solution = params
             self.solution_errors = errs
         else:
-            print("- identification failed for order", self.id)
+            if verbose: print("- identification failed for order", self.id)
             self.solution = None
             self.solution_errors = None
 
@@ -848,7 +848,7 @@ def poly_normalization(wls, flxs,
     return flxs
 
 
-def merge_orders(olist: list[SpectralOrder], normalize=False, margin=2, max_wl=8900,
+def merge_orders(olist: list[SpectralOrder], normalize=True, margin=2, max_wl=8900,
                  resolution=50000, DEBUG_PLOTS=False):
     common_wl = [o.wl[margin:-margin] for o in olist if o.wl.min() < max_wl]
     common_flx = [o.science[margin:-margin] for o in olist if o.wl.min() < max_wl]
@@ -857,7 +857,9 @@ def merge_orders(olist: list[SpectralOrder], normalize=False, margin=2, max_wl=8
         for w, f in zip(common_wl, common_flx):
             plt.plot(w, f)
         plt.show()
-    common_flx = poly_normalization(common_wl, common_flx, DEBUG_PLOTS=DEBUG_PLOTS)
+
+    if normalize:
+        common_flx = poly_normalization(common_wl, common_flx, DEBUG_PLOTS=DEBUG_PLOTS)
 
     # estimate noise for each order, to be used for the weights when merging
 #    common_noise = [estimate_noise(common_wl[k], common_flx[k]) for k in range(len(common_flx))]
@@ -1010,11 +1012,12 @@ def merge_resolution(wave_merged, orders, dres, DEBUG_PLOTS=False):
     return res_merged
 
 def extract_spectrum(spectrum, flats, comps, biases, idcomp_offset=-15,
-                     normalize=False, idcomp_dir="idcomp",
+                     normalize=True, idcomp_dir="idcomp",
                      sampling=200, min_order_samples=6,
                      apply_barycorr=True,
                      verbose=False,
                      DEBUG_PLOTS=False, **kwargs):
+
     spectrum, radvel = open_or_coadd_frame(spectrum, True)
     flats = open_or_coadd_frame(flats)
     comps = open_or_coadd_frame(comps)
@@ -1067,7 +1070,7 @@ def extract_spectrum(spectrum, flats, comps, biases, idcomp_offset=-15,
     # fit orders with polynomials
     for i, o in enumerate(orders):
         if len(o) > min_order_samples:
-            o.generate_polynomial_solution()
+            o.generate_polynomial_solution(verbose=verbose)
 
     if DEBUG_PLOTS:
         for o in orders:
@@ -1091,7 +1094,7 @@ def extract_spectrum(spectrum, flats, comps, biases, idcomp_offset=-15,
     o_to_be_removed = []
     for i, o in enumerate(orders):
         if len(o) > min_order_samples:
-            o.generate_polynomial_solution()
+            o.generate_polynomial_solution(verbose=verbose)
         else:
             o.solution = None
     # remove bad orders
@@ -1200,7 +1203,10 @@ def extract_spectrum(spectrum, flats, comps, biases, idcomp_offset=-15,
     dres = estimate_resolution(orders, verbose=verbose, DEBUG_PLOTS=DEBUG_PLOTS)
 
     if verbose: print("- merging orders")
-    wave_merged, flux_merged = merge_orders(orders, resolution=dres["R_hi"], DEBUG_PLOTS=DEBUG_PLOTS)
+    wave_merged, flux_merged = merge_orders(orders,
+                                            normalize=normalize,
+                                            resolution=dres["R_hi"],
+                                            DEBUG_PLOTS=DEBUG_PLOTS)
 
     if apply_barycorr and (radvel is not None):
         wave_merged = wlshift(wave_merged, radvel)
@@ -1212,6 +1218,7 @@ def extract_spectrum(spectrum, flats, comps, biases, idcomp_offset=-15,
 #    wave_merged, flux_merged = rmcosmics(wave_merged, flux_merged)
 
     mask = np.isfinite(flux_merged)
+    mask[[0, -1]] = False
     wave_merged = wave_merged[mask]
     flux_merged = flux_merged[mask]
     res_merged = res_merged[mask]
@@ -1232,6 +1239,15 @@ def extract_spectrum(spectrum, flats, comps, biases, idcomp_offset=-15,
 
 
 if __name__ == "__main__":
-    spec = extract_spectrum("e202109060016.fit", "e202109060010.fit", "e202109060011.fit", "e202109060004.fit")
+    # spectrum, flats, comps, biases
+    bp = "20240901/"
+    idcomp_dir = "idcomp_2307/"
+    verbose = True
+    spec = extract_spectrum(spectrum=bp+"e202409010007.fit",
+                            flats=bp+"e202409010019.fit",
+                            comps=bp+"e202409010029.fit",
+                            biases=bp+"e202409010033.fit",
+                            idcomp_dir=idcomp_dir,
+                            verbose=verbose)
     print(spec)
 

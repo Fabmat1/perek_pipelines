@@ -6,8 +6,8 @@ from astropy.io import fits
 from matplotlib import pyplot as plt
 from echelle_reduction import extract_spectrum
 
-#spec = "e202408300035.fit"
-spec = None
+#fn_science = "e202408300035.fit"
+fn_science = None
 idcomp_dir = "idcomp_2307/"
 dir = "20240901"
 verbose = True
@@ -27,6 +27,7 @@ for file in sorted(os.listdir(dir)):
         hdul = fits.open(os.path.join(dir, file))
         header = dict(hdul[0].header)
         ftype = header["OBJECT"]
+        print(file, ftype)
         if ftype == "zero":
             biases.append(hdul[0].data)
         elif ftype == "flat":
@@ -34,16 +35,16 @@ for file in sorted(os.listdir(dir)):
         elif ftype == "comp":
             comps.append(hdul[0].data)
         else:
-            if (spec is not None) and (spec in file):
+            if (fn_science is not None) and (fn_science in file):
                 science.append(file)
                 scname.append(ftype.strip().replace(" ", "_"))
-            elif spec is None:
+            elif fn_science is None:
                 science.append(file)
                 scname.append(ftype.strip().replace(" ", "_"))
 
 if len(science) == 0:
-    if spec is not None:
-        sys.exit("did not find %s in %s" % (spec, dir))
+    if fn_science is not None:
+        sys.exit("did not find %s in %s" % (fn_science, dir))
 
 for i in range(len(science)):
     fp = science[i]
