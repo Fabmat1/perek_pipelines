@@ -10,9 +10,10 @@ from echelle_reduction import extract_spectrum
 spec = None
 idcomp_dir = "idcomp_2307/"
 dir = "20240901"
-save_as_fits = True
-plot_spectra = False
 verbose = True
+save_as_fits = True
+save_as_ascii = True
+plot_spectra = False
 
 flats = []
 biases = []
@@ -48,12 +49,10 @@ for i in range(len(science)):
     fp = science[i]
     name = scname[i]
 
-    if save_as_fits:
-        fp_save = fp.replace(".fit", "_" + name + ".fits")
-    else:
-        fp_save = fp.replace(".fit", "_" + name + ".dat")
-
-    if not os.path.exists(fp_save):
+    fp_save_fits = fp.replace(".fit", "_" + name + ".fits")
+    fp_save_ascii = fp.replace(".fit", "_" + name + ".dat")
+    if (save_as_fits and (not os.path.exists(fp_save_fits))) or \
+       (save_as_ascii and (not os.path.exists(fp_save_ascii))):
         print("> reducing %s (%s)" % (fp, name))
         tstart = time.time()
         s = extract_spectrum(dir+"/"+fp, flats, comps, biases,
@@ -74,12 +73,12 @@ for i in range(len(science)):
             # the name is always in captials
             table_hdu = fits.BinTableHDU.from_columns(fits_cols, name="SCIENCE")
             hdul = fits.HDUList([primary_hdu, table_hdu])
-            hdul.writeto(fp_save)
-            print("> saved to", fp_save)
-        else:
-            d_save = np.vstack([s["wave"], s["flux"], s["error"]]).T
-            np.savetxt(fp_save, d_save, fmt="%1.6f")
-            print("> saved to", fp_save)
+            hdul.writeto(fp_save_fits, overwrite=True)
+            print("> saved to", fp_save_fits)
+        if save_as_ascii:
+            d_save = np.vstack([s["wave"], s["flux"], s["error"], s["res"]]).T
+            np.savetxt(fp_save_ascii, d_save, fmt="%1.6f")
+            print("> saved to", fp_save_ascii)
 
         if plot_spectra:
             plt.plot(s["wave"], s["flux"], linewidth=1, color="black")

@@ -6,11 +6,14 @@ from scipy.constants import speed_of_light
 from matplotlib import pyplot as plt
 import numpy as np
 from astropy.io import fits
-from scipy.ndimage import minimum_filter, maximum_filter, median_filter, gaussian_filter, uniform_filter1d
+from scipy.ndimage import minimum_filter, maximum_filter, median_filter, uniform_filter1d
+from scipy.ndimage import gaussian_filter1d
 from scipy.interpolate import interp1d, CubicSpline
 from scipy.optimize import curve_fit, least_squares
-from astropy.stats import sigma_clip
+from scipy.signal import savgol_filter
+from astropy.stats import sigma_clip, mad_std
 from estimate_noise import estimate_noise
+from tools import polyfit_reject, pair_generation
 try:
     from resample_spectres import resample
 except ModuleNotFoundError:
@@ -218,35 +221,6 @@ def Gaussian_res(x, A, mu=0, sigma=1):
     xfull = np.linspace(np.min(x), np.max(x), len(x)*oversample)
     yfull = Gaussian(xfull, A, mu=mu, sigma=sigma)
     return resample(x, xfull, yfull, fill=0, verbose=False)
-
-
-def pair_generation(arr1, arr2, thres_max=5.5):
-    arr1 = np.array(arr1)
-    arr2 = np.array(arr2)
-
-    distance_matrix = np.abs(arr1[:, np.newaxis] - arr2[np.newaxis, :])
-    # -> shape = (len(arr1), len(arr2))
-
-    pairs = []
-    pair_dists = []
-    for i, row in enumerate(distance_matrix):
-        next_index = np.argmin(row)
-        min_dist = np.min(distance_matrix[:, next_index])
-        if min_dist == row[next_index]:
-            pairs.append([i, int(next_index)])
-            pair_dists.append(min_dist)
-        else:
-            pairs.append([i, None])
-            pair_dists.append(np.nan)
-
-    mean_dist = np.nanmean(pair_dists)
-    std_dist = np.nanstd(pair_dists)
-
-    for i in range(len(pairs)):
-        if (pair_dists[i] > mean_dist+thres_max*std_dist):
-            pairs[i][1] = None
-
-    return pairs
 
 
 def assign_orders(slicelist: list[SpectralSlice], max_ind, DEBUG_PLOTS=False, **kwargs):
@@ -650,14 +624,6 @@ def open_or_coadd_frame(frame, get_add_info=False):
 
     return frame
 
-
-def find_nearest(array, value):
-    array = np.asarray(array)
-    idx = (np.abs(array - value)).argmin()
-    return idx
-#    return array[idx]
-
-
 class WavelenthPixelTransform():
     def __init__(self, wstart, dwdp=None, dwdp2=None, dwdp3=None, dwdp4=None, polyorder=3):
         self.wstart = wstart  # wavelength at pixel 0
@@ -781,25 +747,6 @@ def plot_order_list(olist: list[SpectralOrder]):
         plt.plot(o.wl, o.science)
     plt.tight_layout()
     plt.show()
-
-
-def find_neighbors(arr, target):
-    # Ensure the array is sorted
-    arr = np.sort(arr)
-
-    # Use np.searchsorted to find the index where the target would be inserted
-    idx = np.searchsorted(arr, target)
-
-    # Get the neighbors
-    if idx == 0:
-        # Target is smaller than the smallest element
-        return None, arr[0]
-    elif idx == len(arr):
-        # Target is larger than the largest element
-        return arr[-1], None
-    else:
-        # Normal case, the target is between two elements
-        return arr[idx - 1], arr[idx]
 
 def generate_wl_grid(wl, resolution=45000, sampling=2.7):
     temp = (2 * sampling * resolution + 1) / (2 * sampling * resolution - 1)
@@ -953,6 +900,115 @@ def rmcosmics(wl, flx):
     mask = flx < 3 * std_filtered + mean_filtered
     return wl[mask], flx[mask]
 
+def estimate_resolution(orders, verbose=False, DEBUG_PLOTS=False):
+    p = 0.6827
+    pl = 0. + 0.5 * (1. - p)
+    ph = 1. - 0.5 * (1. - p)
+    wl_med = []
+    res_med = []
+    res_qlo = []
+    res_qhi = []
+    res_all = []
+    res_all_wl = []
+    for o in orders:
+        res_o = o.cal_wl/o.cal_wl_fwhm
+        quantile_lo = np.quantile(res_o, pl)
+        quantile_hi = np.quantile(res_o, ph)
+        wl_med.append(np.median(o.cal_wl))
+        res_med.append(np.median(res_o))
+        res_qlo.append(quantile_lo)
+        res_qhi.append(quantile_hi)
+        res_all.extend(res_o)
+        res_all_wl.extend(o.cal_wl)
+    res_qlo = np.array(res_qlo)
+    res_qhi = np.array(res_qhi)
+    res_med = np.array(res_med)
+
+    res_all = np.array(res_all)
+    res_all_wl = np.array(res_all_wl)
+    isort = np.argsort(res_all_wl)
+    res_all = res_all[isort]
+    res_all_wl = res_all_wl[isort]
+
+#    window_size = 25 # AA
+#    rmed, rqlo, rqhi = rolling_median_quant(res_all_wl, res_all, window_size, p=0.6827)
+
+    coeffs = []
+    for o in orders:
+        res_o = o.cal_wl/o.cal_wl_fwhm
+        if len(res_o) < 15:
+            deg = 1
+        else:
+            deg = 2
+        coeff = polyfit_reject(o.cal_wl, res_o, deg=deg, thres=2, nit=3)
+        coeffs.append(coeff)
+
+    if DEBUG_PLOTS:
+        for i, o in enumerate(orders):
+            res_o = o.cal_wl/o.cal_wl_fwhm
+#            plt.scatter(o.cal_wl, o.cal_wl_fwhm, zorder=10, lw=1)
+            xeval = np.linspace(np.min(o.cal_wl), np.max(o.cal_wl), 100)
+            poly1d_fn = np.poly1d(coeffs[i])
+            plt.plot(xeval, poly1d_fn(xeval), zorder=11, lw=2, color="blue", ls="-")
+
+            plt.scatter(o.cal_wl, res_o, zorder=10, lw=1)
+            plt.plot()
+
+        plt.plot(wl_med, res_med, color="black", lw=2, zorder=20, ls="-")
+        plt.plot(wl_med, res_qlo, color="black", lw=2, zorder=20, ls="--")
+        plt.plot(wl_med, res_qhi, color="black", lw=2, zorder=20, ls="--")
+        plt.xlabel(r"Wavelength  /  $\mathrm{\AA}$")
+        plt.ylabel(r"$\lambda$  /  $\Delta \lambda$")
+        plt.show()
+
+    # estimate the median resolving power
+
+    res_all_qlo = np.quantile(res_all, pl)
+    res_all_qhi = np.quantile(res_all, ph)
+    res_all_med = np.median(res_all)
+    res_all_min = res_all_med - res_all_qlo
+    res_all_max = res_all_qhi - res_all_med
+    if verbose: print("- R = %.0f^{+%.0f}_{-%.0f}" % \
+                     (res_all_med, res_all_max, res_all_min))
+
+    dout = {"R_med": res_all_med,
+            "R_lo": res_all_qlo,
+            "R_hi": res_all_qhi,
+            "coeffs": coeffs}
+
+    return dout
+
+def merge_resolution(wave_merged, orders, dres, DEBUG_PLOTS=False):
+    res_poly = []
+    res_poly_wl = []
+    for i, o in enumerate(orders):
+        coeff = dres["coeffs"][i]
+        xeval = np.linspace(np.min(o.wl), np.max(o.wl), 200)
+        poly1d_fn = np.poly1d(coeff)
+        yeval = poly1d_fn(xeval)
+        res_poly.extend(yeval)
+        res_poly_wl.extend(xeval)
+        if DEBUG_PLOTS: plt.plot(xeval, yeval, lw=1.5)
+    res_poly = np.array(res_poly)
+    res_poly_wl = np.array(res_poly_wl)
+    isort = np.argsort(res_poly_wl)
+    res_poly = res_poly[isort]
+    res_poly_wl = res_poly_wl[isort]
+#    res_merged = resample(wave_merged, res_poly_wl, res_poly)
+    res_merged = np.interp(wave_merged, res_poly_wl, res_poly)
+    res_med = dres["R_med"]
+    res_min = dres["R_lo"] / 3
+    res_merged[res_merged<=res_min] = res_min
+    # smooth
+    npix = 35
+    res_merged = gaussian_filter1d(res_merged, npix,
+                                   mode="constant", cval=res_med)
+
+    if DEBUG_PLOTS:
+        plt.plot(wave_merged, res_merged, ls="--", lw=2, color="black")
+        plt.show()
+    return res_merged
+
 def extract_spectrum(spectrum, flats, comps, biases, idcomp_offset=-15,
                      normalize=False, idcomp_dir="idcomp",
                      sampling=200, min_order_samples=6,
@@ -1079,7 +1135,6 @@ def extract_spectrum(spectrum, flats, comps, biases, idcomp_offset=-15,
         # o.plot_frame("bias")
         # o.plot_frame("comp")
 
-
     linelists = {}
     fp_idcomp = sorted(os.listdir(idcomp_dir))
     for file in fp_idcomp:
@@ -1096,16 +1151,10 @@ def extract_spectrum(spectrum, flats, comps, biases, idcomp_offset=-15,
             plt.scatter([len(spectrum) / 2], [key], marker="x", zorder=2, color="red")
         plt.show()
 
-#    print(avg_aps)
-#    print(ap_measure)
     # find the best-matching orders
     id_order_pairs = pair_generation(avg_aps, ap_measure, thres_max=np.inf)
-#    print(id_order_pairs)
     id_order_pairs = [p for p in id_order_pairs if (p[0] is not None) and (p[1] is not None)]
-#    print(id_order_pairs)
     if verbose: print("- found %d pairs" % len(id_order_pairs))
-
-#    orders = orders[[i[1] for i in id_order_pairs]]
 
     if verbose: print("- solving dispersion relations")
     for p in id_order_pairs:
@@ -1147,77 +1196,37 @@ def extract_spectrum(spectrum, flats, comps, biases, idcomp_offset=-15,
             plt.plot(o.pix, np.log10(o.wl), zorder=11, lw=1)
         plt.show()
 
-    p = 0.6827
-    pl = 0. + 0.5 * (1. - p)
-    ph = 1. - 0.5 * (1. - p)
-    if DEBUG_PLOTS:
-        wl_med = []
-        res_med = []
-        res_qlo = []
-        res_qhi = []
-        res = []
-        for o in orders:
-            res_o = o.cal_wl/o.cal_wl_fwhm
+    # estimate spectral resolving power
+    dres = estimate_resolution(orders, verbose=verbose, DEBUG_PLOTS=DEBUG_PLOTS)
 
-#            plt.scatter(o.cal_wl, o.cal_wl_fwhm, zorder=10, lw=1)
-            plt.scatter(o.cal_wl, res_o, zorder=10, lw=1)
-
-            quantile_lo = np.quantile(res_o, pl)
-            quantile_hi = np.quantile(res_o, ph)
-            wl_med.append(np.median(o.cal_wl))
-            res_med.append(np.median(res_o))
-            res_qlo.append(quantile_lo)
-            res_qhi.append(quantile_hi)
-        plt.plot(wl_med, res_med, color="black", lw=2, zorder=20, ls="-")
-        plt.plot(wl_med, res_qlo, color="black", lw=2, zorder=20, ls="--")
-        plt.plot(wl_med, res_qhi, color="black", lw=2, zorder=20, ls="--")
-        plt.xlabel(r"Wavelength  /  $\mathrm{\AA}$")
-        plt.ylabel(r"$\lambda$  /  $\Delta \lambda$")
-        plt.show()
-
-    """
-    # get rid of bad orders at edges
-    order_ltrim = 0
-#    order_rtrim = -10
-    order_rtrim = 47
-    orders = orders[order_ltrim:order_rtrim]
-    if verbose: print("- using %d orders" % len(orders))
-    """
-
-    # estimate the median resolving power
-    res = []
-    for o in orders:
-        res_o = o.cal_wl/o.cal_wl_fwhm
-        res.extend(res_o)
-    res_qlo = np.quantile(res, pl)
-    res_qhi = np.quantile(res, ph)
-    res_med = np.median(res)
-
-    # plot_order_list(orders)
-    if verbose: print("- R = %.0f^{+%.0f}_{-%.0f}" % (res_med, res_qhi-res_med, res_med-res_qlo))
     if verbose: print("- merging orders")
-    wl_final, wl_flux = merge_orders(orders, resolution=res_qhi, DEBUG_PLOTS=DEBUG_PLOTS)
-
+    wave_merged, flux_merged = merge_orders(orders, resolution=dres["R_hi"], DEBUG_PLOTS=DEBUG_PLOTS)
 
     if apply_barycorr and (radvel is not None):
-        wl_final = wlshift(wl_final, radvel)
+        wave_merged = wlshift(wave_merged, radvel)
+
+    # construct resolving power column
+    res_merged = merge_resolution(wave_merged, orders, dres, DEBUG_PLOTS=DEBUG_PLOTS)
 
     # this may remove all pixels ...
-#    wl_final, wl_flux = rmcosmics(wl_final, wl_flux)
+#    wave_merged, flux_merged = rmcosmics(wave_merged, flux_merged)
 
-    mask = np.isfinite(wl_flux)
-    wl_final = wl_final[mask]
-    wl_flux = wl_flux[mask]
+    mask = np.isfinite(flux_merged)
+    wave_merged = wave_merged[mask]
+    flux_merged = flux_merged[mask]
+    res_merged = res_merged[mask]
 
-    mask = mask_section(wl_flux, tlo=0, thi=0.01, return_mask=True)
-    wl_final = wl_final[mask]
-    wl_flux = wl_flux[mask]
+    mask = mask_section(flux_merged, tlo=0, thi=0.01, return_mask=True)
+    wave_merged = wave_merged[mask]
+    flux_merged = flux_merged[mask]
+    res_merged = res_merged[mask]
 
-    noise = estimate_noise(wl_final, wl_flux)
+    noise = estimate_noise(wave_merged, flux_merged)
 
-    dout = {"wave": wl_final,
-            "flux": wl_flux,
-            "error": noise}
+    dout = {"wave": wave_merged,
+            "flux": flux_merged,
+            "error": noise,
+            "res": res_merged}
 
     return dout
 
