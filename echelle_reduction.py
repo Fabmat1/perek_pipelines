@@ -3,7 +3,6 @@ import astropy.units as u
 from astropy.coordinates import EarthLocation, SkyCoord
 from astropy.time import Time
 from scipy.constants import speed_of_light
-from spectres import spectres
 from matplotlib import pyplot as plt
 import numpy as np
 from astropy.io import fits
@@ -12,6 +11,15 @@ from scipy.interpolate import interp1d, CubicSpline
 from scipy.optimize import curve_fit, least_squares
 from astropy.stats import sigma_clip
 from estimate_noise import estimate_noise
+try:
+    from resample_spectres import resample
+except ModuleNotFoundError:
+    print("compile 'pyresample_spectres' like this:")
+    print("python3 -m numpy.f2py -c -m pyresample_spectres resample_spectres.f90")
+    try:
+        from spectres import spectres as resample
+    except ModuleNotFoundError:
+        raise Exception("Need either 'spectres' or 'resample_spectres'")
 
 two_log_two = 2 * np.sqrt(2 * np.log(2))
 
@@ -209,7 +217,7 @@ def Gaussian_res(x, A, mu=0, sigma=1):
     oversample = 10
     xfull = np.linspace(np.min(x), np.max(x), len(x)*oversample)
     yfull = Gaussian(xfull, A, mu=mu, sigma=sigma)
-    return spectres(x, xfull, yfull, fill=0, verbose=False)
+    return resample(x, xfull, yfull, fill=0, verbose=False)
 
 
 def pair_generation(arr1, arr2, thres_max=5.5):
@@ -920,7 +928,7 @@ def merge_orders(olist: list[SpectralOrder], normalize=False, margin=2, max_wl=8
 
     new_grid = generate_wl_grid(common_wl, resolution=resolution)
     # this can only compute a "combined noise", but does not weigh pixels by SNR
-    common_flx  = spectres(new_grid, common_wl, common_flx,
+    common_flx  = resample(new_grid, common_wl, common_flx,
                            verbose=False)
     common_wl = new_grid
 
@@ -1131,7 +1139,7 @@ def extract_spectrum(spectrum, flats, comps, biases, idcomp_offset=-15,
 #            print(o.wl)
         plt.show()
 
-    if verbose: print("- done")
+    if verbose: print("- done         ")
 
     if DEBUG_PLOTS:
         for o in orders:

@@ -10,7 +10,8 @@ from echelle_reduction import extract_spectrum
 spec = None
 idcomp_dir = "idcomp_2307/"
 dir = "20240901"
-plot_spectra = True
+save_as_fits = True
+plot_spectra = False
 verbose = True
 
 flats = []
@@ -46,7 +47,11 @@ if len(science) == 0:
 for i in range(len(science)):
     fp = science[i]
     name = scname[i]
-    fp_save = fp.replace(".fit", "_" + name + ".dat")
+
+    if save_as_fits:
+        fp_save = fp.replace(".fit", "_" + name + ".fits")
+    else:
+        fp_save = fp.replace(".fit", "_" + name + ".dat")
 
     if not os.path.exists(fp_save):
         print("> reducing %s (%s)" % (fp, name))
@@ -60,9 +65,21 @@ for i in range(len(science)):
         SNR = np.nanmedian(s["flux"][mask_good]/s["error"][mask_good])
         print("> median SNR = %.1f" % SNR)
 
-        d_save = np.vstack([s["wave"], s["flux"], s["error"]]).T
-        np.savetxt(fp_save, d_save, fmt="%1.6f")
-        print("> saved to", fp_save)
+        if save_as_fits:
+            # steal the original header
+            with fits.open(dir+"/"+fp) as hdul:
+                header = hdul[0].header
+            primary_hdu = fits.PrimaryHDU(header=header)
+            fits_cols = [fits.Column(name=key, array=s[key], format='D') for key in s]
+            # the name is always in captials
+            table_hdu = fits.BinTableHDU.from_columns(fits_cols, name="SCIENCE")
+            hdul = fits.HDUList([primary_hdu, table_hdu])
+            hdul.writeto(fp_save)
+            print("> saved to", fp_save)
+        else:
+            d_save = np.vstack([s["wave"], s["flux"], s["error"]]).T
+            np.savetxt(fp_save, d_save, fmt="%1.6f")
+            print("> saved to", fp_save)
 
         if plot_spectra:
             plt.plot(s["wave"], s["flux"], linewidth=1, color="black")
