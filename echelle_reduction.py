@@ -6,12 +6,12 @@ from scipy.constants import speed_of_light
 from matplotlib import pyplot as plt
 import numpy as np
 from astropy.io import fits
-from scipy.ndimage import minimum_filter, maximum_filter, median_filter, uniform_filter1d
+from scipy.ndimage import (minimum_filter, maximum_filter,
+                           median_filter, uniform_filter1d)
 from scipy.ndimage import gaussian_filter1d
-from scipy.interpolate import interp1d, CubicSpline
-from scipy.optimize import curve_fit, least_squares
-from scipy.signal import savgol_filter
-from astropy.stats import sigma_clip, mad_std
+from scipy.interpolate import interp1d
+from scipy.optimize import curve_fit
+from astropy.stats import sigma_clip
 from estimate_noise import estimate_noise
 from tools import polyfit_reject, pair_generation
 try:
