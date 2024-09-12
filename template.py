@@ -7,6 +7,7 @@ from matplotlib import pyplot as plt
 from echelle_reduction import extract_spectrum
 
 def reduce_night(dir, idcomp_dir, fn_science=None,
+                 frame_for_slice=None,
                  verbose=True,
                  save_as_fits=True,
                  save_as_ascii=True,
@@ -53,6 +54,7 @@ def reduce_night(dir, idcomp_dir, fn_science=None,
             print("> reducing %s (%s)" % (fp, name))
             tstart = time.time()
             s = extract_spectrum(dir+"/"+fp, flats, comps, biases,
+                                 frame_for_slice=frame_for_slice,
                                  idcomp_dir=idcomp_dir, verbose=verbose)
             tstop = time.time()
             print("> done in %.1f s" % (tstop-tstart))
@@ -88,17 +90,21 @@ def reduce_night(dir, idcomp_dir, fn_science=None,
             print("> skipped %s (%s)" % (fp, name))
 
 def main():
-    dir = "20240830"
+    dir = "20240828"
     idcomp_dir = "idcomp_2307/"
     fn_science = None
     #fn_science = "e202408300035.fit"
     verbose = True
     save_as_fits = True
     save_as_ascii = True
-    plot_spectra = False
+    plot_spectra = True
+    frame_for_slice = "20240902/e202409020033.fit"
+    if not os.path.exists(frame_for_slice):
+        frame_for_slice = None
 
     reduce_night(dir, idcomp_dir,
                  fn_science=fn_science,
+                 frame_for_slice=frame_for_slice,
                  verbose=verbose,
                  save_as_fits=save_as_fits,
                  save_as_ascii=save_as_ascii,

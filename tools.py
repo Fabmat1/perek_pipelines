@@ -1,5 +1,16 @@
 import numpy as np
 from astropy.stats import mad_std
+from scipy.optimize import curve_fit
+
+def fill_nan(y):
+    '''replace nan values in 1-array by interpolated values'''
+
+    y = np.array(y)
+    nans = np.isnan(y)
+    x = lambda z: z.nonzero()[0]
+    y[nans]= np.interp(x(nans), x(~nans), y[~nans])
+
+    return y
 
 def pair_generation(arr1, arr2, thres_max=5.5):
     arr1 = np.array(arr1)
@@ -83,3 +94,41 @@ def polyfit_reject(x, y, deg=1, thres=2, nit=3):
 
     return coef
 
+def curve_fit_reject(x, y, function, thres=2, thres_max=None, **kwargs):
+
+    if type(thres) == int:
+        thres = [thres] * 2
+
+    nit = len(thres)
+
+    x = np.array(x)
+    y = np.array(y)
+
+    for i in range(nit):
+        if i == 0:
+            xfit = x
+            yfit = y
+            kwargs_fit = kwargs.copy()
+        else:
+            if np.sum(mask) < 3:
+                return params, errs
+            else:
+                xfit = x[mask]
+                yfit = y[mask]
+                for key in kwargs:
+                    if type(kwargs[key]) == np.ndarray and \
+                       len(kwargs[key]) == len(mask):
+                        kwargs_fit[key] = kwargs[key][mask]
+
+        params, errs = curve_fit(function, xfit, yfit, **kwargs_fit)
+        errs = np.sqrt(np.diag(errs))
+
+        ymod = function(x, *params)
+        ydiff = np.abs(ymod - y)
+        ystd = mad_std(ydiff)
+        if thres_max is not None:
+            mask = ydiff < max(ystd * thres[i], thres_max)
+        else:
+            mask = ydiff < ystd * thres[i]
+
+    return params, errs, mask

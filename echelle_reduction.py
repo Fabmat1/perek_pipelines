@@ -13,7 +13,7 @@ from scipy.interpolate import interp1d
 from scipy.optimize import curve_fit
 from astropy.stats import sigma_clip
 from estimate_noise import estimate_noise
-from tools import polyfit_reject, pair_generation
+from tools import polyfit_reject, pair_generation, curve_fit_reject, fill_nan
 try:
     from resample_spectres import resample
 except ModuleNotFoundError:
@@ -36,6 +36,7 @@ class SpectralOrder:
         self.pixel_x = []
         self.pixel_y = []
         self.pixel_y_err = []
+        self.pixel_mask_good = None
         self.solution = None
         self.solution_errors = None
         self.w_fcn = None
@@ -45,6 +46,7 @@ class SpectralOrder:
         self.science = None
         self.flat = None
         self.comparison = None
+        self.comparison_orig = None
         self.bias = None
 
         self.wl = None
@@ -59,27 +61,72 @@ class SpectralOrder:
     def __len__(self):
         return len(self.pixel_x)
 
-    def generate_polynomial_solution(self, yerr_default=1.5, verbose=True):
+    def generate_polynomial_solution(self, yerr_default=1.5, verbose=True, DEBUG_PLOTS=False):
         # yerr_default -> maximum rms (in pix) for an acceptable fit
 
-        params, errs = curve_fit(polynomial, self.pixel_x, self.pixel_y, sigma=self.pixel_y_err)
-        errs = np.sqrt(np.diag(errs))
+#        params, errs = curve_fit(polynomial, self.pixel_x, self.pixel_y, sigma=self.pixel_y_err)
+#        errs = np.sqrt(np.diag(errs))
 
-        nresid = len(self.pixel_y)
+        x = self.pixel_x
+        y = self.pixel_y
+        kwargs = {"sigma": self.pixel_y_err}
+        thres = [100, 5, 5, 3]
+        params, errs, mask_good = curve_fit_reject(x, y, polynomial,
+                                                   thres=thres, thres_max=0.2,
+                                                   **kwargs)
+        self.pixel_mask_good = mask_good
 
-        ypoly = polynomial(self.pixel_x, *params)
+
+        ypoly = polynomial(x, *params)
         # root mean squared
-        rms = np.sqrt(np.sum(np.square(self.pixel_y - ypoly)) / nresid)
+        resid = (y - ypoly)
+        nresid = len(resid[mask_good])
+        rms = np.sqrt(np.sum(np.square(resid[mask_good])) / nresid)
 
         self.rms = rms
+
+        if DEBUG_PLOTS:
+
+            figsize = np.array([8, 6])
+            fig, axs = plt.subplots(2, 1, sharex=True,
+                                    height_ratios=[3, 1],
+                                    figsize=figsize)
+            fig.subplots_adjust(hspace=0)
+            axs[0].set_ylabel("y  /  pix")
+            axs[1].set_xlabel("x  /  pix")
+            axs[1].set_ylabel("y - yfit  /  pix")
+            axs[0].scatter(x[mask_good], y[mask_good], color="black")
+            axs[0].scatter(x[~mask_good], y[~mask_good], color="gray")
+
+            xeval = np.arange(np.min(x), np.max(x)+1)
+            yeval = polynomial(xeval, *params)
+            axs[0].plot(xeval, yeval, color="red")
+
+            rmax = np.max(resid)
+            rmin = np.min(resid)
+            rbuf = (rmax - rmin) * 0.1
+            axs[1].set_ylim(bottom=rmin-rbuf, top=rmax+rbuf)
+            axs[1].axhline(y=0, ls="--", color="gray", zorder=10)
+            axs[1].scatter(x[mask_good], resid[mask_good], color="black", zorder=20)
+            axs[1].scatter(x[~mask_good], resid[~mask_good], color="gray", zorder=20)
+
+            axs[0].text(0.95, 0.9,
+                    s="rms = %.3f (thres = %.3f)" % (rms, yerr_default),
+                    ha='right', va='center',
+                    transform=axs[0].transAxes)
+
+            fig.suptitle("order %d" % self.id)
+
+            plt.tight_layout()
+            plt.show()
 
         """
         # estimate reduced chi2
         nfree = 4
         dof = nresid - nfree
         # self.pixel_y_err
-        resid = (self.pixel_y - ypoly) / yerr_default
-        chi2 = np.sqrt(np.sum(np.square(resid)))
+        chi = resid / yerr_default
+        chi2 = np.sqrt(np.sum(np.square(chi)))
         rchi2 = chi2 / dof
         """
 
@@ -112,6 +159,8 @@ class SpectralOrder:
         self.order_width = np.array(list(self.order_width))
         self.pixel_y = np.array(list(self.pixel_y))
         self.pixel_y_err = np.array(list(self.pixel_y_err))
+        if self.pixel_mask_good is not None:
+            self.pixel_mask_good = np.array(list(self.pixel_mask_goodr))
 
     def extract_along_order(self, image, type, times_sigma=2):
         if self.solution is None:
@@ -124,6 +173,7 @@ class SpectralOrder:
         for pixel in np.arange(image.shape[1]):
             sigma = self.w_fcn(pixel) / two_log_two
             width = times_sigma * sigma
+            # limit the order y-width to 4 pixels
             width = np.clip(width, a_min=1, a_max=4)
             y_ind = self.evaluate(pixel)
             top = int(np.floor(y_ind + width))
@@ -146,27 +196,38 @@ class SpectralOrder:
         else:
             raise Exception("Unknown frame type!")
 
-    def plot_frame(self, type):
+    def plot_frame_1d(self, type):
         if type == "bias" or type == "zero":
             data_y = self.bias
-            data_x = self.wl if self.wl is not None else np.arange(len(data_y)) + 1
-            plt.title("bias")
         elif type == "flat":
             data_y = self.flat
-            data_x = self.wl if self.wl is not None else np.arange(len(data_y)) + 1
-            plt.title("flat")
         elif type == "comparison" or type == "comp":
             data_y = self.comparison
-            data_x = self.wl if self.wl is not None else np.arange(len(data_y)) + 1
-            plt.title("comparison")
+        elif type == "comparison_orig" or type == "comp_orig":
+            data_y = self.comparison_orig
         elif type == "science":
             data_y = self.science
-            data_x = self.wl if self.wl is not None else np.arange(len(data_y)) + 1
-            plt.title("science")
         else:
             raise Exception("Unknown frame type!")
 
-        plt.plot(data_x, data_y)
+        data_x = np.arange(len(data_y)) + 1
+
+        if self.wl is not None:
+            figsize = np.array([9.5, 7.5])
+            fig, axs = plt.subplots(2, 1, sharey=True,
+                                    height_ratios=[1, 1],
+                                    figsize=figsize)
+            axs[0].plot(self.wl, data_y)
+            axs[1].plot(data_x, data_y)
+            axs[0].set_xlabel(r"$\lambda$  /  $\mathrm{\AA}$")
+            axs[1].set_xlabel("x  /  pix")
+            axs[1].invert_xaxis()
+        else:
+            fig, ax = plt.subplots()
+            ax.plot(data_x, data_y)
+            ax.invert_xaxis()
+
+        fig.suptitle(type + " " + str(self.id))
 
         plt.tight_layout()
         plt.show()
@@ -183,9 +244,20 @@ class SpectralOrder:
 
         self.science /= norm_flat
 
+        self.comparison_orig = self.comparison.copy()
+        qhi = np.quantile(self.comparison_orig, 0.9)
+        mask = self.comparison_orig < -qhi
+        self.comparison_orig[mask] = np.nan
+        self.comparison_orig = fill_nan(self.comparison_orig)
+
         self.comparison -= minimum_filter(self.comparison, size=min_win_size)
+        # should clip the filter here, force to exceed noise level
         self.comparison /= maximum_filter(self.comparison, size=max_win_size)
 
+        qhi = np.quantile(self.comparison, 0.9)
+        mask = self.comparison < -qhi
+        self.comparison[mask] = np.nan
+        self.comparison = fill_nan(self.comparison)
 
 class SpectralSlice:
     def __init__(self, x, ys, y_errs, widths):
@@ -221,7 +293,6 @@ def Gaussian_res(x, A, mu=0, sigma=1):
     xfull = np.linspace(np.min(x), np.max(x), len(x)*oversample)
     yfull = Gaussian(xfull, A, mu=mu, sigma=sigma)
     return resample(x, xfull, yfull, fill=0, verbose=False)
-
 
 def assign_orders(slicelist: list[SpectralSlice], max_ind, DEBUG_PLOTS=False, **kwargs):
     # Forward loop
@@ -328,7 +399,6 @@ def assign_orders_polyfit(orders, slicelist: list[SpectralSlice], thres_ydist = 
                 o.order_width.append(s.widths[idx_best])
             y_best_plot.append(ydist[idx_best])
         lnew = len(o.pixel_y)
-#        print(lold, lnew)
 
     o.pixel_x = np.array(o.pixel_x)
     o.pixel_y = np.array(o.pixel_y)
@@ -337,8 +407,6 @@ def assign_orders_polyfit(orders, slicelist: list[SpectralSlice], thres_ydist = 
         crot = ["black", "gray"]
         for i, o in enumerate(orders):
             plt.scatter(o.pixel_x, o.pixel_y, marker="x", s=6**2, color=crot[i%len(crot)])
-#            print(o.pixel_x)
-#            print(o.pixel_y)
         plt.show()
 
     if DEBUG_PLOTS:
@@ -405,7 +473,7 @@ def mask_section(section, tlo=0.05, thi=0.05, return_mask=False):
 def slice_analysis(pixel, slice_x, slice_y, MIN_WINDOW=15, MAX_WINDOW=15, NOISE_MEASURE_SECTION_WIDTH=0.05,
                    NOISE_CUTOFF=20, CUTTOFF_MARGIN=5, ORDER_GAUSS_THRESHOLD=0.6, DEBUG_PLOTS=False, **kwargs):
 
-#    if abs(pixel-1437) < 2:
+#    if abs(pixel-1714) < 2:
 #        DEBUG_PLOTS = True
 #    else:
 #        DEBUG_PLOTS = False
@@ -420,7 +488,6 @@ def slice_analysis(pixel, slice_x, slice_y, MIN_WINDOW=15, MAX_WINDOW=15, NOISE_
     # select noise at top and bottom of the slice
     upper_section = slice_y[:NOISE_WIDTH_IDX]
     lower_section = slice_y[-NOISE_WIDTH_IDX:]
-
 
     upper_section = mask_section(upper_section, tlo=0.05, thi=0.15)
     lower_section = mask_section(lower_section, tlo=0.05, thi=0.15)
@@ -468,6 +535,7 @@ def slice_analysis(pixel, slice_x, slice_y, MIN_WINDOW=15, MAX_WINDOW=15, NOISE_
 
     # remove peaks that are isolated to more than 10 sigma
     thres_dist = median_dist + std_dist * 10
+#    MAX_WINDOW = max(MAX_WINDOW, median_dist + std_dist * 4)
 
     # remove pixels that belong to a 'bad' group
     igroup_bad = np.where(ipeak_dist > thres_dist)[0]
@@ -481,6 +549,7 @@ def slice_analysis(pixel, slice_x, slice_y, MIN_WINDOW=15, MAX_WINDOW=15, NOISE_
         noise_indices = noise_indices[mask_good]
 
     if DEBUG_PLOTS:
+        plt.xlabel("group distance  /  pix")
         plt.hist(np.diff(groups_ipeak), bins=15, range=(0,50))
         plt.axvline(median_dist)
         plt.axvline(median_dist+10*std_dist)
@@ -499,13 +568,15 @@ def slice_analysis(pixel, slice_x, slice_y, MIN_WINDOW=15, MAX_WINDOW=15, NOISE_
     lo_ind = first_cross - CUTTOFF_MARGIN
     hi_ind = last_cross + CUTTOFF_MARGIN
 
-
     if DEBUG_PLOTS:
         plt.title(pixel)
         plt.plot(slice_x, slice_y)
         plt.axhline(noise_lvl, color="orange")
         plt.axvline(lo_ind, color='r')
         plt.axvline(hi_ind, color='r')
+        max_slice = maximum_filter(slice_y, size=MAX_WINDOW)
+        max_slice = np.clip(max_slice, a_min=noise_lvl*2, a_max=np.inf)
+        plt.plot(slice_x, max_slice, color="tab:green")
         plt.tight_layout()
         plt.show()
 
@@ -513,6 +584,7 @@ def slice_analysis(pixel, slice_x, slice_y, MIN_WINDOW=15, MAX_WINDOW=15, NOISE_
     slice_y = slice_y[lo_ind:hi_ind]
 
     max_slice = maximum_filter(slice_y, size=MAX_WINDOW)
+    max_slice = np.clip(max_slice, a_min=noise_lvl*2, a_max=np.inf)
     slice_y /= max_slice
 
     filtered_indices = slice_x[slice_y > ORDER_GAUSS_THRESHOLD]
@@ -528,13 +600,14 @@ def slice_analysis(pixel, slice_x, slice_y, MIN_WINDOW=15, MAX_WINDOW=15, NOISE_
             plt.axvline(l, ymin=0, ymax=0.93, color="gray")
             plt.text(s=str(idx), x=l, y=1.1, rotation=90,
                      va="center", ha="center")
+        plt.axhline(ORDER_GAUSS_THRESHOLD, color="orange")
         plt.plot(slice_x, slice_y)
         plt.ylim(-0.05, 1.15)
         plt.tight_layout()
         plt.show()
 
     fit_params = []
-    avg_peak_distance = np.mean(np.diff(peak_locations))
+    med_peak_distance = np.median(np.diff(peak_locations))
 
     refined_peak_locations = []
     location_uncertainties = []
@@ -542,19 +615,19 @@ def slice_analysis(pixel, slice_x, slice_y, MIN_WINDOW=15, MAX_WINDOW=15, NOISE_
     for i, peak_location in enumerate(peak_locations):
         if i == 0:
             mask = slice_x < peak_location + (peak_locations[i + 1] - peak_location) / 2
-            bounds = [[0, 0, 0], [np.inf, peak_locations[i + 1], avg_peak_distance / 2]]
+            bounds = [[0, 0, 0], [np.inf, peak_locations[i + 1], med_peak_distance / 2]]
         elif i == len(peak_locations) - 1:
             mask = slice_x > peak_location - (peak_location - peak_locations[i - 1]) / 2
-            bounds = [[0, peak_locations[i - 1], 0], [np.inf, np.max(slice_x), avg_peak_distance / 2]]
+            bounds = [[0, peak_locations[i - 1], 0], [np.inf, np.max(slice_x), med_peak_distance / 2]]
         else:
             mask = np.logical_and(slice_x < peak_location + (peak_locations[i + 1] - peak_location) / 2,
                                   slice_x > peak_location - (peak_location - peak_locations[i - 1]) / 2)
-            bounds = [[0, peak_locations[i - 1], 0], [np.inf, peak_locations[i + 1], avg_peak_distance / 2]]
+            bounds = [[0, peak_locations[i - 1], 0], [np.inf, peak_locations[i + 1], med_peak_distance / 2]]
         x_neighborhood = slice_x[mask]
         y_neighborhood = slice_y[mask]
 
         params, errs = curve_fit(Gaussian, x_neighborhood, y_neighborhood,
-                                 [1, peak_location, avg_peak_distance / 4],
+                                 [1, peak_location, med_peak_distance / 4],
                                  bounds=bounds,
                                  maxfev=100000)
 
@@ -651,7 +724,7 @@ def wlshift(wl, vel_corr):
     return wl / (1 - (vel_corr / (speed_of_light / 1000)))
 
 
-def solve_wavelength(linetable, order: SpectralOrder, pixel_window=10, DEBUG_PLOT=False):
+def solve_wavelength(linetable, order: SpectralOrder, pixel_window=10, DEBUG_PLOTS=False):
     line_wls = (linetable[:, 1] + linetable[:, 2]) / 2
     line_px = linetable[:, 0]
 
@@ -684,22 +757,24 @@ def solve_wavelength(linetable, order: SpectralOrder, pixel_window=10, DEBUG_PLO
         actual_positions.append(params[1])
         actual_errors.append(errs[1])
         fwhm_pix.append(params[2]*two_log_two)
-        if DEBUG_PLOT:
+        if DEBUG_PLOTS:
             plt.plot(pwin, Gaussian_res(pwin, *params), color="red", zorder=20)
 
     actual_positions = np.array(actual_positions)
     actual_errors = np.array(actual_errors)
     fwhm_pix = np.array(fwhm_pix)
 
-    if DEBUG_PLOT:
+    if DEBUG_PLOTS:
         plt.plot(pixels, order.comparison, zorder=10)
         plt.show()
 
     # this depends on the spectrograph!
-    too_wide_pix = 6
+    # in the blue, OES has 7x sampling ...
+    too_wide_pix = 7
     too_narrow_pix = 2.5
 
     mask_good = (fwhm_pix < too_wide_pix) & (fwhm_pix > too_narrow_pix)
+#    mask_good = np.ones(len(fwhm_pix)).astype(bool)
 
     not_enough_lines = (np.sum(mask_good) < 5)
     if not_enough_lines:
@@ -710,23 +785,83 @@ def solve_wavelength(linetable, order: SpectralOrder, pixel_window=10, DEBUG_PLO
     if (np.sum(mask_good) < 5):
         raise Exception("Not enough calibration lines in order %d" % order.id)
 
-    if DEBUG_PLOT:
+    if DEBUG_PLOTS:
         plt.scatter(actual_positions[~mask_good], fwhm_pix[~mask_good], zorder=10, color="gray")
         plt.scatter(actual_positions[mask_good], fwhm_pix[mask_good], zorder=11, color="black")
         plt.axhline(too_wide_pix, ls="--", c="red")
         plt.axhline(too_narrow_pix, ls="--", c="red")
         plt.show()
 
+    # threshold = np.percentile(actual_errors, 0.9)
+    # actual_positions = actual_positions[actual_errors <= threshold]
+    # actual_errors = actual_errors[actual_errors <= threshold]
+
     actual_positions = actual_positions[mask_good]
     actual_errors = actual_errors[mask_good]
     fwhm_pix = fwhm_pix[mask_good]
     line_wls = line_wls[mask_good]
 
-    # threshold = np.percentile(actual_errors, 0.9)
-    # actual_positions = actual_positions[actual_errors <= threshold]
-    # actual_errors = actual_errors[actual_errors <= threshold]
+    x = actual_positions
+    y = line_wls
+    yerr = actual_errors
+    isort = np.argsort(x)
+    x = x[isort]
+    y = y[isort]
+    yerr = yerr[isort]
+    kwargs = {"sigma": yerr}
+    thres = [10, 5, 3, 2]
+    thres_max = 0.1
+    params, errs, mask_good = curve_fit_reject(x, y, polynomial,
+                                               thres=thres, thres_max=thres_max,
+                                               **kwargs)
 
-    params, errs = curve_fit(polynomial, actual_positions, line_wls, sigma=actual_errors)
+    ypoly = polynomial(x, *params)
+    # root mean squared
+    resid = (y - ypoly)
+    nresid = len(resid)
+    rms = np.sqrt(np.sum(np.square(resid)) / nresid)
+
+    if DEBUG_PLOTS:
+#    if True:
+
+        figsize = np.array([8, 6])
+        fig, axs = plt.subplots(2, 1, sharex=True,
+                                height_ratios=[3, 1],
+                                figsize=figsize)
+        fig.subplots_adjust(hspace=0)
+#        axs[0].invert_yaxis()
+        axs[0].set_ylabel("y  /  Angstrom")
+        axs[1].set_xlabel("x  /  pix")
+        axs[1].set_ylabel("y - yfit  /  Angstrom")
+        axs[0].scatter(x[mask_good], y[mask_good], color="black")
+        axs[0].scatter(x[~mask_good], y[~mask_good], color="gray")
+        axs[0].plot(x, ypoly, color="red")
+
+        rmax = np.max(resid)
+        rmin = np.min(resid)
+        rbuf = (rmax - rmin) * 0.1
+        axs[1].set_ylim(bottom=rmin-rbuf, top=rmax+rbuf)
+        axs[1].axhline(y=0, ls="--", color="gray", zorder=10)
+        axs[1].scatter(x[mask_good], resid[mask_good], color="black", zorder=20)
+        axs[1].scatter(x[~mask_good], resid[~mask_good], color="gray", zorder=20)
+
+        axs[0].text(0.95, 0.9,
+                s="rms = %.3f" % (rms),
+                ha='right', va='center',
+                transform=axs[0].transAxes)
+
+        fig.suptitle("order " + str(order.id))
+
+        plt.tight_layout()
+        plt.show()
+
+
+    actual_positions = actual_positions[mask_good]
+    actual_errors = actual_errors[mask_good]
+    fwhm_pix = fwhm_pix[mask_good]
+    line_wls = line_wls[mask_good]
+
+#    params, errs = curve_fit(polynomial, actual_positions[mask_good], line_wls[mask_good], sigma=actual_errors[mask_good])
 
     pix_width = [np.mean(np.diff(polynomial(np.arange(3)+i-1,*params))) for i in actual_positions]
     pix_width = np.abs(pix_width)
@@ -738,7 +873,8 @@ def solve_wavelength(linetable, order: SpectralOrder, pixel_window=10, DEBUG_PLO
     order.cal_pix_fwhm = fwhm_pix
     order.cal_wl_fwhm = fwhm_angstrom
 
-    if DEBUG_PLOT:
+    if DEBUG_PLOTS:
+        # plot spectral resolution
         plt.scatter(order.cal_wl, order.cal_wl/fwhm_angstrom, zorder=10)
         plt.show()
 
@@ -771,11 +907,13 @@ def mask_intervals(x, intervals):
     return mask
 
 def poly_normalization(wls, flxs,
-                         ignore_windows=[(4090, 4115), (4320, 4355),
-                                         (4842, 4888), (6540, 6590),
-                                         (6860, 6880),
-                                         (6888.1, 6890.5), (6892,6893.6),
-                                         (7590, 7617), (7622.8, 7625)],
+                       ignore_windows=[(3831.4, 3839.4),
+                                       (3883, 3893), (3963.5, 3981),
+                                       (4090, 4115), (4320, 4355),
+                                       (4842, 4888), (6540, 6590),
+                                       (6860, 6880),
+                                       (6888.1, 6890.5), (6892,6893.6),
+                                       (7590, 7617), (7622.8, 7625)],
                          DEBUG_PLOTS=False):
 
     for i, wl in enumerate(wls):
@@ -980,7 +1118,7 @@ def estimate_resolution(orders, verbose=False, DEBUG_PLOTS=False):
 
     return dout
 
-def merge_resolution(wave_merged, orders, dres, DEBUG_PLOTS=False):
+def merge_resolution(wave_merged, orders, dres, npix=45, DEBUG_PLOTS=False):
     res_poly = []
     res_poly_wl = []
     for i, o in enumerate(orders):
@@ -1002,7 +1140,6 @@ def merge_resolution(wave_merged, orders, dres, DEBUG_PLOTS=False):
     res_min = dres["R_lo"] / 3
     res_merged[res_merged<=res_min] = res_min
     # smooth
-    npix = 35
     res_merged = gaussian_filter1d(res_merged, npix,
                                    mode="constant", cval=res_med)
 
@@ -1012,6 +1149,7 @@ def merge_resolution(wave_merged, orders, dres, DEBUG_PLOTS=False):
     return res_merged
 
 def extract_spectrum(spectrum, flats, comps, biases, idcomp_offset=-15,
+                     frame_for_slice=None,
                      normalize=True, idcomp_dir="idcomp",
                      sampling=200, min_order_samples=6,
                      apply_barycorr=True,
@@ -1023,32 +1161,37 @@ def extract_spectrum(spectrum, flats, comps, biases, idcomp_offset=-15,
     comps = open_or_coadd_frame(comps)
     biases = open_or_coadd_frame(biases)
 
+    if frame_for_slice is None:
+        frame_for_slice = flats
+    else:
+        frame_for_slice = open_or_coadd_frame(frame_for_slice)
+        frame_for_slice = (frame_for_slice + flats) / 2
+
     slices = []
 
     # Get orders and stuff from flat
     if verbose: print("- identifying orders")
-    npix_x = flats.shape[1]
+    npix_x = frame_for_slice.shape[1]
     pixels = np.linspace(5, npix_x-5, sampling).astype(int)
     for i in range(sampling):
         pixel = pixels[i]
-#        slice_y = flats[:, pixel - 1].astype(float)
+#        slice_y = frame_for_slice[:, pixel - 1].astype(float)
         # average 3 pixels in x direction
         xidx = np.arange(3) + pixel - 1
         xidx = xidx[(xidx>=0) & (xidx<npix_x)]
-        slice_y = np.sum(flats[:, xidx].astype(float), axis=1) / len(xidx)
-        slice_x = np.arange(flats.shape[1])
+        slice_y = np.sum(frame_for_slice[:, xidx].astype(float), axis=1) / len(xidx)
+        slice_x = np.arange(frame_for_slice.shape[1])
         slice = slice_analysis(pixel - 1, slice_x, slice_y, DEBUG_PLOTS=DEBUG_PLOTS, **kwargs)
         slices.append(slice)
 
     if DEBUG_PLOTS:
-        plt.imshow(flats, zorder=1, cmap='gray', norm="log")
+        plt.imshow(frame_for_slice, zorder=1, cmap='gray', norm="log")
         for slice in slices:
             plt.scatter([np.repeat(slice.x, len(slice.ys))], slice.ys, marker="x", zorder=2)
         plt.tight_layout()
         plt.show()
 
-    norder = 0
-    max_slice = 0
+    norders_slice = []
     for i, slice in enumerate(slices):
         if i == 0:
             slice.next_slice = slices[1]
@@ -1058,27 +1201,36 @@ def extract_spectrum(spectrum, flats, comps, biases, idcomp_offset=-15,
             slice.previous_slice = slices[i - 1]
             slice.next_slice = slices[i + 1]
 
-        if len(slice.ys) > norder:
-            max_slice = i
-            norder = len(slice.ys)
+        # prefer a slice in the middle of the frame
+        if abs(slice.x - 1024) < 200:
+            norders_slice.append(len(slice.ys))
+        else:
+            norders_slice.append(len(slice.ys)/2)
+
+    max_slice = np.argmax(norders_slice)
 
     # max_slice is the slice that has the largest number of order identifications
-    orders = assign_orders(slices, max_slice, **kwargs)
+    orders = assign_orders(slices, max_slice, DEBUG_PLOTS=DEBUG_PLOTS, **kwargs)
 
     if verbose: print(f"- {len(orders)} orders found")
 
+    norders = len(orders)
+    idx = np.arange(norders)
+    # start from the middle, alternate each side (use later for starting parameters)
+#    idx = norders // 2 + (idx + 1) // 2 * (-1) ** idx
     # fit orders with polynomials
-    for i, o in enumerate(orders):
+    for i in idx:
+        o = orders[i]
         if len(o) > min_order_samples:
-            o.generate_polynomial_solution(verbose=verbose)
-
-    if DEBUG_PLOTS:
-        for o in orders:
-            plt.hist(o.rms, bins=10)
-        plt.show()
+            o.generate_polynomial_solution(verbose=verbose, DEBUG_PLOTS=DEBUG_PLOTS)
 
     # remove bad orders
     orders = [o for o in orders if o.solution is not None]
+
+#    if DEBUG_PLOTS:
+#        for o in orders:
+#            plt.hist(o.rms, bins=10)
+#        plt.show()
 
     # estimate y-pos of each order at the center of the x axis
     ap_measure = []
@@ -1104,14 +1256,13 @@ def extract_spectrum(spectrum, flats, comps, biases, idcomp_offset=-15,
     if verbose: print(f"- {len(orders)} orders identified")
 
     times_sigma = 2
-
     if DEBUG_PLOTS:
-        plt.imshow(flats, zorder=1, cmap='gray')
+        plt.imshow(frame_for_slice, zorder=1, cmap='gray')
         for slice in slices:
             plt.scatter([np.repeat(slice.x, len(slice.ys))], slice.ys, marker="x", zorder=2)
         for o in orders:
             # plt.scatter(o.pixel_x, o.pixel_y, marker="x", zorder=2)
-            x = np.arange(flats.shape[1])
+            x = np.arange(frame_for_slice.shape[1])
             o.generate_width_fcn()
             sigma = o.w_fcn(x) / two_log_two
             width = times_sigma * sigma
@@ -1122,22 +1273,6 @@ def extract_spectrum(spectrum, flats, comps, biases, idcomp_offset=-15,
         plt.tight_layout()
         plt.show()
 
-    if verbose: print("- extracting orders")
-
-    # Extract different spectra
-    for o in orders:
-        if verbose: print("- order", o.id, end="\r")
-        o.extract_along_order(spectrum, "science", times_sigma=times_sigma)
-        o.extract_along_order(flats, "flat", times_sigma=times_sigma)
-        o.extract_along_order(biases, "bias", times_sigma=times_sigma)
-        o.extract_along_order(comps, "comp", times_sigma=times_sigma)
-
-        o.apply_corrections()
-        # o.plot_frame("science")
-        # o.plot_frame("flat")
-        # o.plot_frame("bias")
-        # o.plot_frame("comp")
-
     linelists = {}
     fp_idcomp = sorted(os.listdir(idcomp_dir))
     for file in fp_idcomp:
@@ -1147,6 +1282,7 @@ def extract_spectrum(spectrum, flats, comps, biases, idcomp_offset=-15,
             linelists[avg_ap+idcomp_offset] = table
     avg_aps = np.array(list(linelists.keys()))
     nlist = len(avg_aps)
+
 
     if DEBUG_PLOTS:
         plt.imshow(flats)
@@ -1159,6 +1295,31 @@ def extract_spectrum(spectrum, flats, comps, biases, idcomp_offset=-15,
     id_order_pairs = [p for p in id_order_pairs if (p[0] is not None) and (p[1] is not None)]
     if verbose: print("- found %d pairs" % len(id_order_pairs))
 
+    if verbose: print("- extracting orders")
+
+    # Extract different spectra
+
+    for o in orders:
+#    for p in id_order_pairs:
+#        idx_order = p[1]
+#        o = orders[idx_order]
+        if verbose: print("- order", o.id, end="\r")
+        o.extract_along_order(spectrum, "science", times_sigma=times_sigma)
+        o.extract_along_order(flats, "flat", times_sigma=times_sigma)
+        o.extract_along_order(biases, "bias", times_sigma=times_sigma)
+        o.extract_along_order(comps, "comp", times_sigma=times_sigma)
+
+
+        o.apply_corrections()
+
+#        o.plot_frame_1d("comp_orig")
+
+        # o.plot_frame_1d("science")
+        # o.plot_frame_1d("flat")
+        # o.plot_frame_1d("bias")
+        # o.plot_frame_1d("comp")
+
+
     if verbose: print("- solving dispersion relations")
     for p in id_order_pairs:
         idx_id = p[0]
@@ -1168,6 +1329,8 @@ def extract_spectrum(spectrum, flats, comps, biases, idcomp_offset=-15,
         key = avg_aps[idx_id]
         linelist_o = linelists[key]
         solve_wavelength(linelist_o, o)
+
+#        o.plot_frame_1d("comp_orig")
 
     orders = [o for o in orders if o.wl is not None]
 
@@ -1199,6 +1362,7 @@ def extract_spectrum(spectrum, flats, comps, biases, idcomp_offset=-15,
             plt.plot(o.pix, np.log10(o.wl), zorder=11, lw=1)
         plt.show()
 
+
     # estimate spectral resolving power
     dres = estimate_resolution(orders, verbose=verbose, DEBUG_PLOTS=DEBUG_PLOTS)
 
@@ -1217,7 +1381,8 @@ def extract_spectrum(spectrum, flats, comps, biases, idcomp_offset=-15,
     # this may remove all pixels ...
 #    wave_merged, flux_merged = rmcosmics(wave_merged, flux_merged)
 
-    mask = np.isfinite(flux_merged)
+    flux_median = np.nanmedian(flux_merged)
+    mask = np.isfinite(flux_merged) & (flux_merged > -flux_median)
     mask[[0, -1]] = False
     wave_merged = wave_merged[mask]
     flux_merged = flux_merged[mask]
@@ -1247,7 +1412,11 @@ if __name__ == "__main__":
                             flats=bp+"e202409010019.fit",
                             comps=bp+"e202409010029.fit",
                             biases=bp+"e202409010033.fit",
+                            frame_for_slice=bp+"e202409020033.fit",
                             idcomp_dir=idcomp_dir,
                             verbose=verbose)
     print(spec)
+
+    plt.plot(spec["wave"], spec["flux"])
+    plt.show()
 
