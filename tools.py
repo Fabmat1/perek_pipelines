@@ -33,6 +33,17 @@ def fill_nan(y):
 
     return y
 
+# sort and mask the sections based on flux thresholds
+def mask_section(section, tlo=0.05, thi=0.05, return_mask=False):
+    sorted_section = np.sort(section)
+    lsec = len(section)
+    mask = (section > sorted_section[int(tlo*lsec)]) & \
+           (section < sorted_section[int((1-thi)*lsec)])
+    if return_mask:
+        return mask
+    else:
+        return section[mask]
+
 def pair_generation(arr1, arr2, thres_max=5.5):
     arr1 = np.array(arr1)
     arr2 = np.array(arr2)
