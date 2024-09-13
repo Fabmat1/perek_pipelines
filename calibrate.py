@@ -1,9 +1,49 @@
+import os
 import numpy as np
 from scipy.optimize import curve_fit
 from matplotlib import pyplot as plt
-from tools import Gaussian_res, polynomial, curve_fit_reject
+from tools import Gaussian_res, polynomial, curve_fit_reject, pair_generation
 
 two_log_two = 2 * np.sqrt(2 * np.log(2))
+
+def parse_idcomp(file_path):
+    with open(file_path, 'r') as file:
+        lines = file.readlines()
+
+    aplow = None
+    aphigh = None
+    table_data = []
+    in_table = False
+
+    for line in lines:
+        # Strip leading/trailing whitespace
+        line = line.strip()
+
+        # Extract aplow and aphigh values
+        if line.startswith('aplow'):
+            aplow = float(line.split()[1])
+        elif line.startswith('aphigh'):
+            aphigh = float(line.split()[1])
+
+        # Identify when the table starts
+        if line.startswith('features'):
+            in_table = True
+            continue  # Skip the "features" line itself
+
+        # Collect table data
+        if in_table:
+            # Check if the line is still part of the table (starts with a number)
+            if line and line[0].isdigit():
+                floats = line.split()
+                if len(floats) == 7:
+                    floats = floats[:-1]
+                row = list(map(float, floats))
+                table_data.append(row)
+            else:
+                # Table ends if we encounter a non-digit line
+                in_table = False
+
+    return aplow, aphigh, np.array(table_data)
 
 def fit_comparison(linetable, comparison, pixel_window=10, DEBUG_PLOTS=False):
     line_wls = (linetable[:, 1] + linetable[:, 2]) / 2
@@ -203,3 +243,68 @@ def solve_wavelength(linetable, order, pixel_window=10, DEBUG_PLOTS=False):
         # plot spectral resolution
         plt.scatter(order.cal_wl, order.cal_wl/fwhm_angstrom, zorder=10)
         plt.show()
+
+
+def find_dispersion(orders, biases, comps,
+                    idcomp_dir, idcomp_offset=-15,
+                    verbose=False, DEBUG_PLOTS=False):
+
+    npix_x = biases.shape[1]
+    # estimate y-pos of each order at the center of the x axis
+    ap_measure = []
+    for o in orders:
+        ap = float(polynomial(npix_x / 2, *o.solution))
+        o.pixel_y_cen = ap
+        ap_measure.append(ap)
+
+    times_sigma = 2
+
+    linelists = {}
+    fp_idcomp = sorted(os.listdir(idcomp_dir))
+    for file in fp_idcomp:
+        if "idiazcomp" in file:
+            aplo, aphi, table = parse_idcomp(idcomp_dir + "/" + file)
+            avg_ap = (aplo + aphi) / 2
+            linelists[avg_ap+idcomp_offset] = table
+    avg_aps = np.array(list(linelists.keys()))
+    nlist = len(avg_aps)
+
+    if DEBUG_PLOTS:
+        plt.imshow(flats)
+        for key in linelists.keys():
+            plt.scatter([len(spectrum) / 2], [key], marker="x", zorder=2, color="red")
+        plt.show()
+
+    # find the best-matching orders
+    id_order_pairs = pair_generation(avg_aps, ap_measure, thres_max=np.inf)
+    id_order_pairs = [p for p in id_order_pairs if (p[0] is not None) and (p[1] is not None)]
+    if verbose: print("- found %d pairs" % len(id_order_pairs))
+
+    if verbose: print("- extracting orders")
+
+    # Extract different spectra
+#    for o in orders:
+    for p in id_order_pairs:
+        idx_order = p[1]
+        o = orders[idx_order]
+        if verbose: print("- order", o.id, end="\r")
+        o.extract_along_order(biases, "bias", times_sigma=times_sigma)
+        o.extract_along_order(comps, "comp", times_sigma=times_sigma)
+        o.apply_corrections(comparison=True)
+
+#        o.plot_frame_1d("comp_orig")
+
+    if verbose: print("- solving dispersion relations")
+    for p in id_order_pairs:
+        idx_id = p[0]
+        idx_order = p[1]
+        o = orders[idx_order]
+        if verbose: print("- order", o.id, end="\r")
+        key = avg_aps[idx_id]
+        linelist_o = linelists[key]
+        solve_wavelength(linelist_o, o)
+        o.pix = np.arange(len(o.wl))
+
+#        o.plot_frame_1d("comp_orig")
+
+    return orders

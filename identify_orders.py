@@ -451,4 +451,4 @@ def find_orders(frame_for_slice,
         plt.tight_layout()
         plt.show()
 
-    return slices, orders
+    return orders

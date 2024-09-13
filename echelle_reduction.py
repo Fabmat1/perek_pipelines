@@ -16,7 +16,7 @@ from estimate_noise import estimate_noise
 from tools import (polyfit_reject, curve_fit_reject, pair_generation,
                    mask_section,
                    fill_nan, Gaussian, Gaussian_res, polynomial)
-from calibrate import solve_wavelength
+from calibrate import find_dispersion
 from identify_orders import (SpectralSlice, find_orders)
 from orders import SpectralOrder
 
@@ -32,87 +32,42 @@ except ModuleNotFoundError:
 
 two_log_two = 2 * np.sqrt(2 * np.log(2))
 
-def parse_idcomp(file_path):
-    with open(file_path, 'r') as file:
-        lines = file.readlines()
+def get_barycorr(frame):
+    with fits.open(frame) as hdul:
+        header = hdul[0].header
+    header = dict(header)
+    hreq = ["LATITUDE", "LONGITUD", "HEIGHT",
+            "RA", "DEC", "DATE-OBS", "UT"]
+    if all(i in header for i in hreq):
+        lat = header['LATITUDE']
+        lon = header['LONGITUD']
 
-    aplow = None
-    aphigh = None
-    table_data = []
-    in_table = False
+        height = header['HEIGHT']
+        RA = header['RA']
+        DEC = header['DEC']
 
-    for line in lines:
-        # Strip leading/trailing whitespace
-        line = line.strip()
+        time = Time(header["DATE-OBS"]+"T"+header["UT"], format='isot', scale='utc')
 
-        # Extract aplow and aphigh values
-        if line.startswith('aplow'):
-            aplow = float(line.split()[1])
-        elif line.startswith('aphigh'):
-            aphigh = float(line.split()[1])
+        location = EarthLocation(lat=lat, lon=lon, height=height)
+        coord = SkyCoord(ra=RA, dec=DEC, unit=(u.hourangle, u.deg))
+        radvel_corr = coord.radial_velocity_correction(obstime=time, location=location)
+        radvel_corr = radvel_corr.to(u.km / u.s)
+        radvel_corr = radvel_corr.value
+    return radvel_corr
 
-        # Identify when the table starts
-        if line.startswith('features'):
-            in_table = True
-            continue  # Skip the "features" line itself
-
-        # Collect table data
-        if in_table:
-            # Check if the line is still part of the table (starts with a number)
-            if line and line[0].isdigit():
-                floats = line.split()
-                if len(floats) == 7:
-                    floats = floats[:-1]
-                row = list(map(float, floats))
-                table_data.append(row)
-            else:
-                # Table ends if we encounter a non-digit line
-                in_table = False
-
-    return aplow, aphigh, np.array(table_data)
-
-
-def open_or_coadd_frame(frame, get_add_info=False):
-    if isinstance(frame, np.ndarray):
-        if get_add_info:
-            raise Exception("Spectrum MUST be path to fits file!")
-        return frame
-    elif isinstance(frame, list):
-        frame = np.sum(frame, axis=0).astype(float) / len(frame)
-        if get_add_info:
-            raise Exception("Spectrum MUST be path to fits file!")
-    else:
-        frame = fits.open(frame)
-        if get_add_info:
-            header = frame[0].header
-            header = dict(header)
-            hreq = ["LATITUDE", "LONGITUD", "HEIGHT",
-                    "RA", "DEC", "DATE-OBS", "UT"]
-            if all(i in header for i in hreq):
-                lat = header['LATITUDE']
-                lon = header['LONGITUD']
-
-                height = header['HEIGHT']
-                RA = header['RA']
-                DEC = header['DEC']
-
-                time = Time(header["DATE-OBS"]+"T"+header["UT"], format='isot', scale='utc')
-
-                location = EarthLocation(lat=lat, lon=lon, height=height)
-                coord = SkyCoord(ra=RA, dec=DEC, unit=(u.hourangle, u.deg))
-                radvel_corr = coord.radial_velocity_correction(obstime=time, location=location)
-                radvel_corr = radvel_corr.to(u.km / u.s)
-                radvel_corr = radvel_corr.value
-
-                return frame[0].data, radvel_corr
-            else:
-                return frame[0].data, None
-
-        else:
-            frame = frame[0].data
-
+def coadd_frames(frames):
+    frame = np.sum(frames, axis=0).astype(float) / len(frames)
     return frame
 
+def open_or_coadd_frame(frame):
+    if isinstance(frame, np.ndarray):
+        return frame
+    elif isinstance(frame, list):
+        frame = coadd_frames(frame)
+    else:
+        with fits.open(frame) as hdul:
+            frame = hdul[0].data
+    return frame
 
 def wlshift(wl, vel_corr):
     # wl_shift = vel_corr/speed_of_light * wl
@@ -397,6 +352,33 @@ def merge_resolution(wave_merged, orders, dres, npix=45, DEBUG_PLOTS=False):
         plt.show()
     return res_merged
 
+def calibrate_orders(flat, comp, bias,
+                     idcomp_dir="idcomp",
+                     idcomp_offset=-15,
+                     sampling=200, min_order_samples=6,
+                     frame_for_slice=None,
+                     verbose=False, DEBUG_PLOTS=False):
+
+    if frame_for_slice is None:
+        frame_for_slice = flat
+    else:
+        frame_for_slice = open_or_coadd_frame(frame_for_slice)
+        frame_for_slice = (frame_for_slice + flat) / 2
+
+    # find orders in 2d image
+    orders = find_orders(frame_for_slice, sampling=sampling,
+                         min_order_samples=min_order_samples,
+                         DEBUG_PLOTS=DEBUG_PLOTS, verbose=verbose)
+
+    # extract calibration and solve dispersion relations for each identified order
+    orders = find_dispersion(orders, bias, comp, idcomp_dir,
+                             idcomp_offset=idcomp_offset,
+                             verbose=verbose,
+                             DEBUG_PLOTS=DEBUG_PLOTS)
+
+    orders = [o for o in orders if o.wl is not None]
+
+    return orders
 
 def extract_spectrum(spectrum, flats, comps, biases, idcomp_offset=-15,
                      frame_for_slice=None,
@@ -404,100 +386,45 @@ def extract_spectrum(spectrum, flats, comps, biases, idcomp_offset=-15,
                      sampling=200, min_order_samples=6,
                      apply_barycorr=True,
                      verbose=False,
+                     orders=None,
                      DEBUG_PLOTS=False, **kwargs):
 
-    spectrum, radvel = open_or_coadd_frame(spectrum, True)
+    radvel = get_barycorr(spectrum)
+
+    spectrum = open_or_coadd_frame(spectrum)
     flats = open_or_coadd_frame(flats)
     comps = open_or_coadd_frame(comps)
     biases = open_or_coadd_frame(biases)
 
-    if frame_for_slice is None:
-        frame_for_slice = flats
-    else:
-        frame_for_slice = open_or_coadd_frame(frame_for_slice)
-        frame_for_slice = (frame_for_slice + flats) / 2
+    if orders is None:
+        orders = calibrate_orders(flats, comps, biases,
+                                  idcomp_dir=idcomp_dir,
+                                  idcomp_offset=idcomp_offset,
+                                  sampling=sampling,
+                                  min_order_samples=min_order_samples,
+                                  frame_for_slice=frame_for_slice,
+                                  verbose=verbose, DEBUG_PLOTS=DEBUG_PLOTS)
 
-    slices, orders = find_orders(frame_for_slice, sampling=sampling,
-                                 min_order_samples=min_order_samples,
-                                 DEBUG_PLOTS=DEBUG_PLOTS, verbose=verbose)
-
-    # estimate y-pos of each order at the center of the x axis
-    ap_measure = []
-    for o in orders:
-        ap = float(polynomial(len(spectrum) / 2, *o.solution))
-        o.pixel_y_cen = ap
-        ap_measure.append(ap)
+#    print("NORDERS", len(orders))
 
     times_sigma = 2
 
-    linelists = {}
-    fp_idcomp = sorted(os.listdir(idcomp_dir))
-    for file in fp_idcomp:
-        if "idiazcomp" in file:
-            aplo, aphi, table = parse_idcomp(idcomp_dir + "/" + file)
-            avg_ap = (aplo + aphi) / 2
-            linelists[avg_ap+idcomp_offset] = table
-    avg_aps = np.array(list(linelists.keys()))
-    nlist = len(avg_aps)
-
-
-    if DEBUG_PLOTS:
-        plt.imshow(flats)
-        for key in linelists.keys():
-            plt.scatter([len(spectrum) / 2], [key], marker="x", zorder=2, color="red")
-        plt.show()
-
-    # find the best-matching orders
-    id_order_pairs = pair_generation(avg_aps, ap_measure, thres_max=np.inf)
-    id_order_pairs = [p for p in id_order_pairs if (p[0] is not None) and (p[1] is not None)]
-    if verbose: print("- found %d pairs" % len(id_order_pairs))
-
     if verbose: print("- extracting orders")
-
     # Extract different spectra
-#    for o in orders:
-    for p in id_order_pairs:
-        idx_order = p[1]
-        o = orders[idx_order]
+    for o in orders:
         if verbose: print("- order", o.id, end="\r")
         o.extract_along_order(spectrum, "science", times_sigma=times_sigma)
         o.extract_along_order(flats, "flat", times_sigma=times_sigma)
         o.extract_along_order(biases, "bias", times_sigma=times_sigma)
         o.extract_along_order(comps, "comp", times_sigma=times_sigma)
 
-        o.apply_corrections()
-
-#        o.plot_frame_1d("comp_orig")
+        o.apply_corrections(comparison=True)
 
         # o.plot_frame_1d("science")
         # o.plot_frame_1d("flat")
         # o.plot_frame_1d("bias")
         # o.plot_frame_1d("comp")
-
-    if verbose: print("- solving dispersion relations")
-    for p in id_order_pairs:
-        idx_id = p[0]
-        idx_order = p[1]
-        o = orders[idx_order]
-        if verbose: print("- order", o.id, end="\r")
-        key = avg_aps[idx_id]
-        linelist_o = linelists[key]
-        solve_wavelength(linelist_o, o)
-
-#        o.plot_frame_1d("comp_orig")
-
-    orders = [o for o in orders if o.wl is not None]
-
-    # sort wavelengths
-    for o in orders:
-        o.pix = np.arange(len(o.wl))
-        isort = np.argsort(o.wl)
-        o.wl = o.wl[isort]
-        o.science = o.science[isort]
-        o.flat = o.flat[isort]
-        o.comparison = o.comparison[isort]
-        o.bias = o.bias[isort]
-        o.pix = o.pix[isort]
+        # o.plot_frame_1d("comp_orig")
 
     if DEBUG_PLOTS:
         for o in orders:
@@ -551,7 +478,8 @@ def extract_spectrum(spectrum, flats, comps, biases, idcomp_offset=-15,
     dout = {"wave": wave_merged,
             "flux": flux_merged,
             "error": noise,
-            "res": res_merged}
+            "res": res_merged,
+            "orders": orders}
 
     return dout
 
@@ -568,7 +496,6 @@ if __name__ == "__main__":
                             frame_for_slice=bp+"e202409020033.fit",
                             idcomp_dir=idcomp_dir,
                             verbose=verbose)
-    print(spec)
 
     plt.plot(spec["wave"], spec["flux"])
     plt.show()

@@ -65,6 +65,7 @@ def reduce_night(dir, idcomp_dir, fn_science=None,
         if fn_science is not None:
             sys.exit("did not find %s in %s" % (fn_science, dir))
 
+    orders = None
     for i in range(len(science)):
         fp = science[i]
         name = scname[i]
@@ -80,9 +81,11 @@ def reduce_night(dir, idcomp_dir, fn_science=None,
             tstart = time.time()
             s = extract_spectrum(dir+"/"+fp, flats, comps, biases,
                                  frame_for_slice=frame_for_slice,
+                                 orders=orders,
                                  idcomp_dir=idcomp_dir, verbose=verbose)
             tstop = time.time()
             print("> done in %.1f s" % (tstop-tstart))
+            orders = s["orders"]
 
             mask_good = s["error"] > 0
             SNR = np.nanmedian(s["flux"][mask_good]/s["error"][mask_good])
@@ -93,7 +96,7 @@ def reduce_night(dir, idcomp_dir, fn_science=None,
                 with fits.open(dir+"/"+fp) as hdul:
                     header = hdul[0].header
                 primary_hdu = fits.PrimaryHDU(header=header)
-                fits_cols = [fits.Column(name=key, array=s[key], format='D') for key in s]
+                fits_cols = [fits.Column(name=key, array=s[key], format='D') for key in s if type(s[key]) == np.ndarray]
                 # the name is always in captials
                 table_hdu = fits.BinTableHDU.from_columns(fits_cols, name="SCIENCE")
                 hdul = fits.HDUList([primary_hdu, table_hdu])

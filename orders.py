@@ -208,29 +208,35 @@ class SpectralOrder:
         plt.tight_layout()
         plt.show()
 
-    def apply_corrections(self, med_win_size=25, min_win_size=15, max_win_size=15):
-        self.flat -= self.bias
-        self.science -= self.bias
-        self.comparison -= self.bias
+    def apply_corrections(self, med_win_size=25, min_win_size=15, max_win_size=15, comparison=False):
 
-        norm_flat = median_filter(self.flat, size=med_win_size)
-        # norm_flat /= norm_flat.max()
+        if self.flat is not None:
+            self.flat -= self.bias
+        if self.science is not None:
+            self.science -= self.bias
+        if self.comparison is not None:
+            self.comparison -= self.bias
 
-        self.flat = norm_flat
+        if self.flat is not None:
+            norm_flat = median_filter(self.flat, size=med_win_size)
+            # norm_flat /= norm_flat.max()
+            self.flat = norm_flat
 
-        self.science /= norm_flat
+        if (self.science is not None) and (self.flat is not None):
+            self.science /= norm_flat
 
-        self.comparison_orig = self.comparison.copy()
-        qhi = np.quantile(self.comparison_orig, 0.9)
-        mask = self.comparison_orig < -qhi
-        self.comparison_orig[mask] = np.nan
-        self.comparison_orig = fill_nan(self.comparison_orig)
+        if comparison and self.comparison is not None:
+            self.comparison_orig = self.comparison.copy()
+            qhi = np.quantile(self.comparison_orig, 0.9)
+            mask = self.comparison_orig < -qhi
+            self.comparison_orig[mask] = np.nan
+            self.comparison_orig = fill_nan(self.comparison_orig)
 
-        self.comparison -= minimum_filter(self.comparison, size=min_win_size)
-        # should clip the filter here, force to exceed noise level
-        self.comparison /= maximum_filter(self.comparison, size=max_win_size)
+            self.comparison -= minimum_filter(self.comparison, size=min_win_size)
+            # should clip the filter here, force to exceed noise level
+            self.comparison /= maximum_filter(self.comparison, size=max_win_size)
 
-        qhi = np.quantile(self.comparison, 0.9)
-        mask = self.comparison < -qhi
-        self.comparison[mask] = np.nan
-        self.comparison = fill_nan(self.comparison)
+            qhi = np.quantile(self.comparison, 0.9)
+            mask = self.comparison < -qhi
+            self.comparison[mask] = np.nan
+            self.comparison = fill_nan(self.comparison)
