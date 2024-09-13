@@ -1,3 +1,4 @@
+import re
 import os
 import sys
 import time
@@ -5,6 +6,27 @@ import numpy as np
 from astropy.io import fits
 from matplotlib import pyplot as plt
 from echelle_reduction import extract_spectrum
+
+def main():
+    dir = "20240901"
+    idcomp_dir = "idcomp_2307/"
+    fn_science = None
+    #fn_science = "e202408300035.fit"
+    verbose = True
+    save_as_fits = True
+    save_as_ascii = True
+    plot_spectra = False
+    frame_for_slice = "20240901/e202409020033.fit"
+    if not os.path.exists(frame_for_slice):
+        frame_for_slice = None
+
+    reduce_night(dir, idcomp_dir,
+                 fn_science=fn_science,
+                 frame_for_slice=frame_for_slice,
+                 verbose=verbose,
+                 save_as_fits=save_as_fits,
+                 save_as_ascii=save_as_ascii,
+                 plot_spectra=plot_spectra)
 
 def reduce_night(dir, idcomp_dir, fn_science=None,
                  frame_for_slice=None,
@@ -47,8 +69,11 @@ def reduce_night(dir, idcomp_dir, fn_science=None,
         fp = science[i]
         name = scname[i]
 
-        fp_save_fits = fp.replace(".fit", "_" + name + ".fits")
-        fp_save_ascii = fp.replace(".fit", "_" + name + ".dat")
+        # replace non-alphanumeric characters, except "_", ".", "+", "-"
+        fp_save = re.sub(r'[^\w_.+-]', '_', fp)
+
+        fp_save_fits = fp_save.replace(".fit", "_" + name + ".fits")
+        fp_save_ascii = fp_save.replace(".fit", "_" + name + ".dat")
         if (save_as_fits and (not os.path.exists(fp_save_fits))) or \
            (save_as_ascii and (not os.path.exists(fp_save_ascii))):
             print("> reducing %s (%s)" % (fp, name))
@@ -89,26 +114,6 @@ def reduce_night(dir, idcomp_dir, fn_science=None,
         else:
             print("> skipped %s (%s)" % (fp, name))
 
-def main():
-    dir = "20240828"
-    idcomp_dir = "idcomp_2307/"
-    fn_science = None
-    #fn_science = "e202408300035.fit"
-    verbose = True
-    save_as_fits = True
-    save_as_ascii = True
-    plot_spectra = True
-    frame_for_slice = "20240902/e202409020033.fit"
-    if not os.path.exists(frame_for_slice):
-        frame_for_slice = None
-
-    reduce_night(dir, idcomp_dir,
-                 fn_science=fn_science,
-                 frame_for_slice=frame_for_slice,
-                 verbose=verbose,
-                 save_as_fits=save_as_fits,
-                 save_as_ascii=save_as_ascii,
-                 plot_spectra=plot_spectra)
 
 if __name__ == "__main__":
     main()

@@ -13,7 +13,9 @@ from scipy.interpolate import interp1d
 from scipy.optimize import curve_fit
 from astropy.stats import sigma_clip
 from estimate_noise import estimate_noise
-from tools import polyfit_reject, pair_generation, curve_fit_reject, fill_nan
+from tools import (polyfit_reject, curve_fit_reject, pair_generation,
+                   fill_nan, Gaussian, Gaussian_res, polynomial)
+from calibrate import solve_wavelength
 try:
     from resample_spectres import resample
 except ModuleNotFoundError:
@@ -25,9 +27,6 @@ except ModuleNotFoundError:
         raise Exception("Need either 'spectres' or 'resample_spectres'")
 
 two_log_two = 2 * np.sqrt(2 * np.log(2))
-
-def polynomial(x, a, b, c, d):
-    return a * x ** 3 + b * x ** 2 + c * x + d
 
 class SpectralOrder:
     def __init__(self, id):
@@ -282,17 +281,6 @@ class SpectralSlice:
                     self.order_ownership[i] = self.order_ownership[i + j] - j
                 else:
                     self.order_ownership[i] = self.order_ownership[i - 1] + 1
-
-
-def Gaussian(x, A, mu=0, sigma=1):
-    return A * (1 / (sigma * np.sqrt(2 * np.pi))) * np.exp(-0.5 * ((x - mu) / sigma) ** 2)
-
-
-def Gaussian_res(x, A, mu=0, sigma=1):
-    oversample = 10
-    xfull = np.linspace(np.min(x), np.max(x), len(x)*oversample)
-    yfull = Gaussian(xfull, A, mu=mu, sigma=sigma)
-    return resample(x, xfull, yfull, fill=0, verbose=False)
 
 def assign_orders(slicelist: list[SpectralSlice], max_ind, DEBUG_PLOTS=False, **kwargs):
     # Forward loop
@@ -697,186 +685,11 @@ def open_or_coadd_frame(frame, get_add_info=False):
 
     return frame
 
-class WavelenthPixelTransform():
-    def __init__(self, wstart, dwdp=None, dwdp2=None, dwdp3=None, dwdp4=None, polyorder=3):
-        self.wstart = wstart  # wavelength at pixel 0
-        self.dwdp = dwdp  # d(wavelength)/d(pixel)
-        self.dwdp2 = dwdp2  # d(wavelength)^2/d(pixel)^2
-        self.dwdp3 = dwdp3  # d(wavelength)^3/d(pixel)^3
-        self.dwdp4 = dwdp4  # d(wavelength)^4/d(pixel)^4
-        self.polyorder = polyorder
-
-    def wl_to_px(self, wl_arr):
-        pxspace = np.linspace(0, 2500, 2500)
-        f = interp1d(self.px_to_wl(pxspace), pxspace, bounds_error=False, fill_value="extrapolate")
-        return f(wl_arr)
-
-    def px_to_wl(self, px_arr):
-        if self.polyorder == 4:
-            return line(px_arr, self.dwdp4, self.dwdp3, self.dwdp2, self.dwdp, self.wstart)
-        elif self.polyorder == 3:
-            return self.wstart + self.dwdp * px_arr + self.dwdp2 * px_arr ** 2 + self.dwdp3 * px_arr ** 3
-
 
 def wlshift(wl, vel_corr):
     # wl_shift = vel_corr/speed_of_light * wl
     # return wl+wl_shift
     return wl / (1 - (vel_corr / (speed_of_light / 1000)))
-
-
-def solve_wavelength(linetable, order: SpectralOrder, pixel_window=10, DEBUG_PLOTS=False):
-    line_wls = (linetable[:, 1] + linetable[:, 2]) / 2
-    line_px = linetable[:, 0]
-
-    initial_params, _ = curve_fit(polynomial, line_px, line_wls)
-
-    pixels = np.arange(len(order.comparison)) + 1
-    actual_positions = []
-    actual_errors = []
-    fwhm_pix = []
-
-    for l in line_px:
-        px_window = np.logical_and(pixels > l - pixel_window, pixels < l + pixel_window)
-        pwin = pixels[px_window]
-        intensities = order.comparison[px_window]
-
-        # replace with Levenberg-Marquardt fit (lmfit)
-        # remove bad fits (assume snr = 100), cut on rchi^2
-        # possibly resample
-        # extrapolate solutions, iterative identification with ThAr lines
-        params, errs = curve_fit(Gaussian_res, pwin, intensities,
-                                 p0=[1, l, pixel_window / 4],
-                                 bounds=[
-                                     [0, l - pixel_window / 2, 0],
-                                     [np.inf, l + pixel_window / 2, pixel_window / 2]
-                                 ],
-                                 maxfev=100000)
-
-        errs = np.sqrt(np.diag(errs))
-
-        actual_positions.append(params[1])
-        actual_errors.append(errs[1])
-        fwhm_pix.append(params[2]*two_log_two)
-        if DEBUG_PLOTS:
-            plt.plot(pwin, Gaussian_res(pwin, *params), color="red", zorder=20)
-
-    actual_positions = np.array(actual_positions)
-    actual_errors = np.array(actual_errors)
-    fwhm_pix = np.array(fwhm_pix)
-
-    if DEBUG_PLOTS:
-        plt.plot(pixels, order.comparison, zorder=10)
-        plt.show()
-
-    # this depends on the spectrograph!
-    # in the blue, OES has 7x sampling ...
-    too_wide_pix = 7
-    too_narrow_pix = 2.5
-
-    mask_good = (fwhm_pix < too_wide_pix) & (fwhm_pix > too_narrow_pix)
-#    mask_good = np.ones(len(fwhm_pix)).astype(bool)
-
-    not_enough_lines = (np.sum(mask_good) < 5)
-    if not_enough_lines:
-        mask_good = (fwhm_pix < 9) & (fwhm_pix > 2)
-    not_enough_lines = (np.sum(mask_good) < 5)
-    if not_enough_lines:
-        mask_good = np.ones(len(fwhm_pix)).astype(bool)
-    if (np.sum(mask_good) < 5):
-        raise Exception("Not enough calibration lines in order %d" % order.id)
-
-    if DEBUG_PLOTS:
-        plt.scatter(actual_positions[~mask_good], fwhm_pix[~mask_good], zorder=10, color="gray")
-        plt.scatter(actual_positions[mask_good], fwhm_pix[mask_good], zorder=11, color="black")
-        plt.axhline(too_wide_pix, ls="--", c="red")
-        plt.axhline(too_narrow_pix, ls="--", c="red")
-        plt.show()
-
-    # threshold = np.percentile(actual_errors, 0.9)
-    # actual_positions = actual_positions[actual_errors <= threshold]
-    # actual_errors = actual_errors[actual_errors <= threshold]
-
-    actual_positions = actual_positions[mask_good]
-    actual_errors = actual_errors[mask_good]
-    fwhm_pix = fwhm_pix[mask_good]
-    line_wls = line_wls[mask_good]
-
-    x = actual_positions
-    y = line_wls
-    yerr = actual_errors
-    isort = np.argsort(x)
-    x = x[isort]
-    y = y[isort]
-    yerr = yerr[isort]
-    kwargs = {"sigma": yerr}
-    thres = [10, 5, 3, 2]
-    thres_max = 0.1
-    params, errs, mask_good = curve_fit_reject(x, y, polynomial,
-                                               thres=thres, thres_max=thres_max,
-                                               **kwargs)
-
-    ypoly = polynomial(x, *params)
-    # root mean squared
-    resid = (y - ypoly)
-    nresid = len(resid)
-    rms = np.sqrt(np.sum(np.square(resid)) / nresid)
-
-    if DEBUG_PLOTS:
-#    if True:
-
-        figsize = np.array([8, 6])
-        fig, axs = plt.subplots(2, 1, sharex=True,
-                                height_ratios=[3, 1],
-                                figsize=figsize)
-        fig.subplots_adjust(hspace=0)
-#        axs[0].invert_yaxis()
-        axs[0].set_ylabel("y  /  Angstrom")
-        axs[1].set_xlabel("x  /  pix")
-        axs[1].set_ylabel("y - yfit  /  Angstrom")
-        axs[0].scatter(x[mask_good], y[mask_good], color="black")
-        axs[0].scatter(x[~mask_good], y[~mask_good], color="gray")
-        axs[0].plot(x, ypoly, color="red")
-
-        rmax = np.max(resid)
-        rmin = np.min(resid)
-        rbuf = (rmax - rmin) * 0.1
-        axs[1].set_ylim(bottom=rmin-rbuf, top=rmax+rbuf)
-        axs[1].axhline(y=0, ls="--", color="gray", zorder=10)
-        axs[1].scatter(x[mask_good], resid[mask_good], color="black", zorder=20)
-        axs[1].scatter(x[~mask_good], resid[~mask_good], color="gray", zorder=20)
-
-        axs[0].text(0.95, 0.9,
-                s="rms = %.3f" % (rms),
-                ha='right', va='center',
-                transform=axs[0].transAxes)
-
-        fig.suptitle("order " + str(order.id))
-
-        plt.tight_layout()
-        plt.show()
-
-
-    actual_positions = actual_positions[mask_good]
-    actual_errors = actual_errors[mask_good]
-    fwhm_pix = fwhm_pix[mask_good]
-    line_wls = line_wls[mask_good]
-
-#    params, errs = curve_fit(polynomial, actual_positions[mask_good], line_wls[mask_good], sigma=actual_errors[mask_good])
-
-    pix_width = [np.mean(np.diff(polynomial(np.arange(3)+i-1,*params))) for i in actual_positions]
-    pix_width = np.abs(pix_width)
-    fwhm_angstrom = fwhm_pix * np.array(pix_width)
-
-    order.wl = polynomial(pixels, *params)
-    order.cal_pix = actual_positions
-    order.cal_wl = line_wls
-    order.cal_pix_fwhm = fwhm_pix
-    order.cal_wl_fwhm = fwhm_angstrom
-
-    if DEBUG_PLOTS:
-        # plot spectral resolution
-        plt.scatter(order.cal_wl, order.cal_wl/fwhm_angstrom, zorder=10)
-        plt.show()
 
 def plot_order_list(olist: list[SpectralOrder]):
     for o in olist:
@@ -884,7 +697,7 @@ def plot_order_list(olist: list[SpectralOrder]):
     plt.tight_layout()
     plt.show()
 
-def generate_wl_grid(wl, resolution=45000, sampling=2.7):
+def generate_wl_grid(wl, resolution=45000, sampling=2.6):
     temp = (2 * sampling * resolution + 1) / (2 * sampling * resolution - 1)
     nwave = np.ceil(np.log(wl.max() / wl.min()) / np.log(temp))
     if wl.min() > 0 and np.isfinite(nwave):
@@ -1299,10 +1112,10 @@ def extract_spectrum(spectrum, flats, comps, biases, idcomp_offset=-15,
 
     # Extract different spectra
 
-    for o in orders:
-#    for p in id_order_pairs:
-#        idx_order = p[1]
-#        o = orders[idx_order]
+#    for o in orders:
+    for p in id_order_pairs:
+        idx_order = p[1]
+        o = orders[idx_order]
         if verbose: print("- order", o.id, end="\r")
         o.extract_along_order(spectrum, "science", times_sigma=times_sigma)
         o.extract_along_order(flats, "flat", times_sigma=times_sigma)
@@ -1388,7 +1201,7 @@ def extract_spectrum(spectrum, flats, comps, biases, idcomp_offset=-15,
     flux_merged = flux_merged[mask]
     res_merged = res_merged[mask]
 
-    mask = mask_section(flux_merged, tlo=0, thi=0.01, return_mask=True)
+    mask = mask_section(flux_merged, tlo=0, thi=0.005, return_mask=True)
     wave_merged = wave_merged[mask]
     flux_merged = flux_merged[mask]
     res_merged = res_merged[mask]

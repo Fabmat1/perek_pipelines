@@ -1,6 +1,27 @@
 import numpy as np
 from astropy.stats import mad_std
 from scipy.optimize import curve_fit
+try:
+    from resample_spectres import resample
+except ModuleNotFoundError:
+    print("compile 'pyresample_spectres' like this:")
+    print("python3 -m numpy.f2py -c -m pyresample_spectres resample_spectres.f90")
+    try:
+        from spectres import spectres as resample
+    except ModuleNotFoundError:
+        raise Exception("Need either 'spectres' or 'resample_spectres'")
+
+def polynomial(x, a, b, c, d):
+    return a * x ** 3 + b * x ** 2 + c * x + d
+
+def Gaussian(x, A, mu=0, sigma=1):
+    return A * (1 / (sigma * np.sqrt(2 * np.pi))) * np.exp(-0.5 * ((x - mu) / sigma) ** 2)
+
+def Gaussian_res(x, A, mu=0, sigma=1):
+    oversample = 10
+    xfull = np.linspace(np.min(x), np.max(x), len(x)*oversample)
+    yfull = Gaussian(xfull, A, mu=mu, sigma=sigma)
+    return resample(x, xfull, yfull, fill=0, verbose=False)
 
 def fill_nan(y):
     '''replace nan values in 1-array by interpolated values'''
