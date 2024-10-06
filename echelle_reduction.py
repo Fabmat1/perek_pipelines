@@ -5,6 +5,7 @@ from astropy.time import Time
 from scipy.constants import speed_of_light
 from matplotlib import pyplot as plt
 import numpy as np
+from time import time
 from astropy.io import fits
 from scipy.ndimage import (minimum_filter, maximum_filter,
                            median_filter, uniform_filter1d)
@@ -46,11 +47,11 @@ def get_barycorr(frame):
         RA = header['RA']
         DEC = header['DEC']
 
-        time = Time(header["DATE-OBS"]+"T"+header["UT"], format='isot', scale='utc')
+        otime = Time(header["DATE-OBS"]+"T"+header["UT"], format='isot', scale='utc')
 
         location = EarthLocation(lat=lat, lon=lon, height=height)
         coord = SkyCoord(ra=RA, dec=DEC, unit=(u.hourangle, u.deg))
-        radvel_corr = coord.radial_velocity_correction(obstime=time, location=location)
+        radvel_corr = coord.radial_velocity_correction(obstime=otime, location=location)
         radvel_corr = radvel_corr.to(u.km / u.s)
         radvel_corr = radvel_corr.value
     return radvel_corr
@@ -80,18 +81,6 @@ def plot_order_list(olist: list[SpectralOrder]):
         plt.plot(o.wl, o.science)
     plt.tight_layout()
     plt.show()
-
-
-def generate_wl_grid(wl, resolution=45000, sampling=2.6):
-    temp = (2 * sampling * resolution + 1) / (2 * sampling * resolution - 1)
-    nwave = np.ceil(np.log(wl.max() / wl.min()) / np.log(temp))
-    if wl.min() > 0 and np.isfinite(nwave):
-        t2 = np.arange(nwave)
-        new_grid = temp ** t2 * wl.min()
-    else:
-        print("WARNING: could not find nwave, using old grid")
-        new_grid = wl
-    return new_grid
 
 
 def mask_intervals(x, intervals):
@@ -185,39 +174,220 @@ def poly_normalization(wls, flxs,
 
     return flxs
 
+def resample_orders(wave_new, wave, flux, flux_err=None):
+
+    wave_res = []
+    flux_res = []
+    err_res = []
+    widx_res = []
+    norder = len(wave)
+    for i in range(norder):
+        wave_order = wave[i]
+        flux_order = flux[i]
+        isort = np.argsort(wave_order)
+        wave_order = wave_order[isort]
+        flux_order = flux_order[isort]
+        mask = np.isfinite(flux_order) & np.isfinite(wave_order)
+        wave_order = wave_order[mask]
+        flux_order = flux_order[mask]
+        if not (flux_err is None):
+            flux_err_order = flux_err[i]
+            flux_err_order = flux_err_order[isort]
+            flux_err_order = flux_err_order[mask]
+        wmin_order = wave_order[0]
+        wmax_order = wave_order[-1]
+        widx_new = (wave_new >= wmin_order) & (wave_new <= wmax_order)
+        widx_new = np.where(widx_new)[0]
+        wave_order_new = wave_new[widx_new]
+
+        flux_order = resample(wave_order_new, wave_order, flux_order,
+                              verbose=False)
+        if not (flux_err is None):
+            flux_err_order = resample(wave_order_new, wave_order, flux_err_order,
+                                      verbose=False)
+        else:
+            flux_err_order = estimate_noise(wave_order_new, flux_order)
+
+#        wave_res.append(wave_order_new)
+        mask_err = (~np.isfinite(flux_err_order)) | \
+                   (flux_err_order <= 0)
+        flux_err_order[mask_err] = np.inf
+
+        flux_res.append(flux_order)
+        err_res.append(flux_err_order)
+        widx_res.append(widx_new)
+
+    # --> create lists of fluxes for each pixel; to vecotrize, first flatten
+    widx_flat = np.concatenate(widx_res)
+    flux_flat = np.concatenate(flux_res)
+    err_flat = np.concatenate(err_res)
+    # count occurrences of each wavelength index in widx_flat to pre-allocate space
+    nwave = len(wave_new)
+    counts = np.bincount(widx_flat, minlength=nwave)
+    max_count = np.max(counts)
+    # preallocate arrays to store the results
+    flux_re = np.empty((nwave, max_count), dtype=flux_flat.dtype)
+    flux_re.fill(np.nan)
+    err_re = np.empty((nwave, max_count), dtype=err_flat.dtype)
+    err_re.fill(np.nan)
+    # track where to insert the next value for each widx
+    insert_pos = np.zeros(nwave, dtype=int)
+    for i in range(len(widx_flat)):
+        idx = widx_flat[i]
+        flux_re[idx, insert_pos[idx]] = flux_flat[i]
+        err_re[idx, insert_pos[idx]] = err_flat[i]
+        insert_pos[idx] += 1
+    # to remove nans
+    flux_re = [flux_re[i, :counts[i]] for i in range(nwave)]
+    err_re = [err_re[i, :counts[i]] for i in range(nwave)]
+
+    # --> merging
+    flux_concat = np.concatenate(flux_re)
+    err_concat = np.concatenate(err_re)
+    weight = 1 / np.square(err_concat)
+    # create an array of indices corresponding to which wavelength each value belongs to
+    indices = np.concatenate([np.full(len(flux_re[i]), i) for i in range(nwave)])
+    # compute the weighted sum for each wavelength
+    wsum = np.bincount(indices, weights=weight, minlength=nwave)
+    weighted_flux_sum = np.bincount(indices, weights=flux_concat * weight, minlength=nwave)
+    # compute the merged flux and error
+    flux_merge = weighted_flux_sum / wsum
+    err_merge = np.sqrt(1 / wsum)
+
+    plot = False
+    if plot:
+        plt.plot(wave_new, flux_merge)
+        plt.plot(wave_new, err_merge, c="grey")
+        err_est = estimate_noise(wave_new, flux_merge)
+        plt.plot(wave_new, err_est, c="red")
+        plt.show()
+
+    return flux_merge, err_merge
+
+
+def generate_wave_grid(wmin, wmax, resolution,
+                       sampling=2.6):
+    temp = (2 * sampling * resolution + 1) / (2 * sampling * resolution - 1)
+    nwave = np.ceil(np.log(wmax / wmin) / np.log(temp))
+    if wmin > 0 and np.isfinite(nwave):
+        t2 = np.arange(nwave)
+        new_grid = temp ** t2 * wmin
+    else:
+        print("WARNING: could not find nwave, using old grid")
+        new_grid = wl
+    return new_grid
+
+
+def align_normalization(wave, flux, DEBUG_PLOTS=False):
+    """
+    mulitiply fluxes for each order so that overlapping regions align
+    """
+
+    norder = len(flux)
+    wmin = [np.min(i) for i in wave]
+    wmax = [np.max(i) for i in wave]
+    mleft = []
+    mright = []
+    wleft = []
+    wright = []
+    for i in range(norder):
+        f = flux[i]
+        w = wave[i]
+        isort = np.argsort(w)
+        w = w[isort]
+        f = f[isort]
+        if i==0:
+            mask_right = w > wmin[i+1]
+            if np.sum(mask_right) == 0:
+                mask_right = np.zeros(len(w)).astype(bool)
+                mask_right[-30:] = True
+            mr = np.nanmedian(f[mask_right])
+            wr = np.nanmedian(w[mask_right])
+            ml = np.nan
+            wl = np.nan
+        elif i == norder-1:
+            mask_left = w < wmax[i-1]
+            if np.sum(mask_left) == 0:
+                mask_left = np.zeros(len(w)).astype(bool)
+                mask_left[:30] = True
+            ml = np.nanmedian(f[mask_left])
+            wl = np.nanmedian(w[mask_left])
+            mr = np.nan
+            mr = np.nan
+        else:
+            mask_right = w > wmin[i+1]
+            mask_left = w < wmax[i-1]
+            if np.sum(mask_left) == 0:
+                mask_left = np.zeros(len(w)).astype(bool)
+                mask_left[:30] = True
+            if np.sum(mask_right) == 0:
+                mask_right = np.zeros(len(w)).astype(bool)
+                mask_right[-30:] = True
+            ml = np.nanmedian(f[mask_left])
+            wl = np.nanmedian(w[mask_left])
+            mr = np.nanmedian(f[mask_right])
+            wr = np.nanmedian(w[mask_right])
+        mleft.append(ml)
+        mright.append(mr)
+        wleft.append(wl)
+        wright.append(wr)
+
+    mleft = np.array(mleft)
+    mright = np.array(mright)
+    factors = mright[:-1] / mleft[1:]
+    factors = np.insert(factors, 0, 1)
+    factors = np.cumprod(factors)
+
+    if DEBUG_PLOTS:
+        for i in range(norder):
+            plt.plot(wave[i], flux[i])
+            plt.plot(wave[i], flux[i]*factors[i], color="black")
+        plt.scatter(wleft, mleft, c="blue", zorder=1000)
+        plt.scatter(wright, mright, c="red", zorder=1000)
+        plt.show()
+
+    flux_renorm = [flux[i]*factors[i] for i in range(norder)]
+
+    return flux_renorm
+
 
 def merge_orders(olist: list[SpectralOrder], normalize=True, margin=2, max_wl=8900,
                  resolution=50000, DEBUG_PLOTS=False):
-    common_wl = [o.wl[margin:-margin] for o in olist if o.wl.min() < max_wl]
-    common_flx = [o.science[margin:-margin] for o in olist if o.wl.min() < max_wl]
+    wave = [o.wl[margin:-margin] for o in olist if o.wl.min() < max_wl]
+    flux = [o.science[margin:-margin] for o in olist if o.wl.min() < max_wl]
+
+    # sort orders by median wave
+    wmed = [np.nanmedian(i) for i in wave]
+    isort = np.argsort(wmed)
+    wave = np.array(wave, dtype=object)[isort]
+    flux = np.array(flux, dtype=object)[isort]
+    wave = [np.array(i, dtype=float) for i in wave]
+    flux = [np.array(i, dtype=float) for i in flux]
 
     if DEBUG_PLOTS:
-        for w, f in zip(common_wl, common_flx):
+        for w, f in zip(wave, flux):
             plt.plot(w, f)
         plt.show()
 
     if normalize:
-        common_flx = poly_normalization(common_wl, common_flx, DEBUG_PLOTS=DEBUG_PLOTS)
+        flux = poly_normalization(wave, flux, DEBUG_PLOTS=DEBUG_PLOTS)
+    else:
+        flux = align_normalization(wave, flux, DEBUG_PLOTS=DEBUG_PLOTS)
 
-    # estimate noise for each order, to be used for the weights when merging
-#    common_noise = [estimate_noise(common_wl[k], common_flx[k]) for k in range(len(common_flx))]
+    # only to get min and max wavelength
+    wave_flat = np.concatenate(wave)
+    flux_flat = np.concatenate(flux)
+    mask = np.isfinite(flux_flat)
+    wave_flat = wave_flat[mask]
+    flux_flat = flux_flat[mask]
+    isort = np.argsort(wave_flat)
+    wave_flat = wave_flat[isort]
+    flux_flat = flux_flat[isort]
+    wmin = wave_flat[0]
+    wmax = wave_flat[-1]
 
-    common_wl = np.concatenate(common_wl)
-    common_flx = np.concatenate(common_flx)
-
-    mask = np.argsort(common_wl)
-    common_wl = common_wl[mask]
-    common_flx = common_flx[mask]
-
-    mask = np.isfinite(common_flx)
-    common_wl = common_wl[mask]
-    common_flx = common_flx[mask]
-
-    new_grid = generate_wl_grid(common_wl, resolution=resolution)
-    # this can only compute a "combined noise", but does not weigh pixels by SNR
-    common_flx  = resample(new_grid, common_wl, common_flx,
-                           verbose=False)
-    common_wl = new_grid
+    common_wl = generate_wave_grid(wmin, wmax, resolution=resolution)
+    common_flx, common_err = resample_orders(common_wl, wave, flux, flux_err=None)
 
     if DEBUG_PLOTS:
         plt.plot(common_wl, common_flx)

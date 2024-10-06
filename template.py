@@ -13,11 +13,13 @@ def main():
     fn_science = None
     #fn_science = "e202408300035.fit"
     verbose = True
+    normalize = True
     save_as_fits = True
     save_as_ascii = True
-    plot_spectra = False
+    plot_spectra = True
     frame_for_slice = "20240901/e202409020033.fit"
     if not os.path.exists(frame_for_slice):
+        print(frame_for_slice + " does not exist")
         frame_for_slice = None
 
     reduce_night(dir, idcomp_dir,
@@ -31,6 +33,7 @@ def main():
 def reduce_night(dir, idcomp_dir, fn_science=None,
                  frame_for_slice=None,
                  verbose=True,
+                 normalize=True,
                  save_as_fits=True,
                  save_as_ascii=True,
                  plot_spectra=False):
@@ -82,6 +85,7 @@ def reduce_night(dir, idcomp_dir, fn_science=None,
             s = extract_spectrum(dir+"/"+fp, flats, comps, biases,
                                  frame_for_slice=frame_for_slice,
                                  orders=orders,
+                                 normalize=normalize,
                                  idcomp_dir=idcomp_dir, verbose=verbose)
             tstop = time.time()
             print("> done in %.1f s" % (tstop-tstart))
