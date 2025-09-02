@@ -260,6 +260,10 @@ def resample_orders(wave_new, wave, flux, flux_err=None):
         plt.plot(wave_new, err_merge, c="grey")
         err_est = estimate_noise(wave_new, flux_merge)
         plt.plot(wave_new, err_est, c="red")
+        plt.title("Flux normalisation by order")
+        plt.xlabel("Wavelength / Angstrom")
+        plt.ylabel("Flux")
+        plt.tight_layout()
         plt.show()
 
     return flux_merge, err_merge
@@ -395,7 +399,7 @@ def merge_orders(olist: list[SpectralOrder], normalize=True, margin=2, max_wl=89
 
     if DEBUG_PLOTS:
         plt.plot(common_wl, common_flx)
-        plt.title("Flux normalisation by order")
+        plt.title("Merged, normalised")
         plt.xlabel("Wavelength  /  Angstrom")
         plt.ylabel("Flux")
         plt.tight_layout()
@@ -623,7 +627,7 @@ def extract_spectrum(spectrum, flats, comps, biases, idcomp_offset=-15,
             plt.plot(o.pix, np.log10(o.wl), zorder=11, lw=1)
         plt.title("Dispersion relations")
         plt.xlabel("Extracted X pixel")
-        plt.ylabel(r"log" "$\lambda / \mathrm{\AA}$")
+        plt.ylabel(r"log" "$\\lambda / \\mathrm{\\AA}$")
         plt.tight_layout()
         plt.show()
 

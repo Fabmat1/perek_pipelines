@@ -9,6 +9,11 @@ from echelle_reduction import extract_spectrum
 
 def main():
     dir = "20240901"
+    frame_for_slice = "20240901/e202409020033.fit"
+
+    dir = "20250831"
+    frame_for_slice = "20250831/e202508310033.fit"
+
     idcomp_dir = "idcomp_2307/"
     fn_science = None
     #fn_science = "e202408300035.fit"
@@ -17,8 +22,7 @@ def main():
     save_as_fits = True
     save_as_ascii = True
     plot_spectra = False
-    DEBUG_PLOTS = False
-    frame_for_slice = "20240901/e202409020033.fit"
+    DEBUG_PLOTS = True
     if not os.path.exists(frame_for_slice):
         print(frame_for_slice + " does not exist")
         frame_for_slice = None
