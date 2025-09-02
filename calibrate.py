@@ -83,6 +83,10 @@ def fit_comparison(linetable, comparison, pixel_window=10, DEBUG_PLOTS=False):
 
     if DEBUG_PLOTS:
         plt.plot(pixels, comparison, zorder=10)
+        plt.title("Arc line fits")
+        plt.xlabel("Extracted X pixel")
+        plt.ylabel("Renormalised counts")
+        plt.tight_layout()
         plt.show()
 
     dout = {"actual_positions": actual_positions,
@@ -93,7 +97,7 @@ def fit_comparison(linetable, comparison, pixel_window=10, DEBUG_PLOTS=False):
     return dout
 
 def mask_good_lines(actual_positions, fwhm_pix,
-                    too_narrow_pix=2.5,
+                    too_narrow_pix=2.6,
                     too_wide_pix=7.0,
                     DEBUG_PLOTS=False):
 
@@ -118,6 +122,9 @@ def mask_good_lines(actual_positions, fwhm_pix,
         plt.scatter(actual_positions[mask_good], fwhm_pix[mask_good], zorder=11, color="black")
         plt.axhline(too_wide_pix, ls="--", c="red")
         plt.axhline(too_narrow_pix, ls="--", c="red")
+        plt.title("Arc fit rejection")
+        plt.xlabel("Extracted X pixel")
+        plt.xlabel("Gaussian FWHM (in pix)")
         plt.show()
 
     return mask_good
@@ -172,7 +179,7 @@ def fit_dispersion(x, y, yerr, DEBUG_PLOTS=False):
                 ha='right', va='center',
                 transform=axs[0].transAxes)
 
-        fig.suptitle("order " + str(order.id))
+#        fig.suptitle("order " + str(order.id))
 
         plt.tight_layout()
         plt.show()
@@ -241,7 +248,10 @@ def solve_wavelength(linetable, order, pixel_window=10, DEBUG_PLOTS=False):
 
     if DEBUG_PLOTS:
         # plot spectral resolution
+        plt.title("Order %d" % order.id)
         plt.scatter(order.cal_wl, order.cal_wl/fwhm_angstrom, zorder=10)
+        plt.xlabel(r"$\lambda$  /  $\mathrm{\AA}$")
+        plt.ylabel(r"$R = \lambda / \Delta \lambda$")
         plt.show()
 
 
@@ -269,11 +279,11 @@ def find_dispersion(orders, biases, comps,
     avg_aps = np.array(list(linelists.keys()))
     nlist = len(avg_aps)
 
-    if DEBUG_PLOTS:
-        plt.imshow(flats)
-        for key in linelists.keys():
-            plt.scatter([len(spectrum) / 2], [key], marker="x", zorder=2, color="red")
-        plt.show()
+#    if DEBUG_PLOTS:
+#        plt.imshow(flats)
+#        for key in linelists.keys():
+#            plt.scatter([len(spectrum) / 2], [key], marker="x", zorder=2, color="red")
+#        plt.show()
 
     # find the best-matching orders
     id_order_pairs = pair_generation(avg_aps, ap_measure, thres_max=np.inf)
@@ -295,14 +305,19 @@ def find_dispersion(orders, biases, comps,
 #        o.plot_frame_1d("comp_orig")
 
     if verbose: print("- solving dispersion relations")
-    for p in id_order_pairs:
+    for j, p in enumerate(id_order_pairs):
         idx_id = p[0]
         idx_order = p[1]
         o = orders[idx_order]
         if verbose: print("- order", o.id, end="\r")
         key = avg_aps[idx_id]
         linelist_o = linelists[key]
-        solve_wavelength(linelist_o, o)
+        # only plot one solution
+        if DEBUG_PLOTS and j==3:
+            debug_solve = True
+        else:
+            debug_solve = False
+        solve_wavelength(linelist_o, o, DEBUG_PLOTS=debug_solve)
         o.pix = np.arange(len(o.wl))
 
 #        o.plot_frame_1d("comp_orig")

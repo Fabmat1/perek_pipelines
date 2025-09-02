@@ -1,5 +1,6 @@
 import numpy as np
 from matplotlib import pyplot as plt
+from matplotlib.colors import LogNorm
 from scipy.optimize import curve_fit
 from scipy.ndimage import (minimum_filter, maximum_filter)
 
@@ -31,7 +32,6 @@ class SpectralSlice:
                     self.order_ownership[i] = self.order_ownership[i + j] - j
                 else:
                     self.order_ownership[i] = self.order_ownership[i - 1] + 1
-
 
 def slice_analysis(pixel, slice_x, slice_y, MIN_WINDOW=15, MAX_WINDOW=15, NOISE_MEASURE_SECTION_WIDTH=0.05,
                    NOISE_CUTOFF=20, CUTTOFF_MARGIN=5, ORDER_GAUSS_THRESHOLD=0.6, DEBUG_PLOTS=False):
@@ -111,13 +111,13 @@ def slice_analysis(pixel, slice_x, slice_y, MIN_WINDOW=15, MAX_WINDOW=15, NOISE_
         mask_good[ibad] = False
         noise_indices = noise_indices[mask_good]
 
-    if DEBUG_PLOTS:
+    # disabled
+    if DEBUG_PLOTS and False:
         plt.xlabel("group distance  /  pix")
         plt.hist(np.diff(groups_ipeak), bins=15, range=(0,50))
         plt.axvline(median_dist)
         plt.axvline(median_dist+10*std_dist)
         plt.show()
-#        exit()
 
     # assume that "real" orders only start at pixles > 'idx_peak_min'
     idx_peak_min = 700
@@ -131,15 +131,18 @@ def slice_analysis(pixel, slice_x, slice_y, MIN_WINDOW=15, MAX_WINDOW=15, NOISE_
     lo_ind = first_cross - CUTTOFF_MARGIN
     hi_ind = last_cross + CUTTOFF_MARGIN
 
-    if DEBUG_PLOTS:
-        plt.title(pixel)
-        plt.plot(slice_x, slice_y)
-        plt.axhline(noise_lvl, color="orange")
+    if (DEBUG_PLOTS):
+        plt.title("X pixel %d" % pixel)
+        plt.plot(slice_x, slice_y, label="X slice")
+        plt.axhline(noise_lvl, color="orange", label="noise level")
         plt.axvline(lo_ind, color='r')
         plt.axvline(hi_ind, color='r')
         max_slice = maximum_filter(slice_y, size=MAX_WINDOW)
         max_slice = np.clip(max_slice, a_min=noise_lvl*2, a_max=np.inf)
-        plt.plot(slice_x, max_slice, color="tab:green")
+        plt.plot(slice_x, max_slice, color="tab:green", label="max filter")
+        plt.xlabel("Y pixel")
+        plt.ylabel("Counts")
+        plt.legend()
         plt.tight_layout()
         plt.show()
 
@@ -155,10 +158,23 @@ def slice_analysis(pixel, slice_x, slice_y, MIN_WINDOW=15, MAX_WINDOW=15, NOISE_
     peaks = [peak for peak in peaks if len(peak) > 1]
 
     peak_locations = [np.mean(p) for p in peaks]
-#    print(f"Identified {len(peaks)} orders @ x = {pixel}")
 
-    if DEBUG_PLOTS:
-        plt.title(str(pixel))
+    if len(peak_locations) > 1:
+        xdist_med = np.median(np.diff(peak_locations))
+        # filter peaks closer than xdist_med/3
+        filtered_peak_locations = [peak_locations[0]]
+        for loc in peak_locations[1:]:
+            if loc - filtered_peak_locations[-1] >= xdist_med / 3:
+                filtered_peak_locations.append(loc)
+    else:
+        filtered_peak_locations = peak_locations
+    peak_locations = filtered_peak_locations
+
+#    print(f"Identified {len(peak_locations)} orders @ x = {pixel}")
+
+    if DEBUG_PLOTS and False:
+#        plt.title(str(pixel))
+        plt.title("X pixel %d" % pixel)
         for idx, l in enumerate(peak_locations):
             plt.axvline(l, ymin=0, ymax=0.93, color="gray")
             plt.text(s=str(idx), x=l, y=1.1, rotation=90,
@@ -166,6 +182,8 @@ def slice_analysis(pixel, slice_x, slice_y, MIN_WINDOW=15, MAX_WINDOW=15, NOISE_
         plt.axhline(ORDER_GAUSS_THRESHOLD, color="orange")
         plt.plot(slice_x, slice_y)
         plt.ylim(-0.05, 1.15)
+        plt.xlabel("Y pixel")
+        plt.ylabel("Re-normalised counts")
         plt.tight_layout()
         plt.show()
 
@@ -197,7 +215,8 @@ def slice_analysis(pixel, slice_x, slice_y, MIN_WINDOW=15, MAX_WINDOW=15, NOISE_
         if DEBUG_PLOTS:
             plt.text(s=str(i), x=peak_location, y=1.1, rotation=90,
                      va="center", ha="center")
-            plt.plot(x_neighborhood, Gaussian(x_neighborhood, *params), color="r")
+            plt.plot(x_neighborhood, Gaussian(x_neighborhood, *params),
+                     color="r")
         fit_params.append(params)
 
         errs = np.sqrt(np.diag(errs))
@@ -207,9 +226,11 @@ def slice_analysis(pixel, slice_x, slice_y, MIN_WINDOW=15, MAX_WINDOW=15, NOISE_
         widths.append(two_log_two * params[2])
 
     if DEBUG_PLOTS:
-        plt.title(pixel)
+        plt.title("X pixel %d" % pixel)
         plt.plot(slice_x, slice_y)
         plt.ylim(-0.05, 1.15)
+        plt.xlabel("Y pixel")
+        plt.ylabel("Re-normalised counts")
         plt.tight_layout()
         plt.show()
 
@@ -232,13 +253,21 @@ def find_slices(frame_for_slice, sampling=200, DEBUG_PLOTS=False):
         xidx = xidx[(xidx>=0) & (xidx<npix_x)]
         slice_y = np.sum(frame_for_slice[:, xidx].astype(float), axis=1) / len(xidx)
         slice_x = np.arange(frame_for_slice.shape[1])
-        slice = slice_analysis(pixel - 1, slice_x, slice_y, DEBUG_PLOTS=DEBUG_PLOTS)
+        if (i == 0) and DEBUG_PLOTS:
+            debug_slice = True
+        else:
+            debug_slice = False
+        slice = slice_analysis(pixel - 1, slice_x, slice_y, DEBUG_PLOTS=debug_slice)
         slices.append(slice)
 
     if DEBUG_PLOTS:
         plt.imshow(frame_for_slice, zorder=1, cmap='gray', norm="log")
         for slice in slices:
             plt.scatter([np.repeat(slice.x, len(slice.ys))], slice.ys, marker="x", zorder=2)
+        # allow stretching
+        plt.gca().set_aspect('auto')
+        plt.xlabel("X pixel")
+        plt.ylabel("Y pixel")
         plt.tight_layout()
         plt.show()
 
@@ -435,7 +464,7 @@ def find_orders(frame_for_slice,
 
     times_sigma = 2
     if DEBUG_PLOTS:
-        plt.imshow(frame_for_slice, zorder=1, cmap='gray')
+        plt.imshow(frame_for_slice, zorder=1, cmap='gray', norm="log")
         for slice in slices:
             plt.scatter([np.repeat(slice.x, len(slice.ys))], slice.ys, marker="x", zorder=2)
         for o in orders:
@@ -448,6 +477,10 @@ def find_orders(frame_for_slice,
             pc = plt.plot(x, o.evaluate(x))
             plt.plot(x, o.evaluate(x)-width, c=pc[0]._color, ls="--")
             plt.plot(x, o.evaluate(x)+width, c=pc[0]._color, ls="--")
+        # allow imshow stretching
+        plt.xlabel("X pixel")
+        plt.ylabel("Y pixel")
+        plt.gca().set_aspect('auto')
         plt.tight_layout()
         plt.show()
 

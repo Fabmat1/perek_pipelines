@@ -2,6 +2,7 @@ import numpy as np
 from tools import (curve_fit_reject, polynomial, Gaussian, fill_nan)
 from scipy.interpolate import interp1d
 from scipy.ndimage import (minimum_filter, maximum_filter, median_filter)
+from matplotlib import pyplot as plt
 
 two_log_two = 2 * np.sqrt(2 * np.log(2))
 
@@ -76,7 +77,7 @@ class SpectralOrder:
 
             xeval = np.arange(np.min(x), np.max(x)+1)
             yeval = polynomial(xeval, *params)
-            axs[0].plot(xeval, yeval, color="red")
+            axs[0].plot(xeval, yeval, color="red", label="poly")
 
             rmax = np.max(resid)
             rmin = np.min(resid)
@@ -91,7 +92,7 @@ class SpectralOrder:
                     ha='right', va='center',
                     transform=axs[0].transAxes)
 
-            fig.suptitle("order %d" % self.id)
+            fig.suptitle("order %d (3rd order poly fit)" % self.id)
 
             plt.tight_layout()
             plt.show()

@@ -16,7 +16,8 @@ def main():
     normalize = True
     save_as_fits = True
     save_as_ascii = True
-    plot_spectra = True
+    plot_spectra = False
+    DEBUG_PLOTS = False
     frame_for_slice = "20240901/e202409020033.fit"
     if not os.path.exists(frame_for_slice):
         print(frame_for_slice + " does not exist")
@@ -28,7 +29,8 @@ def main():
                  verbose=verbose,
                  save_as_fits=save_as_fits,
                  save_as_ascii=save_as_ascii,
-                 plot_spectra=plot_spectra)
+                 plot_spectra=plot_spectra,
+                 DEBUG_PLOTS=DEBUG_PLOTS)
 
 def reduce_night(dir, idcomp_dir, fn_science=None,
                  frame_for_slice=None,
@@ -36,7 +38,8 @@ def reduce_night(dir, idcomp_dir, fn_science=None,
                  normalize=True,
                  save_as_fits=True,
                  save_as_ascii=True,
-                 plot_spectra=False):
+                 plot_spectra=False,
+                 DEBUG_PLOTS=False):
 
     flats = []
     biases = []
@@ -86,7 +89,9 @@ def reduce_night(dir, idcomp_dir, fn_science=None,
                                  frame_for_slice=frame_for_slice,
                                  orders=orders,
                                  normalize=normalize,
-                                 idcomp_dir=idcomp_dir, verbose=verbose)
+                                 idcomp_dir=idcomp_dir,
+                                 verbose=verbose,
+                                 DEBUG_PLOTS=DEBUG_PLOTS)
             tstop = time.time()
             print("> done in %.1f s" % (tstop-tstart))
             orders = s["orders"]
@@ -116,6 +121,9 @@ def reduce_night(dir, idcomp_dir, fn_science=None,
                 plt.plot(s["wave"], s["error"], linewidth=1, color="gray")
                 plt.ylim((0, 2))
                 plt.legend()
+                plt.title("Merged spectrum")
+                plt.xlabel("Wavelength / Angstrom")
+                plt.ylabel("Normalised flux")
                 plt.tight_layout()
                 plt.show()
         else:

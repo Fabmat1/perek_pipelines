@@ -367,6 +367,10 @@ def merge_orders(olist: list[SpectralOrder], normalize=True, margin=2, max_wl=89
     if DEBUG_PLOTS:
         for w, f in zip(wave, flux):
             plt.plot(w, f)
+        plt.title("Extracted, calibrated, flat-fielded orders")
+        plt.xlabel("Wavelength  /  Angstrom")
+        plt.ylabel("Flux")
+        plt.tight_layout()
         plt.show()
 
     if normalize:
@@ -391,6 +395,9 @@ def merge_orders(olist: list[SpectralOrder], normalize=True, margin=2, max_wl=89
 
     if DEBUG_PLOTS:
         plt.plot(common_wl, common_flx)
+        plt.title("Flux normalisation by order")
+        plt.xlabel("Wavelength  /  Angstrom")
+        plt.ylabel("Flux")
         plt.tight_layout()
         plt.show()
 
@@ -519,7 +526,10 @@ def merge_resolution(wave_merged, orders, dres, npix=45, DEBUG_PLOTS=False):
 
     if DEBUG_PLOTS:
         plt.plot(wave_merged, res_merged, ls="--", lw=2, color="black")
+        plt.title("Resolving power")
+        plt.tight_layout()
         plt.show()
+
     return res_merged
 
 def calibrate_orders(flat, comp, bias,
@@ -611,6 +621,10 @@ def extract_spectrum(spectrum, flats, comps, biases, idcomp_offset=-15,
         for o in orders:
             plt.scatter(o.cal_pix, np.log10(o.cal_wl), zorder=10, lw=1)
             plt.plot(o.pix, np.log10(o.wl), zorder=11, lw=1)
+        plt.title("Dispersion relations")
+        plt.xlabel("Extracted X pixel")
+        plt.ylabel(r"log" "$\lambda / \mathrm{\AA}$")
+        plt.tight_layout()
         plt.show()
 
     # estimate spectral resolving power
