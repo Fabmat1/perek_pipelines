@@ -260,7 +260,7 @@ def find_slices(frame_for_slice, sampling=200, DEBUG_PLOTS=False):
         slice = slice_analysis(pixel - 1, slice_x, slice_y, DEBUG_PLOTS=debug_slice)
         slices.append(slice)
 
-    if DEBUG_PLOTS:
+    if DEBUG_PLOTS and False:
         plt.imshow(frame_for_slice, zorder=1, cmap='gray', norm="log")
         for slice in slices:
             plt.scatter([np.repeat(slice.x, len(slice.ys))], slice.ys, marker="x", zorder=2)

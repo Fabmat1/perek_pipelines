@@ -611,12 +611,18 @@ def extract_spectrum(spectrum, flats, comps, biases, idcomp_offset=-15,
         # o.plot_frame_1d("comp_orig")
 
     if DEBUG_PLOTS:
-        for o in orders:
-            plt.plot(o.wl, o.science)
-            plt.plot(o.wl, o.flat)
-            plt.plot(o.wl, o.comparison)
-            plt.plot(o.wl, o.bias)
+        plt.title("Science, flat, arc, bias in each order")
+        colors_sc = ["tab:red", "tab:blue"]
+        colors_flat = ["tab:orange", "tab:pink"]
+        colors_arc = ["tab:purple", "tab:green"]
+        colors_bias = ["tab:gray", "black"]
+        for k, o in enumerate(orders):
+            plt.plot(o.wl, o.science, colors_sc[k%2])
+            plt.plot(o.wl, o.flat, colors_flat[k%2])
+            plt.plot(o.wl, o.comparison, colors_arc[k%2])
+            plt.plot(o.wl, o.bias, colors_bias[k%2])
 #            print(o.wl)
+        plt.tight_layout()
         plt.show()
 
     if verbose: print("- done         ")
