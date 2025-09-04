@@ -96,9 +96,10 @@ def mask_intervals(x, intervals):
     return mask
 
 def poly_normalization(wls, flxs,
-                       poly_order=2,
+                       poly_order=3,
                        ignore_windows=[(3831.4, 3839.4),
-                                       (3883, 3893), (3963.5, 3981),
+                                       (3883, 3893), (3933-3, 3933+3),
+                                       (3963.5, 3981),
                                        (4090, 4115), (4320, 4355),
                                        (4842, 4888), (6540, 6590),
                                        (6860, 6880),
@@ -122,22 +123,25 @@ def poly_normalization(wls, flxs,
     for i, wl in enumerate(wls):
         flx = flxs[i]
 
-        # pre-smooth to suppress noise
-        flx_smooth = median_filter(flx, size=smooth_width)
-
         mask = mask_intervals(wl, ignore_windows)
 
-        wl_for_interpol = wl[mask]
-        flx_for_interpol = flx_smooth[mask]
-
         # Initial wide sigma clip to remove huge outliers
-        mask2 = ~sigma_clip(flx_for_interpol,
+        mask2 = ~sigma_clip(flx,
                             sigma_lower=8,
                             sigma_upper=8,
                             masked=True).mask
+        mask = mask & mask2
+
+        # pre-smooth to suppress noise
+        flx_smooth = median_filter(flx[mask], size=smooth_width,
+                                   mode="nearest")
+
+        wl_for_interpol = wl[mask]
+        flx_for_interpol = flx_smooth
+        mask2 = np.ones_like(wl_for_interpol).astype(bool)
 
         sigmas_lo = [3, 2.5, 2.0, 1.8]
-        sigmas_hi = [5, 4, 4, 3]
+        sigmas_hi = [5, 4, 3.5, 3]
         nit = len(sigmas_lo)
 
         # Iterative robust fitting
@@ -157,7 +161,9 @@ def poly_normalization(wls, flxs,
         flx_cont = polynomial(wl, *params)
 
         # enforce continuum never below smoothed flux
-        flx_smooth = median_filter(flx_smooth, size=int(len(flx_smooth)/3))
+        flx_smooth = median_filter(flx,
+                                   size=int(len(flx_smooth)/4),
+                                   mode="nearest")
         flx_cont = np.maximum(flx_cont, flx_smooth)
 
         # normalize
