@@ -19,7 +19,7 @@ def main():
     save_as_fits = True
     save_as_ascii = True
     plot_spectra = False
-    DEBUG_PLOTS = True
+    DEBUG_PLOTS = False
     if not os.path.exists(frame_for_slice):
         print(frame_for_slice + " does not exist")
         frame_for_slice = None

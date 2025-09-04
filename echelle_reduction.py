@@ -157,21 +157,21 @@ def poly_normalization(wls, flxs,
         flx_cont = polynomial(wl, *params)
 
         # enforce continuum never below smoothed flux
+        flx_smooth = median_filter(flx_smooth, size=int(len(flx_smooth)/3))
         flx_cont = np.maximum(flx_cont, flx_smooth)
 
         # normalize
         flxs[i] = flx / flx_cont
 
         if DEBUG_PLOTS:
-            plt.figure()
-            plt.plot(wl, flx, "k-", alpha=0.5, label="original")
-            plt.plot(wl, flx_smooth, "gray", alpha=0.5, label="smoothed")
-            plt.plot(wl, flx_cont, "r-", lw=2, label="continuum fit")
-            plt.legend()
-            plt.title(f"Order {i}")
+            plt.plot(wl, flx, "k-", alpha=0.5)
+            plt.plot(wl, flx_smooth, "gray", alpha=0.5)
+            plt.plot(wl, flx_cont, "r-", lw=2)
 
     if DEBUG_PLOTS:
         plt.show()
+        plt.tight_layout()
+        plt.title(f"Order {i}")
 
     return flxs
 
@@ -585,8 +585,10 @@ def estimate_resolution(orders, verbose=False, DEBUG_PLOTS=False):
         plt.plot(wl_med, res_med, color="black", lw=2, zorder=20, ls="-")
         plt.plot(wl_med, res_qlo, color="black", lw=2, zorder=20, ls="--")
         plt.plot(wl_med, res_qhi, color="black", lw=2, zorder=20, ls="--")
+        plt.title("Resolving power per order")
         plt.xlabel(r"Wavelength  /  $\mathrm{\AA}$")
         plt.ylabel(r"$\lambda$  /  $\Delta \lambda$")
+        plt.tight_layout()
         plt.show()
 
     # estimate the median resolving power
