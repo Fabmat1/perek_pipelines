@@ -337,6 +337,8 @@ def assign_orders(slicelist: list[SpectralSlice], max_ind, DEBUG_PLOTS=False):
 
         plt.gca().invert_yaxis()
         plt.title("Order assignment")
+        plt.xlabel("X pixel")
+        plt.ylabel("Y pixel")
         plt.tight_layout()
         plt.show()
 

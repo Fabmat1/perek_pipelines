@@ -78,7 +78,8 @@ class SpectralOrder:
 
         self.rms = rms
 
-        if DEBUG_PLOTS:
+        # don't show all orders
+        if DEBUG_PLOTS and ((self.id < 8) or (self.id > 55)):
 
             figsize = np.array([8, 6])
             fig, axs = plt.subplots(2, 1, sharex=True,
@@ -173,9 +174,9 @@ class SpectralOrder:
             y_ind_round = int(round(y_ind, 0))
             y_min = int(np.floor(y_ind - half_height))
             y_max = int(np.ceil(y_ind + half_height))
-            # limit to +-5 pixel; the OES orders are too close together
-            y_min = y_ind_round - min(5, (y_ind_round - y_min))
-            y_max = y_ind_round + min(5, (y_max - y_ind_round))
+            # limit to +-4 pixel; the OES orders are too close together
+            y_min = y_ind_round - min(4, (y_ind_round - y_min))
+            y_max = y_ind_round + min(4, (y_max - y_ind_round))
 
             # pixel indices along cross-dispersion
             y_pixels = np.arange(y_min, y_max)

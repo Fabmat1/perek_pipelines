@@ -8,11 +8,8 @@ from matplotlib import pyplot as plt
 from echelle_reduction import extract_spectrum
 
 def main():
-    dir = "20240901"
-    frame_for_slice = "20240901/e202409020033.fit"
-
-    dir = "20250831"
-    frame_for_slice = "20250831/e202508310033.fit"
+    dir = "20250903part/"
+    frame_for_slice = "20250903part/e202509030031.fit"
 
     idcomp_dir = "idcomp_2307/"
     fn_science = None
