@@ -3,6 +3,22 @@ from tools import (curve_fit_reject, polynomial, Gaussian, fill_nan)
 from scipy.interpolate import interp1d
 from scipy.ndimage import (minimum_filter, maximum_filter, median_filter)
 from matplotlib import pyplot as plt
+from scipy.special import erf
+
+def gaussian_pixel_weights(y_pixels, y0, sigma):
+    """
+    Compute normalized pixel-integrated Gaussian weights for each pixel index in y_pixels.
+    y_pixels: array of pixel indices (integers)
+    y0: center of the Gaussian (float)
+    sigma: Gaussian sigma (float)
+    """
+    y_low = (y_pixels - 0.5 - y0) / (np.sqrt(2) * sigma)
+    y_high = (y_pixels + 0.5 - y0) / (np.sqrt(2) * sigma)
+    weights = 0.5 * (erf(y_high) - erf(y_low))
+    # Normalize so total weight sums to 1
+    if np.sum(weights) > 0:
+        weights /= np.sum(weights)
+    return weights
 
 two_log_two = 2 * np.sqrt(2 * np.log(2))
 
@@ -150,26 +166,41 @@ class SpectralOrder:
         for pixel in np.arange(image.shape[1]):
             sigma = self.w_fcn(pixel) / two_log_two
             width = times_sigma * sigma
-            # limit the order y-width to 4 pixels
-            width = np.clip(width, a_min=1, a_max=4)
-            y_ind = self.evaluate(pixel)
-            top = int(np.floor(y_ind + width))
-            bot = int(np.ceil(y_ind - width))
+            # extend the aperture to something safe (avoid clipping)
+            half_height = int(np.ceil(width * 3))  # 3-sigma coverage
 
-            fluxsum = np.dot(image[bot:top, int(pixel)], Gaussian(np.arange(bot, top), 1, y_ind, sigma))
-            upperfraction = image[bot - 1, int(pixel)] * (np.abs(bot - (y_ind - width))) * Gaussian(bot - 1, 1, y_ind, sigma)
-            lowerfraction = image[top + 1, int(pixel)] * (np.abs(top - (y_ind + width))) * Gaussian(top + 1, 1, y_ind, sigma)
-            fluxsum = upperfraction + lowerfraction + fluxsum
+            y_ind = self.evaluate(pixel)
+            y_ind_round = int(round(y_ind, 0))
+            y_min = int(np.floor(y_ind - half_height))
+            y_max = int(np.ceil(y_ind + half_height))
+            # limit to +-5 pixel; the OES orders are too close together
+            y_min = y_ind_round - min(5, (y_ind_round - y_min))
+            y_max = y_ind_round + min(5, (y_max - y_ind_round))
+
+            # pixel indices along cross-dispersion
+            y_pixels = np.arange(y_min, y_max)
+
+            # compute proper Gaussian-integrated weights
+            weights = gaussian_pixel_weights(y_pixels, y_ind, sigma)
+
+            # weighted sum of flux
+            col = image[y_pixels, int(pixel)]
+            fluxsum = np.sum(col * weights)
+
             intensities.append(fluxsum)
 
+        intensities = np.array(intensities)
+
         if type == "bias" or type == "zero":
-            self.bias = np.array(intensities)
+            self.bias = intensities
         elif type == "flat":
-            self.flat = np.array(intensities)
+            self.flat = intensities
         elif type == "comparison" or type == "comp":
-            self.comparison = np.array(intensities)
+            self.comparison = intensities
         elif type == "science":
-            self.science = np.array(intensities)
+            self.science = intensities
+#            plt.plot(np.arange(len(self.science)), self.science)
+#            plt.show()
         else:
             raise Exception("Unknown frame type!")
 
@@ -209,7 +240,17 @@ class SpectralOrder:
         plt.tight_layout()
         plt.show()
 
-    def apply_corrections(self, med_win_size=25, min_win_size=15, max_win_size=15, comparison=False):
+    def apply_corrections(self, med_win_size=25, min_win_size=15, max_win_size=15,
+                          comparison=False, DEBUG_PLOTS=False):
+
+        DEBUG_PLOTS = False
+
+        if DEBUG_PLOTS and (self.bias is not None) and (self.wl is not None):
+            plt.plot(self.wl, self.bias, label="bias", color="black")
+        if DEBUG_PLOTS and (self.flat is not None) and (self.wl is not None):
+            plt.plot(self.wl, self.flat, label="flat")
+        if DEBUG_PLOTS and (self.science is not None) and (self.wl is not None):
+            plt.plot(self.wl, self.science, label="science")
 
         if self.flat is not None:
             self.flat -= self.bias
@@ -218,9 +259,19 @@ class SpectralOrder:
         if self.comparison is not None:
             self.comparison -= self.bias
 
+        if DEBUG_PLOTS and (self.flat is not None) and (self.wl is not None):
+            plt.plot(self.wl, self.flat, label="flat - bias")
+            if (self.science is not None):
+                plt.plot(self.wl, self.science, label="science - bias")
+            plt.title("Bias correction of flat")
+            plt.xlabel("Wavelength")
+            plt.ylabel("Flux")
+            plt.legend()
+            plt.tight_layout()
+            plt.show()
+
         if self.flat is not None:
             norm_flat = median_filter(self.flat, size=med_win_size)
-            # norm_flat /= norm_flat.max()
             self.flat = norm_flat
 
         if (self.science is not None) and (self.flat is not None):

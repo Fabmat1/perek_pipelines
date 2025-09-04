@@ -132,7 +132,7 @@ def slice_analysis(pixel, slice_x, slice_y, MIN_WINDOW=15, MAX_WINDOW=15, NOISE_
     hi_ind = last_cross + CUTTOFF_MARGIN
 
     if (DEBUG_PLOTS):
-        plt.title("X pixel %d" % pixel)
+        plt.title("Order slice for X pixel %d" % pixel)
         plt.plot(slice_x, slice_y, label="X slice")
         plt.axhline(noise_lvl, color="orange", label="noise level")
         plt.axvline(lo_ind, color='r')
@@ -173,8 +173,7 @@ def slice_analysis(pixel, slice_x, slice_y, MIN_WINDOW=15, MAX_WINDOW=15, NOISE_
 #    print(f"Identified {len(peak_locations)} orders @ x = {pixel}")
 
     if DEBUG_PLOTS and False:
-#        plt.title(str(pixel))
-        plt.title("X pixel %d" % pixel)
+        plt.title("Order slice for X pixel %d" % pixel)
         for idx, l in enumerate(peak_locations):
             plt.axvline(l, ymin=0, ymax=0.93, color="gray")
             plt.text(s=str(idx), x=l, y=1.1, rotation=90,
@@ -285,6 +284,7 @@ def find_slices(frame_for_slice, sampling=200, DEBUG_PLOTS=False):
 
 
 def assign_orders(slicelist: list[SpectralSlice], max_ind, DEBUG_PLOTS=False):
+
     # Forward loop
     slicelist[max_ind].order_ownership = np.arange(len(slicelist[max_ind].ys)) + 1
 
@@ -336,6 +336,8 @@ def assign_orders(slicelist: list[SpectralSlice], max_ind, DEBUG_PLOTS=False):
             plt.scatter(s.x*np.ones(len(s.ys)), s.ys, color="k", marker="x")
 
         plt.gca().invert_yaxis()
+        plt.title("Order assignment")
+        plt.tight_layout()
         plt.show()
 
     orders = {}

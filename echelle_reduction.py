@@ -12,11 +12,12 @@ from scipy.ndimage import (minimum_filter, maximum_filter,
 from scipy.ndimage import gaussian_filter1d
 from scipy.optimize import curve_fit
 from astropy.stats import sigma_clip
+from numpy.polynomial import legendre
 
 from estimate_noise import estimate_noise
 from tools import (polyfit_reject, curve_fit_reject, pair_generation,
                    mask_section,
-                   fill_nan, Gaussian, Gaussian_res, polynomial)
+                   fill_nan, Gaussian, Gaussian_res)
 from calibrate import find_dispersion
 from identify_orders import (SpectralSlice, find_orders)
 from orders import SpectralOrder
@@ -94,93 +95,192 @@ def mask_intervals(x, intervals):
 
     return mask
 
-
 def poly_normalization(wls, flxs,
+                       poly_order=2,
                        ignore_windows=[(3831.4, 3839.4),
                                        (3883, 3893), (3963.5, 3981),
                                        (4090, 4115), (4320, 4355),
                                        (4842, 4888), (6540, 6590),
                                        (6860, 6880),
-                                       (6888.1, 6890.5), (6892,6893.6),
+                                       (6888.1, 6890.5), (6892, 6893.6),
                                        (7590, 7617), (7622.8, 7625)],
-                         DEBUG_PLOTS=False):
+                       smooth_width=31,
+                       DEBUG_PLOTS=False):
+    """
+    Normalize single spectral orders using low-order polynomials.
+    """
+
+    def polynomial(x, *p):
+        return np.polyval(p, x)
+
+    def mask_intervals(wl, intervals):
+        mask = np.ones_like(wl, dtype=bool)
+        for lo, hi in intervals:
+            mask &= ~((wl > lo) & (wl < hi))
+        return mask
 
     for i, wl in enumerate(wls):
         flx = flxs[i]
 
+        # pre-smooth to suppress noise
+        flx_smooth = median_filter(flx, size=smooth_width)
+
         mask = mask_intervals(wl, ignore_windows)
+
         wl_for_interpol = wl[mask]
-        flx_for_interpol = flx[mask]
+        flx_for_interpol = flx_smooth[mask]
 
-        # clip some extreme outliers before the first fit
-        mask = ~sigma_clip(flx_for_interpol,
-                           sigma_lower=10,
-                           sigma_upper=10,
-                           axis=0, masked=True).mask
+        # Initial wide sigma clip to remove huge outliers
+        mask2 = ~sigma_clip(flx_for_interpol,
+                            sigma_lower=8,
+                            sigma_upper=8,
+                            masked=True).mask
 
-        sigmas_lo = [6, 4, 3, 2, 1.7]
-        sigmas_hi = [6, 5, 4, 4, 3]
+        sigmas_lo = [3, 2.5, 2.0, 1.8]
+        sigmas_hi = [5, 4, 4, 3]
         nit = len(sigmas_lo)
+
+        # Iterative robust fitting
         for k in range(nit):
-            params, errs = curve_fit(polynomial,
-                                     wl_for_interpol[mask],
-                                     flx_for_interpol[mask])
+            params, _ = curve_fit(lambda x, *p: polynomial(x, *p),
+                                  wl_for_interpol[mask2],
+                                  flx_for_interpol[mask2],
+                                  p0=np.ones(poly_order+1))
             flx_cont = polynomial(wl_for_interpol, *params)
-            mask = ~sigma_clip(flx_for_interpol/flx_cont,
-                               sigma_lower=sigmas_lo[k],
-                               sigma_upper=sigmas_hi[k],
-                               masked=True,
-                               axis=0).mask
+            ratio = flx_for_interpol / flx_cont
+            mask2 = ~sigma_clip(ratio,
+                                sigma_lower=sigmas_lo[k],
+                                sigma_upper=sigmas_hi[k],
+                                masked=True).mask
+
+        # final continuum
         flx_cont = polynomial(wl, *params)
-        flx /= flx_cont
-        flxs[i] = flx
+
+        # enforce continuum never below smoothed flux
+        flx_cont = np.maximum(flx_cont, flx_smooth)
+
+        # normalize
+        flxs[i] = flx / flx_cont
 
         if DEBUG_PLOTS:
-            colors_good = ["navy", "black"]
-            color_bad = ["cadetblue", "gray"]
-            color_model = ["darkorange", "red"]
-            plt.scatter(wl_for_interpol[~mask], flx_for_interpol[~mask],
-                        marker=".", zorder=10, color=color_bad[i%2])
-            plt.scatter(wl_for_interpol[mask], flx_for_interpol[mask],
-                        marker=".", zorder=11, color=colors_good[i%2])
-            plt.plot(wl, flx_cont, color=color_model[i%2], zorder=12)
-
-
-        # hiflx = flx[int(0.8*len(flx)):int(0.9*len(flx))]
-        # loflx = flx[int(0.1*len(flx)):int(0.2*len(flx))]
-        #
-        # hiwl = np.mean(wl[int(0.8*len(flx)):int(0.9*len(flx))])
-        # lowl = np.mean(wl[int(0.1*len(flx)):int(0.2*len(flx))])
-        #
-        # himed = np.median(hiflx)
-        # lomed = np.median(loflx)
-        #
-        # m = (himed-lomed)/(hiwl-lowl)
-        # n = lomed - m * lowl
-        #
-        # flxs[i] /= m*wls[i]+n
-
-        # nextflx = np.median(flxs[i+1][int(0.1*len(flx)):int(0.2*len(flx))])
-        # nextwl = np.median(wls[i+1][int(0.1*len(flx)):int(0.2*len(flx))])
-        #
-        # shouldbe = nextwl*m+n
-        #
-        # fac = shouldbe/nextflx
-
-        # flxs[i+1] *= fac
+            plt.figure()
+            plt.plot(wl, flx, "k-", alpha=0.5, label="original")
+            plt.plot(wl, flx_smooth, "gray", alpha=0.5, label="smoothed")
+            plt.plot(wl, flx_cont, "r-", lw=2, label="continuum fit")
+            plt.legend()
+            plt.title(f"Order {i}")
 
     if DEBUG_PLOTS:
         plt.show()
 
     return flxs
 
-def resample_orders(wave_new, wave, flux, flux_err=None):
+def legendre_normalization(wls, flxs,
+                           poly_order=3,
+                           ignore_windows=[(3831.4, 3839.4),
+                                           (3883, 3893), (3963.5, 3981),
+                                           (4090, 4115), (4320, 4355),
+                                           (4842, 4888), (6540, 6590),
+                                           (6860, 6880),
+                                           (6888.1, 6890.5), (6892, 6893.6),
+                                           (7590, 7617), (7622.8, 7625)],
+                           smooth_width=31,
+                           DEBUG_PLOTS=False):
+    """
+    Normalize single spectral orders using low-order Legendre polynomials.
+
+    Parameters
+    ----------
+    wls : list of 1D arrays
+        Wavelength arrays (one per order).
+    flxs : list of 1D arrays
+        Flux arrays (one per order).
+    poly_order : int
+        Degree of Legendre polynomial (1–2 is usually best).
+    ignore_windows : list of (low, high) tuples
+        Wavelength ranges to ignore during fitting.
+    smooth_width : int
+        Width of median filter for pre-smoothing.
+    DEBUG_PLOTS : bool
+        If True, diagnostic plots are shown.
+    """
+
+    def mask_intervals(wl, intervals):
+        mask = np.ones_like(wl, dtype=bool)
+        for lo, hi in intervals:
+            mask &= ~((wl > lo) & (wl < hi))
+        return mask
+
+    def legendre_fit(x, *coeffs):
+        """Evaluate Legendre polynomial on normalized domain [-1, 1]."""
+        # Normalize wavelengths to [-1, 1]
+        xn = 2 * (x - x.min()) / (x.max() - x.min()) - 1
+        return legendre.legval(xn, coeffs)
+
+    for i, wl in enumerate(wls):
+        flx = flxs[i]
+
+        # Pre-smooth flux to suppress noise/cosmic rays
+        flx_smooth = median_filter(flx, size=smooth_width)
+
+        # Mask out bad windows
+        mask = mask_intervals(wl, ignore_windows)
+        wl_for_fit = wl[mask]
+        flx_for_fit = flx_smooth[mask]
+
+        # Initial broad sigma clip
+        mask2 = ~sigma_clip(flx_for_fit,
+                            sigma_lower=8,
+                            sigma_upper=8,
+                            masked=True).mask
+
+        # Iterative asymmetric clipping
+        sigmas_lo = [3, 2.5, 2.0, 1.8]
+        sigmas_hi = [5, 4, 4, 3]
+
+        for k in range(len(sigmas_lo)):
+            coeffs, _ = curve_fit(lambda x, *c: legendre_fit(x, *c),
+                                  wl_for_fit[mask2],
+                                  flx_for_fit[mask2],
+                                  p0=np.zeros(poly_order + 1))
+            flx_cont = legendre_fit(wl_for_fit, *coeffs)
+            ratio = flx_for_fit / flx_cont
+            mask2 = ~sigma_clip(ratio,
+                                sigma_lower=sigmas_lo[k],
+                                sigma_upper=sigmas_hi[k],
+                                masked=True).mask
+
+        # Final continuum
+        flx_cont = legendre_fit(wl, *coeffs)
+
+        # Enforce continuum ≥ smoothed flux
+        flx_cont = np.maximum(flx_cont, flx_smooth)
+
+        # Normalize
+        flxs[i] = flx / flx_cont
+
+        if DEBUG_PLOTS:
+            plt.figure()
+            plt.plot(wl, flx, "k-", alpha=0.6, label="original")
+            plt.plot(wl, flx_smooth, "gray", alpha=0.6, label="smoothed")
+            plt.plot(wl, flx_cont, "r-", lw=2, label="Legendre fit")
+            plt.legend()
+            plt.title(f"Order {i}")
+
+    if DEBUG_PLOTS:
+        plt.show()
+
+    return flxs
+
+def resample_orders(wave_new, wave, flux, flux_err=None,
+                    plot=False):
 
     wave_res = []
     flux_res = []
     err_res = []
     widx_res = []
     norder = len(wave)
+    colors_i = ["tab:orange", "tab:pink"]
     for i in range(norder):
         wave_order = wave[i]
         flux_order = flux[i]
@@ -199,6 +299,8 @@ def resample_orders(wave_new, wave, flux, flux_err=None):
         widx_new = (wave_new >= wmin_order) & (wave_new <= wmax_order)
         widx_new = np.where(widx_new)[0]
         wave_order_new = wave_new[widx_new]
+
+        if plot: plt.plot(wave_order, flux_order, color=colors_i[i%2])
 
         flux_order = resample(wave_order_new, wave_order, flux_order,
                               verbose=False)
@@ -254,12 +356,11 @@ def resample_orders(wave_new, wave, flux, flux_err=None):
     flux_merge = weighted_flux_sum / wsum
     err_merge = np.sqrt(1 / wsum)
 
-    plot = False
     if plot:
         plt.plot(wave_new, flux_merge)
-        plt.plot(wave_new, err_merge, c="grey")
+#        plt.plot(wave_new, err_merge, c="grey")
         err_est = estimate_noise(wave_new, flux_merge)
-        plt.plot(wave_new, err_est, c="red")
+        plt.plot(wave_new, err_est, c="tab:gray")
         plt.title("Flux normalisation by order")
         plt.xlabel("Wavelength / Angstrom")
         plt.ylabel("Flux")
@@ -270,7 +371,7 @@ def resample_orders(wave_new, wave, flux, flux_err=None):
 
 
 def generate_wave_grid(wmin, wmax, resolution,
-                       sampling=2.6):
+                       sampling=2.7):
     temp = (2 * sampling * resolution + 1) / (2 * sampling * resolution - 1)
     nwave = np.ceil(np.log(wmax / wmin) / np.log(temp))
     if wmin > 0 and np.isfinite(nwave):
@@ -356,7 +457,7 @@ def align_normalization(wave, flux, DEBUG_PLOTS=False):
 
 
 def merge_orders(olist: list[SpectralOrder], normalize=True, margin=2, max_wl=8900,
-                 resolution=50000, DEBUG_PLOTS=False):
+                 resolution=30000, DEBUG_PLOTS=False):
     wave = [o.wl[margin:-margin] for o in olist if o.wl.min() < max_wl]
     flux = [o.science[margin:-margin] for o in olist if o.wl.min() < max_wl]
 
@@ -379,6 +480,7 @@ def merge_orders(olist: list[SpectralOrder], normalize=True, margin=2, max_wl=89
 
     if normalize:
         flux = poly_normalization(wave, flux, DEBUG_PLOTS=DEBUG_PLOTS)
+#        flux = legendre_normalization(wave, flux, DEBUG_PLOTS=DEBUG_PLOTS)
     else:
         flux = align_normalization(wave, flux, DEBUG_PLOTS=DEBUG_PLOTS)
 
@@ -395,7 +497,9 @@ def merge_orders(olist: list[SpectralOrder], normalize=True, margin=2, max_wl=89
     wmax = wave_flat[-1]
 
     common_wl = generate_wave_grid(wmin, wmax, resolution=resolution)
-    common_flx, common_err = resample_orders(common_wl, wave, flux, flux_err=None)
+    plot_resample = False
+    common_flx, common_err = resample_orders(common_wl, wave, flux, flux_err=None,
+                                 plot=plot_resample)
 
     if DEBUG_PLOTS:
         plt.plot(common_wl, common_flx)
@@ -504,6 +608,11 @@ def estimate_resolution(orders, verbose=False, DEBUG_PLOTS=False):
 
 
 def merge_resolution(wave_merged, orders, dres, npix=45, DEBUG_PLOTS=False):
+
+    DEBUG_PLOTS_res = DEBUG_PLOTS
+    # not necessary; already plotted
+    DEBUG_PLOTS_res = False
+
     res_poly = []
     res_poly_wl = []
     for i, o in enumerate(orders):
@@ -513,7 +622,8 @@ def merge_resolution(wave_merged, orders, dres, npix=45, DEBUG_PLOTS=False):
         yeval = poly1d_fn(xeval)
         res_poly.extend(yeval)
         res_poly_wl.extend(xeval)
-        if DEBUG_PLOTS: plt.plot(xeval, yeval, lw=1.5)
+        if DEBUG_PLOTS_res:
+            plt.plot(xeval, yeval, lw=1.5)
     res_poly = np.array(res_poly)
     res_poly_wl = np.array(res_poly_wl)
     isort = np.argsort(res_poly_wl)
@@ -528,7 +638,7 @@ def merge_resolution(wave_merged, orders, dres, npix=45, DEBUG_PLOTS=False):
     res_merged = gaussian_filter1d(res_merged, npix,
                                    mode="constant", cval=res_med)
 
-    if DEBUG_PLOTS:
+    if DEBUG_PLOTS_res:
         plt.plot(wave_merged, res_merged, ls="--", lw=2, color="black")
         plt.title("Resolving power")
         plt.tight_layout()
@@ -536,33 +646,6 @@ def merge_resolution(wave_merged, orders, dres, npix=45, DEBUG_PLOTS=False):
 
     return res_merged
 
-def calibrate_orders(flat, comp, bias,
-                     idcomp_dir="idcomp",
-                     idcomp_offset=-15,
-                     sampling=200, min_order_samples=6,
-                     frame_for_slice=None,
-                     verbose=False, DEBUG_PLOTS=False):
-
-    if frame_for_slice is None:
-        frame_for_slice = flat
-    else:
-        frame_for_slice = open_or_coadd_frame(frame_for_slice)
-        frame_for_slice = (frame_for_slice + flat) / 2
-
-    # find orders in 2d image
-    orders = find_orders(frame_for_slice, sampling=sampling,
-                         min_order_samples=min_order_samples,
-                         DEBUG_PLOTS=DEBUG_PLOTS, verbose=verbose)
-
-    # extract calibration and solve dispersion relations for each identified order
-    orders = find_dispersion(orders, bias, comp, idcomp_dir,
-                             idcomp_offset=idcomp_offset,
-                             verbose=verbose,
-                             DEBUG_PLOTS=DEBUG_PLOTS)
-
-    orders = [o for o in orders if o.wl is not None]
-
-    return orders
 
 def extract_spectrum(spectrum, flats, comps, biases, idcomp_offset=-15,
                      frame_for_slice=None,
@@ -580,18 +663,38 @@ def extract_spectrum(spectrum, flats, comps, biases, idcomp_offset=-15,
     comps = open_or_coadd_frame(comps)
     biases = open_or_coadd_frame(biases)
 
-    if orders is None:
-        orders = calibrate_orders(flats, comps, biases,
-                                  idcomp_dir=idcomp_dir,
-                                  idcomp_offset=idcomp_offset,
-                                  sampling=sampling,
-                                  min_order_samples=min_order_samples,
-                                  frame_for_slice=frame_for_slice,
-                                  verbose=verbose, DEBUG_PLOTS=DEBUG_PLOTS)
+    """
+    spectrum = spectrum - biases
+    flats = flats - biases
+    comps = comps - biases
+    biases -= biases
+    """
 
-#    print("NORDERS", len(orders))
 
     times_sigma = 2
+    if orders is None:
+        if frame_for_slice is None:
+            frame_for_slice = flats
+        else:
+            frame_for_slice = open_or_coadd_frame(frame_for_slice)
+            frame_for_slice = (frame_for_slice + flats) / 2
+
+        # find orders in 2d image
+        orders = find_orders(frame_for_slice, sampling=sampling,
+                             min_order_samples=min_order_samples,
+                             DEBUG_PLOTS=DEBUG_PLOTS, verbose=verbose)
+
+#        for o in orders:
+#            o.extract_along_order(spectrum, "science", times_sigma=times_sigma)
+
+        # extract calibration and solve dispersion relations for each identified order
+        orders = find_dispersion(orders, biases, comps, idcomp_dir,
+                                 idcomp_offset=idcomp_offset,
+                                 verbose=verbose,
+                                 DEBUG_PLOTS=DEBUG_PLOTS)
+
+        # only keep orders that have a wavelength solution
+        orders = [o for o in orders if o.wl is not None]
 
     if verbose: print("- extracting orders")
     # Extract different spectra
@@ -602,7 +705,7 @@ def extract_spectrum(spectrum, flats, comps, biases, idcomp_offset=-15,
         o.extract_along_order(biases, "bias", times_sigma=times_sigma)
         o.extract_along_order(comps, "comp", times_sigma=times_sigma)
 
-        o.apply_corrections(comparison=True)
+        o.apply_corrections(comparison=True, DEBUG_PLOTS=False)
 
         # o.plot_frame_1d("science")
         # o.plot_frame_1d("flat")
@@ -643,7 +746,7 @@ def extract_spectrum(spectrum, flats, comps, biases, idcomp_offset=-15,
     if verbose: print("- merging orders")
     wave_merged, flux_merged = merge_orders(orders,
                                             normalize=normalize,
-                                            resolution=dres["R_hi"],
+                                            resolution=dres["R_med"],
                                             DEBUG_PLOTS=DEBUG_PLOTS)
 
     if apply_barycorr and (radvel is not None):
