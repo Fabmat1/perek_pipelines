@@ -103,7 +103,7 @@ def slice_analysis(pixel, slice_x, slice_y, MIN_WINDOW=15, MAX_WINDOW=15, NOISE_
     # remove pixels that belong to a 'bad' group
     igroup_bad = np.where(ipeak_dist > thres_dist)[0]
     if DEBUG_PLOTS:
-        print(igroup_bad)
+        print("bad groups:", igroup_bad)
     if (len(igroup_bad) > 0):
         isplit_groups = np.array(isplit_groups, dtype=object)
         ibad = np.concatenate(isplit_groups[igroup_bad])

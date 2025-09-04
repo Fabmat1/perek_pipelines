@@ -45,7 +45,9 @@ def parse_idcomp(file_path):
 
     return aplow, aphigh, np.array(table_data)
 
-def fit_comparison(linetable, comparison, pixel_window=10, DEBUG_PLOTS=False):
+def fit_comparison(linetable, comparison, pixel_window=8, DEBUG_PLOTS=False):
+
+#    DEBUG_PLOTS = True
 
     line_wls = (linetable[:, 1] + linetable[:, 2]) / 2
     line_px = linetable[:, 0]
@@ -66,11 +68,15 @@ def fit_comparison(linetable, comparison, pixel_window=10, DEBUG_PLOTS=False):
         pwin = pixels[px_window]
         intensities = comparison[px_window]
 
+        psigma_ini = 3.5 / 2.355
+        psigma_min = 1.5 / 2.355
+        psigma_max = min(9.5, 2*pixel_window) / 2.355
+
         params, errs = curve_fit(Gaussian_res, pwin, intensities,
-                                 p0=[1, l, pixel_window / 4],
+                                 p0=[1, l, psigma_ini],
                                  bounds=[
-                                     [0, l - pixel_window / 2, 0],
-                                     [np.inf, l + pixel_window / 2, pixel_window / 2]
+                                     [0, l - pixel_window / 2, psigma_min],
+                                     [np.inf, l + pixel_window / 2, psigma_max]
                                  ],
                                  maxfev=100000)
 
@@ -197,11 +203,12 @@ def fit_dispersion(x, y, yerr, DEBUG_PLOTS=False):
     return dout
 
 
-def solve_wavelength(linetable, order, pixel_window=10, DEBUG_PLOTS=False):
+def solve_wavelength(linetable, order, pixel_window=8, DEBUG_PLOTS=False):
 
     # determine the arc line positions in pixels, given starting values
     lfit = fit_comparison(linetable, order.comparison,
-                          pixel_window=10, DEBUG_PLOTS=DEBUG_PLOTS)
+                          pixel_window=pixel_window,
+                          DEBUG_PLOTS=DEBUG_PLOTS)
 
     actual_positions = lfit["actual_positions"]
     actual_errors = lfit["actual_errors"]

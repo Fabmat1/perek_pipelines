@@ -672,12 +672,12 @@ def extract_spectrum(spectrum, flats, comps, biases, idcomp_offset=-15,
     biases = open_or_coadd_frame(biases)
 
     """
+    # remove biases first
     spectrum = spectrum - biases
     flats = flats - biases
     comps = comps - biases
     biases -= biases
     """
-
 
     times_sigma = 2
     if orders is None:
