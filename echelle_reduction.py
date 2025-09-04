@@ -170,14 +170,14 @@ def poly_normalization(wls, flxs,
         flxs[i] = flx / flx_cont
 
         if DEBUG_PLOTS:
-            plt.plot(wl, flx, "k-", alpha=0.5)
-            plt.plot(wl, flx_smooth, "gray", alpha=0.5)
+            plt.plot(wl, flx, "k-")
+            plt.plot(wl, flx_smooth, "gray")
             plt.plot(wl, flx_cont, "r-", lw=2)
 
     if DEBUG_PLOTS:
-        plt.show()
+        plt.title("Normalisation")
         plt.tight_layout()
-        plt.title(f"Order {i}")
+        plt.show()
 
     return flxs
 

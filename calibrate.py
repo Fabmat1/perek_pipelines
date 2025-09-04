@@ -47,13 +47,11 @@ def parse_idcomp(file_path):
 
 def fit_comparison(linetable, comparison, pixel_window=10, DEBUG_PLOTS=False):
 
-#    DEBUG_PLOTS = True
-
     line_wls = (linetable[:, 1] + linetable[:, 2]) / 2
     line_px = linetable[:, 0]
 
     if DEBUG_PLOTS:
-        plt.vlines(line_px, ymin=1, ymax=1.05, color="tab:orange")
+        plt.vlines(line_px, ymin=1.1, ymax=1.15, color="tab:orange")
 
     initial_params, _ = curve_fit(polynomial, line_px, line_wls)
 
