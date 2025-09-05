@@ -8,8 +8,8 @@ from matplotlib import pyplot as plt
 from echelle_reduction import extract_spectrum
 
 def main():
-    dir = "20250903part/"
-    frame_for_slice = "20250903part/e202509030031.fit"
+    dir = "20250831/"
+    frame_for_slice = "20250831/e202508310031.fit"
 
     idcomp_dir = "idcomp_2307/"
     fn_science = None
@@ -105,6 +105,8 @@ def reduce_night(dir, idcomp_dir, fn_science=None,
                 # steal the original header
                 with fits.open(dir+"/"+fp) as hdul:
                     header = hdul[0].header
+                if s["bjd"] is not None:
+                    header["BJD"] = s["bjd"]
                 primary_hdu = fits.PrimaryHDU(header=header)
                 fits_cols = [fits.Column(name=key, array=s[key], format='D') for key in s if type(s[key]) == np.ndarray]
                 # the name is always in captials

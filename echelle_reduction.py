@@ -1,18 +1,20 @@
 import os
-import astropy.units as u
-from astropy.coordinates import EarthLocation, SkyCoord
-from astropy.time import Time
-from scipy.constants import speed_of_light
-from matplotlib import pyplot as plt
-import numpy as np
 from time import time
-from astropy.io import fits
+import numpy as np
+from numpy.polynomial import legendre
+import matplotlib.pyplot as plt
+
+from scipy.constants import speed_of_light
 from scipy.ndimage import (minimum_filter, maximum_filter,
                            median_filter, uniform_filter1d)
 from scipy.ndimage import gaussian_filter1d
 from scipy.optimize import curve_fit
+
+import astropy.units as u
+from astropy.coordinates import EarthLocation, SkyCoord
+from astropy.time import Time
+from astropy.io import fits
 from astropy.stats import sigma_clip
-from numpy.polynomial import legendre
 
 from estimate_noise import estimate_noise
 from tools import (polyfit_reject, curve_fit_reject, pair_generation,
@@ -34,28 +36,47 @@ except ModuleNotFoundError:
 
 two_log_two = 2 * np.sqrt(2 * np.log(2))
 
+
 def get_barycorr(frame):
+    """
+    comute:
+     - barycentric correction to the radial velocity
+     - barycentrically corrected JD (-> BJD)
+    """
+
     with fits.open(frame) as hdul:
         header = hdul[0].header
     header = dict(header)
     hreq = ["LATITUDE", "LONGITUD", "HEIGHT",
             "RA", "DEC", "DATE-OBS", "UT"]
+    radvel_corr = None
+    bjd = None
     if all(i in header for i in hreq):
+        # Telescope location
         lat = header['LATITUDE']
         lon = header['LONGITUD']
-
         height = header['HEIGHT']
+        location = EarthLocation(lat=lat, lon=lon, height=height)
+
+        # Target coordinates
         RA = header['RA']
         DEC = header['DEC']
-
-        otime = Time(header["DATE-OBS"]+"T"+header["UT"], format='isot', scale='utc')
-
-        location = EarthLocation(lat=lat, lon=lon, height=height)
         coord = SkyCoord(ra=RA, dec=DEC, unit=(u.hourangle, u.deg))
-        radvel_corr = coord.radial_velocity_correction(obstime=otime, location=location)
-        radvel_corr = radvel_corr.to(u.km / u.s)
-        radvel_corr = radvel_corr.value
-    return radvel_corr
+
+        # Observation time
+        otime = Time(header["DATE-OBS"]+"T"+header["UT"], format='isot', scale='utc', location=location)
+
+        # Radial velocity correction (barycentric)
+        radvel_corr = coord.radial_velocity_correction(obstime=otime)
+        radvel_corr = radvel_corr.to(u.km / u.s).value
+
+        # Barycentric Julian Date
+        ltt_bary = otime.light_travel_time(coord)  # Light-travel time correction
+        bjd = (otime.tdb + ltt_bary).jd           # BJD in days
+    else:
+        print("> failed to compute barycorr")
+
+    return radvel_corr, bjd
 
 def coadd_frames(frames):
     frame = np.sum(frames, axis=0).astype(float) / len(frames)
@@ -664,7 +685,7 @@ def extract_spectrum(spectrum, flats, comps, biases, idcomp_offset=-15,
                      orders=None,
                      DEBUG_PLOTS=False, **kwargs):
 
-    radvel = get_barycorr(spectrum)
+    radvel, bjd = get_barycorr(spectrum)
 
     spectrum = open_or_coadd_frame(spectrum)
     flats = open_or_coadd_frame(flats)
@@ -784,7 +805,8 @@ def extract_spectrum(spectrum, flats, comps, biases, idcomp_offset=-15,
             "flux": flux_merged,
             "error": noise,
             "res": res_merged,
-            "orders": orders}
+            "orders": orders,
+            "bjd": bjd}
 
     return dout
 
