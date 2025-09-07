@@ -79,7 +79,11 @@ def reduce_night(dir, idcomp_dir, fn_science=None,
 
         # replace non-alphanumeric characters, except "_", ".", "+", "-"
         fp_save = re.sub(r'[^\w_.+-]', '_', fp)
-
+        fp_save = "done/" + fp_save
+        try:
+            os.makedirs("done/")
+        except FileExistsError:
+            pass
         fp_save_fits = fp_save.replace(".fit", "_" + name + ".fits")
         fp_save_ascii = fp_save.replace(".fit", "_" + name + ".dat")
         if (save_as_fits and (not os.path.exists(fp_save_fits))) or \

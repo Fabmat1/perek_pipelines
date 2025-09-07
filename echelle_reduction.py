@@ -197,8 +197,7 @@ def poly_normalization(wls, flxs,
     with Pool(n_processes) as pool:
         if TQDM_AVAILABLE and show_progress and len(args_list) > 10:
             results = list(tqdm(pool.imap(normalize_single_order, args_list),
-                               total=len(args_list),
-                               desc="Normalizing spectra"))
+                               total=len(args_list)))
         else:
             results = pool.map(normalize_single_order, args_list)
 
@@ -500,7 +499,7 @@ def align_normalization(wave, flux, DEBUG_PLOTS=False):
 
 
 def merge_orders(olist: list[SpectralOrder], normalize=True, margin=2, max_wl=8900,
-                 resolution=30000, DEBUG_PLOTS=False):
+                 resolution=30000, DEBUG_PLOTS=False, verbose=True):
     wave = [o.wl[margin:-margin] for o in olist if o.wl.min() < max_wl]
     flux = [o.science[margin:-margin] for o in olist if o.wl.min() < max_wl]
 
@@ -521,6 +520,7 @@ def merge_orders(olist: list[SpectralOrder], normalize=True, margin=2, max_wl=89
         plt.tight_layout()
         plt.show()
 
+    if verbose: print("- normalising orders")
     if normalize:
         flux = poly_normalization(wave, flux, DEBUG_PLOTS=DEBUG_PLOTS)
 #        flux = legendre_normalization(wave, flux, DEBUG_PLOTS=DEBUG_PLOTS)
@@ -539,6 +539,7 @@ def merge_orders(olist: list[SpectralOrder], normalize=True, margin=2, max_wl=89
     wmin = wave_flat[0]
     wmax = wave_flat[-1]
 
+    if verbose: print("- merging orders")
     common_wl = generate_wave_grid(wmin, wmax, resolution=resolution)
     plot_resample = False
     common_flx, common_err = resample_orders(common_wl, wave, flux, flux_err=None,
@@ -777,11 +778,11 @@ def extract_spectrum(spectrum, flats, comps, biases, idcomp_offset=-15,
     # estimate spectral resolving power
     dres = estimate_resolution(orders, verbose=verbose, DEBUG_PLOTS=DEBUG_PLOTS)
 
-    if verbose: print("- merging orders")
     wave_merged, flux_merged = merge_orders(orders,
                                             normalize=normalize,
                                             resolution=dres["R_med"],
-                                            DEBUG_PLOTS=DEBUG_PLOTS)
+                                            DEBUG_PLOTS=DEBUG_PLOTS,
+                                            verbose=verbose)
 
     if apply_barycorr and (radvel is not None):
         wave_merged = wlshift(wave_merged, radvel)
