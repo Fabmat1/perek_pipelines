@@ -293,3 +293,25 @@ class SpectralOrder:
             mask = self.comparison < -qhi
             self.comparison[mask] = np.nan
             self.comparison = fill_nan(self.comparison)
+
+def extract_order(o_args):
+    o, spectrum, flats, biases, comps, times_sigma = o_args
+    o.extract_along_order(spectrum, "science", times_sigma=times_sigma)
+    o.extract_along_order(flats, "flat", times_sigma=times_sigma)
+    o.extract_along_order(biases, "bias", times_sigma=times_sigma)
+    o.extract_along_order(comps, "comp", times_sigma=times_sigma)
+    o.apply_corrections(comparison=True, DEBUG_PLOTS=False)
+    # o.plot_frame_1d("science")
+    # o.plot_frame_1d("flat")
+    # o.plot_frame_1d("bias")
+    # o.plot_frame_1d("comp")
+    # o.plot_frame_1d("comp_orig")
+    return o
+
+def extract_order_for_calib(args):
+    idx_order, orders, biases, comps, times_sigma = args
+    o = orders[idx_order]
+    o.extract_along_order(biases, "bias", times_sigma=times_sigma)
+    o.extract_along_order(comps, "comp", times_sigma=times_sigma)
+    o.apply_corrections(comparison=True)
+    return idx_order, o

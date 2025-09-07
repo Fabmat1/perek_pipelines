@@ -4,6 +4,9 @@ from matplotlib.colors import LogNorm
 from scipy.optimize import curve_fit
 from scipy.ndimage import (minimum_filter, maximum_filter)
 
+from multiprocessing import Pool, cpu_count
+from tqdm import tqdm
+
 from tools import (mask_section, Gaussian, fill_nan, pair_generation)
 from orders import SpectralOrder
 
@@ -238,26 +241,23 @@ def slice_analysis(pixel, slice_x, slice_y, MIN_WINDOW=15, MAX_WINDOW=15, NOISE_
                          np.array(location_uncertainties),
                          np.array(widths))
 
+def process_slice(args):
+    i, pixel, frame_for_slice, npix_x, DEBUG_PLOTS = args
+    xidx = np.arange(3) + pixel - 1
+    xidx = xidx[(xidx>=0) & (xidx<npix_x)]
+    slice_y = np.sum(frame_for_slice[:, xidx].astype(float), axis=1) / len(xidx)
+    slice_x = np.arange(frame_for_slice.shape[1])
+    debug_slice = (i == 0) and DEBUG_PLOTS
+    slice = slice_analysis(pixel - 1, slice_x, slice_y, DEBUG_PLOTS=debug_slice)
+    return slice
 
 def find_slices(frame_for_slice, sampling=200, DEBUG_PLOTS=False):
     # Get orders and stuff from flat
     npix_x = frame_for_slice.shape[1]
     pixels = np.linspace(5, npix_x-5, sampling).astype(int)
-    slices = []
-    for i in range(sampling):
-        pixel = pixels[i]
-#        slice_y = frame_for_slice[:, pixel - 1].astype(float)
-        # average 3 pixels in x direction
-        xidx = np.arange(3) + pixel - 1
-        xidx = xidx[(xidx>=0) & (xidx<npix_x)]
-        slice_y = np.sum(frame_for_slice[:, xidx].astype(float), axis=1) / len(xidx)
-        slice_x = np.arange(frame_for_slice.shape[1])
-        if (i == 0) and DEBUG_PLOTS:
-            debug_slice = True
-        else:
-            debug_slice = False
-        slice = slice_analysis(pixel - 1, slice_x, slice_y, DEBUG_PLOTS=debug_slice)
-        slices.append(slice)
+    args_list = [(i, pixels[i], frame_for_slice, npix_x, DEBUG_PLOTS) for i in range(sampling)]
+    with Pool(processes=cpu_count()) as pool:
+        slices = list(tqdm(pool.imap(process_slice, args_list), total=sampling))
 
     if DEBUG_PLOTS and False:
         plt.imshow(frame_for_slice, zorder=1, cmap='gray', norm="log")

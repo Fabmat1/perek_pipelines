@@ -3,6 +3,9 @@ import numpy as np
 from scipy.optimize import curve_fit
 from matplotlib import pyplot as plt
 from tools import Gaussian_res, polynomial, curve_fit_reject, pair_generation
+from orders import extract_order_for_calib
+from multiprocessing import Pool, cpu_count
+from tqdm import tqdm
 
 two_log_two = 2 * np.sqrt(2 * np.log(2))
 
@@ -266,6 +269,23 @@ def solve_wavelength(linetable, order, pixel_window=8, DEBUG_PLOTS=False):
         plt.ylabel(r"$R = \lambda / \Delta \lambda$")
         plt.show()
 
+def process_dispersion(args):
+    """
+    wrapper for solving dispersion relations using multiprocessing
+    """
+    j, idx_id, idx_order, orders, avg_aps, linelists, DEBUG_PLOTS = args
+    o = orders[idx_order]
+    key = avg_aps[idx_id]
+    linelist_o = linelists[key]
+
+    # only plot one solution
+    debug_solve = DEBUG_PLOTS and (j == 3)
+
+    solve_wavelength(linelist_o, o, DEBUG_PLOTS=debug_solve)
+    o.pix = np.arange(len(o.wl))
+#    o.plot_frame_1d("comp_orig")
+
+    return idx_order, o
 
 def find_dispersion(orders, biases, comps,
                     idcomp_dir, idcomp_offset=-15,
@@ -302,10 +322,15 @@ def find_dispersion(orders, biases, comps,
     id_order_pairs = [p for p in id_order_pairs if (p[0] is not None) and (p[1] is not None)]
     if verbose: print("- found %d pairs" % len(id_order_pairs))
 
+    # extract arc spectra from image
     if verbose: print("- extracting orders")
+    args = [(p[1], orders, biases, comps, times_sigma) for p in id_order_pairs]
+    with Pool(processes=cpu_count()) as pool:
+        results = list(tqdm(pool.imap(extract_order_for_calib, args), total=len(args)))
+    for idx_order, o in results:
+        orders[idx_order] = o
 
-    # Extract different spectra
-#    for o in orders:
+    """
     for p in id_order_pairs:
         idx_order = p[1]
         o = orders[idx_order]
@@ -313,10 +338,18 @@ def find_dispersion(orders, biases, comps,
         o.extract_along_order(biases, "bias", times_sigma=times_sigma)
         o.extract_along_order(comps, "comp", times_sigma=times_sigma)
         o.apply_corrections(comparison=True)
+    """
 
-#        o.plot_frame_1d("comp_orig")
 
     if verbose: print("- solving dispersion relations")
+    args = [(j, p[0], p[1], orders, avg_aps, linelists, DEBUG_PLOTS) \
+            for j, p in enumerate(id_order_pairs)]
+    with Pool(processes=cpu_count()) as pool:
+        results = list(tqdm(pool.imap(process_dispersion, args), total=len(args)))
+    for idx_order, o in results:
+        orders[idx_order] = o
+
+    """
     for j, p in enumerate(id_order_pairs):
         idx_id = p[0]
         idx_order = p[1]
@@ -333,5 +366,7 @@ def find_dispersion(orders, biases, comps,
         o.pix = np.arange(len(o.wl))
 
 #        o.plot_frame_1d("comp_orig")
+    """
+
 
     return orders

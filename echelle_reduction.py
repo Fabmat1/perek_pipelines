@@ -10,6 +10,9 @@ from scipy.ndimage import (minimum_filter, maximum_filter,
 from scipy.ndimage import gaussian_filter1d
 from scipy.optimize import curve_fit
 
+from multiprocessing import Pool, cpu_count
+from tqdm import tqdm
+
 import astropy.units as u
 from astropy.coordinates import EarthLocation, SkyCoord
 from astropy.time import Time
@@ -22,7 +25,7 @@ from tools import (polyfit_reject, curve_fit_reject, pair_generation,
                    fill_nan, Gaussian, Gaussian_res)
 from calibrate import find_dispersion
 from identify_orders import (SpectralSlice, find_orders)
-from orders import SpectralOrder
+from orders import (SpectralOrder, extract_order)
 
 try:
     from resample_spectres import resample
@@ -726,21 +729,10 @@ def extract_spectrum(spectrum, flats, comps, biases, idcomp_offset=-15,
         orders = [o for o in orders if o.wl is not None]
 
     if verbose: print("- extracting orders")
-    # Extract different spectra
-    for o in orders:
-        if verbose: print("- order", o.id, end="\r")
-        o.extract_along_order(spectrum, "science", times_sigma=times_sigma)
-        o.extract_along_order(flats, "flat", times_sigma=times_sigma)
-        o.extract_along_order(biases, "bias", times_sigma=times_sigma)
-        o.extract_along_order(comps, "comp", times_sigma=times_sigma)
-
-        o.apply_corrections(comparison=True, DEBUG_PLOTS=False)
-
-        # o.plot_frame_1d("science")
-        # o.plot_frame_1d("flat")
-        # o.plot_frame_1d("bias")
-        # o.plot_frame_1d("comp")
-        # o.plot_frame_1d("comp_orig")
+    args = [(o, spectrum, flats, biases, comps, times_sigma) for o in orders]
+    with Pool(processes=cpu_count()) as pool:
+        results = list(tqdm(pool.imap(extract_order, args), total=len(args)))
+        orders = results
 
     if DEBUG_PLOTS:
         plt.title("Science, flat, arc, bias in each order")
