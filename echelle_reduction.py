@@ -11,13 +11,26 @@ from scipy.ndimage import gaussian_filter1d
 from scipy.optimize import curve_fit
 
 from multiprocessing import Pool, cpu_count
-from tqdm import tqdm
+try:
+    from tqdm import tqdm
+    TQDM_AVAILABLE = True
+except ImportError:
+    TQDM_AVAILABLE = False
 
 import astropy.units as u
 from astropy.coordinates import EarthLocation, SkyCoord
 from astropy.time import Time
 from astropy.io import fits
 from astropy.stats import sigma_clip
+
+import numpy as np
+from scipy.ndimage import median_filter
+from scipy.optimize import curve_fit
+from astropy.stats import sigma_clip
+import matplotlib.pyplot as plt
+from multiprocessing import Pool
+import functools
+
 
 from estimate_noise import estimate_noise
 from tools import (polyfit_reject, curve_fit_reject, pair_generation,
@@ -119,6 +132,49 @@ def mask_intervals(x, intervals):
 
     return mask
 
+def polynomial(x, *p):
+    return np.polyval(p, x)
+
+def mask_intervals(wl, intervals):
+    mask = np.ones_like(wl, dtype=bool)
+    for lo, hi in intervals:
+        mask &= ~((wl > lo) & (wl < hi))
+    return mask
+
+def normalize_single_order(args):
+    """Worker function for multiprocessing"""
+    i, wl, flx, poly_order, ignore_windows, smooth_width, DEBUG_PLOTS = args
+
+    mask = mask_intervals(wl, ignore_windows)
+    mask2 = ~sigma_clip(flx, sigma_lower=8, sigma_upper=8, masked=True).mask
+    mask = mask & mask2
+    flx_smooth = median_filter(flx[mask], size=smooth_width, mode="nearest")
+    wl_for_interpol = wl[mask]
+    flx_for_interpol = flx_smooth
+    mask2 = np.ones_like(wl_for_interpol).astype(bool)
+    sigmas_lo = [3, 2.5, 2.0, 1.8]
+    sigmas_hi = [5, 4, 3.5, 3]
+    nit = len(sigmas_lo)
+
+    for k in range(nit):
+        params, *_ = curve_fit(lambda x, *p: polynomial(x, *p),
+                              wl_for_interpol[mask2],
+                              flx_for_interpol[mask2],
+                              p0=np.ones(poly_order+1))
+        flx_cont = polynomial(wl_for_interpol, *params)
+        ratio = flx_for_interpol / flx_cont
+        mask2 = ~sigma_clip(ratio,
+                            sigma_lower=sigmas_lo[k],
+                            sigma_upper=sigmas_hi[k],
+                            masked=True).mask
+
+    flx_cont = polynomial(wl, *params)
+    flx_smooth = median_filter(flx, size=int(len(flx_smooth)/4), mode="nearest")
+    flx_cont = np.maximum(flx_cont, flx_smooth)
+    normalized_flx = flx / flx_cont
+
+    return i, normalized_flx, (wl, flx, flx_smooth, flx_cont) if DEBUG_PLOTS else None
+
 def poly_normalization(wls, flxs,
                        poly_order=3,
                        ignore_windows=[(3831.4, 3839.4),
@@ -130,70 +186,26 @@ def poly_normalization(wls, flxs,
                                        (6888.1, 6890.5), (6892, 6893.6),
                                        (7590, 7617), (7622.8, 7625)],
                        smooth_width=31,
-                       DEBUG_PLOTS=False):
+                       DEBUG_PLOTS=False,
+                       n_processes=None,
+                       show_progress=True):
     """
-    Normalize single spectral orders using low-order polynomials.
+    Normalize single spectral orders using low-order polynomials with multiprocessing.
     """
+    args_list = [(i, wl, flxs[i], poly_order, ignore_windows, smooth_width, DEBUG_PLOTS)
+                 for i, wl in enumerate(wls)]
+    with Pool(n_processes) as pool:
+        if TQDM_AVAILABLE and show_progress and len(args_list) > 10:
+            results = list(tqdm(pool.imap(normalize_single_order, args_list),
+                               total=len(args_list),
+                               desc="Normalizing spectra"))
+        else:
+            results = pool.map(normalize_single_order, args_list)
 
-    def polynomial(x, *p):
-        return np.polyval(p, x)
-
-    def mask_intervals(wl, intervals):
-        mask = np.ones_like(wl, dtype=bool)
-        for lo, hi in intervals:
-            mask &= ~((wl > lo) & (wl < hi))
-        return mask
-
-    for i, wl in enumerate(wls):
-        flx = flxs[i]
-
-        mask = mask_intervals(wl, ignore_windows)
-
-        # Initial wide sigma clip to remove huge outliers
-        mask2 = ~sigma_clip(flx,
-                            sigma_lower=8,
-                            sigma_upper=8,
-                            masked=True).mask
-        mask = mask & mask2
-
-        # pre-smooth to suppress noise
-        flx_smooth = median_filter(flx[mask], size=smooth_width,
-                                   mode="nearest")
-
-        wl_for_interpol = wl[mask]
-        flx_for_interpol = flx_smooth
-        mask2 = np.ones_like(wl_for_interpol).astype(bool)
-
-        sigmas_lo = [3, 2.5, 2.0, 1.8]
-        sigmas_hi = [5, 4, 3.5, 3]
-        nit = len(sigmas_lo)
-
-        # Iterative robust fitting
-        for k in range(nit):
-            params, _ = curve_fit(lambda x, *p: polynomial(x, *p),
-                                  wl_for_interpol[mask2],
-                                  flx_for_interpol[mask2],
-                                  p0=np.ones(poly_order+1))
-            flx_cont = polynomial(wl_for_interpol, *params)
-            ratio = flx_for_interpol / flx_cont
-            mask2 = ~sigma_clip(ratio,
-                                sigma_lower=sigmas_lo[k],
-                                sigma_upper=sigmas_hi[k],
-                                masked=True).mask
-
-        # final continuum
-        flx_cont = polynomial(wl, *params)
-
-        # enforce continuum never below smoothed flux
-        flx_smooth = median_filter(flx,
-                                   size=int(len(flx_smooth)/4),
-                                   mode="nearest")
-        flx_cont = np.maximum(flx_cont, flx_smooth)
-
-        # normalize
-        flxs[i] = flx / flx_cont
-
-        if DEBUG_PLOTS:
+    for i, normalized_flx, debug_data in results:
+        flxs[i] = normalized_flx
+        if DEBUG_PLOTS and debug_data:
+            wl, flx, flx_smooth, flx_cont = debug_data
             plt.plot(wl, flx, "k-")
             plt.plot(wl, flx_smooth, "gray")
             plt.plot(wl, flx_cont, "r-", lw=2)
@@ -330,7 +342,8 @@ def resample_orders(wave_new, wave, flux, flux_err=None,
         widx_new = np.where(widx_new)[0]
         wave_order_new = wave_new[widx_new]
 
-        if plot: plt.plot(wave_order, flux_order, color=colors_i[i%2])
+        if plot:
+            plt.plot(wave_order, flux_order, color=colors_i[i%2])
 
         flux_order = resample(wave_order_new, wave_order, flux_order,
                               verbose=False)

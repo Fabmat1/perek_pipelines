@@ -175,8 +175,11 @@ class SpectralOrder:
             y_min = int(np.floor(y_ind - half_height))
             y_max = int(np.ceil(y_ind + half_height))
             # limit to +-4 pixel; the OES orders are too close together
-            y_min = y_ind_round - min(4, (y_ind_round - y_min))
-            y_max = y_ind_round + min(4, (y_max - y_ind_round))
+            ywidth = 4
+            if self.id > 8:
+                ywidth = 5
+            y_min = y_ind_round - min(ywidth, (y_ind_round - y_min))
+            y_max = y_ind_round + min(ywidth, (y_max - y_ind_round))
 
             # pixel indices along cross-dispersion
             y_pixels = np.arange(y_min, y_max)
