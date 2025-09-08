@@ -8,8 +8,9 @@ from matplotlib import pyplot as plt
 from echelle_reduction import extract_spectrum
 
 def main():
-    dir = "20250831/"
-    frame_for_slice = "20250831/e202508310031.fit"
+    dir = "20250907/"
+#    dir = "20250904/"
+    frame_for_slice = "science"
 
     idcomp_dir = "idcomp_2307/"
     fn_science = None
@@ -20,7 +21,8 @@ def main():
     save_as_ascii = True
     plot_spectra = False
     DEBUG_PLOTS = False
-    if not os.path.exists(frame_for_slice):
+    if (not os.path.exists(frame_for_slice)) and \
+       (not frame_for_slice == "science"):
         print(frame_for_slice + " does not exist")
         frame_for_slice = None
 
@@ -90,8 +92,12 @@ def reduce_night(dir, idcomp_dir, fn_science=None,
            (save_as_ascii and (not os.path.exists(fp_save_ascii))):
             print("> reducing %s (%s)" % (fp, name))
             tstart = time.time()
+            if frame_for_slice == "science":
+                frame_for_slice_i = [dir+"/"+sc for sc in science]
+            else:
+                frame_for_slice_i = frame_for_slice
             s = extract_spectrum(dir+"/"+fp, flats, comps, biases,
-                                 frame_for_slice=frame_for_slice,
+                                 frame_for_slice=frame_for_slice_i,
                                  orders=orders,
                                  normalize=normalize,
                                  idcomp_dir=idcomp_dir,
@@ -111,6 +117,7 @@ def reduce_night(dir, idcomp_dir, fn_science=None,
                     header = hdul[0].header
                 if s["bjd"] is not None:
                     header["BJD"] = s["bjd"]
+                header["SNR"] = SNR
                 primary_hdu = fits.PrimaryHDU(header=header)
                 fits_cols = [fits.Column(name=key, array=s[key], format='D') for key in s if type(s[key]) == np.ndarray]
                 # the name is always in captials

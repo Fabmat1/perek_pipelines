@@ -98,14 +98,37 @@ def coadd_frames(frames):
     frame = np.sum(frames, axis=0).astype(float) / len(frames)
     return frame
 
-def open_or_coadd_frame(frame):
+def open_or_coadd_frame_old(frame):
     if isinstance(frame, np.ndarray):
         return frame
-    elif isinstance(frame, list):
+    elif isinstance(frame, list) and \
+         (type(frame[0]) != str):
         frame = coadd_frames(frame)
     else:
         with fits.open(frame) as hdul:
             frame = hdul[0].data
+    return frame
+
+def open_or_coadd_frame(frame):
+    if isinstance(frame, np.ndarray):
+        # Already a numpy array
+        return frame
+    elif isinstance(frame, list):
+        if all(isinstance(f, np.ndarray) for f in frame):
+            # List of numpy arrays -> coadd directly
+            frame = coadd_frames(frame)
+        elif all(isinstance(f, str) for f in frame):
+            # List of filenames -> open and coadd
+            arrays = [fits.open(f)[0].data for f in frame]
+            frame = coadd_frames(arrays)
+        else:
+            raise ValueError("List must contain either all ndarrays or all strings.")
+    elif isinstance(frame, str):
+        # Single filename
+        with fits.open(frame) as hdul:
+            frame = hdul[0].data
+    else:
+        raise TypeError("Input must be a numpy array, a filename, or a list of them.")
     return frame
 
 def wlshift(wl, vel_corr):
@@ -724,6 +747,11 @@ def extract_spectrum(spectrum, flats, comps, biases, idcomp_offset=-15,
         else:
             frame_for_slice = open_or_coadd_frame(frame_for_slice)
             frame_for_slice = (frame_for_slice + flats) / 2
+            """
+            plt.imshow(frame_for_slice, norm="log")
+            plt.gca().set_aspect('auto')
+            plt.show()
+            """
 
         # find orders in 2d image
         orders = find_orders(frame_for_slice, sampling=sampling,

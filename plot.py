@@ -140,8 +140,8 @@ def main():
         fps = [fps]
     print(fps)
 
-    groups, coords = group_close_stars_with_bjd(fps, max_sep_arcsec=30)
-    for g in groups: print(g)
+#    groups, coords = group_close_stars_with_bjd(fps, max_sep_arcsec=30)
+#    for g in groups: print(g)
 
     for fp in fps:
         if "fits" in fp:
@@ -154,7 +154,7 @@ def main():
             wave, flux, err = read_spectrum_file(fp)
         snr = flux/err
         median_snr = np.nanmedian(snr)
-        print(fp, "%.1f" % median_snr)
+        print("%33s %.1f" % (fp, median_snr))
         if show_plots:
             plot_spectrum(wave, flux, err, fp)
 
