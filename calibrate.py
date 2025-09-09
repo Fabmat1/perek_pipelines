@@ -6,6 +6,7 @@ from tools import Gaussian_res, polynomial, curve_fit_reject, pair_generation
 from orders import extract_order_for_calib
 from multiprocessing import Pool, cpu_count
 from tqdm import tqdm
+from scipy.interpolate import interp1d
 
 two_log_two = 2 * np.sqrt(2 * np.log(2))
 
@@ -143,7 +144,16 @@ def mask_good_lines(actual_positions, fwhm_pix,
 
     return mask_good
 
-def fit_dispersion(x, y, yerr, DEBUG_PLOTS=False):
+
+def wavelength_to_pixel(wavelengths, params, x, polynomial):
+    # evaluate polynomial across your pixel grid
+    wl = polynomial(x, *params)
+    # make a monotonic interpolator (λ→x)
+    f = interp1d(wl, x, bounds_error=False, fill_value=np.nan)
+    return f(wavelengths)
+
+
+def fit_dispersion(x, y, yerr, thar_list=None, DEBUG_PLOTS=False):
 
     isort = np.argsort(x)
     x = x[isort]
@@ -152,7 +162,7 @@ def fit_dispersion(x, y, yerr, DEBUG_PLOTS=False):
 
     kwargs = {"sigma": yerr}
     thres = [10, 5, 3, 2]
-    thres_max = 0.1
+    thres_max = 0.025
     # TODO: extrapolate solutions to adjacent orders, iterative identification with ThAr lines
     params, errs, mask_good = curve_fit_reject(x, y, polynomial,
                                                thres=thres, thres_max=thres_max,
@@ -165,8 +175,6 @@ def fit_dispersion(x, y, yerr, DEBUG_PLOTS=False):
     rms = np.sqrt(np.sum(np.square(resid)) / nresid)
 
     if DEBUG_PLOTS:
-#    if True:
-
         figsize = np.array([8, 6])
         fig, axs = plt.subplots(2, 1, sharex=True,
                                 height_ratios=[3, 1],
@@ -179,7 +187,6 @@ def fit_dispersion(x, y, yerr, DEBUG_PLOTS=False):
         axs[0].scatter(x[mask_good], y[mask_good], color="black")
         axs[0].scatter(x[~mask_good], y[~mask_good], color="gray")
         axs[0].plot(x, ypoly, color="red")
-
         rmax = np.max(resid)
         rmin = np.min(resid)
         rbuf = (rmax - rmin) * 0.1
@@ -205,56 +212,118 @@ def fit_dispersion(x, y, yerr, DEBUG_PLOTS=False):
 
     return dout
 
+def solve_wavelength(linetable, order,
+                     pixel_window=8,
+                     thar_list=None,
+                     max_iterations=3,
+                     DEBUG_PLOTS=False):
+    """
+    Fit ThAr lines in a spectral order to solve the dispersion relation.
 
-def solve_wavelength(linetable, order, pixel_window=8, DEBUG_PLOTS=False):
+    Parameters
+    ----------
+    linetable : array-like
+        Initial guess of line positions.
+    order : object
+        Spectral order with .comparison array and .id attribute.
+    pixel_window : int
+        Pixel window to search around guessed positions.
+    thar_list : DataFrame
+        Reference ThAr line list (optional).
+    max_iterations : int
+        Maximum iterations for fitting with new ThAr lines.
+    DEBUG_PLOTS : bool
+        Whether to show debug plots.
+    """
 
-    # determine the arc line positions in pixels, given starting values
-    lfit = fit_comparison(linetable, order.comparison,
-                          pixel_window=pixel_window,
-                          DEBUG_PLOTS=DEBUG_PLOTS)
-
-    actual_positions = lfit["actual_positions"]
-    actual_errors = lfit["actual_errors"]
-    fwhm_pix = lfit["fwhm_pix"]
-    line_wls = lfit["line_wls"]
     pixels = np.arange(len(order.comparison)) + 1
-
-    # this depends on the spectrograph!
-    # OES has 7x sampling in the blue ...
     too_wide_pix = 7
     too_narrow_pix = 2.5
-    mask_good = mask_good_lines(actual_positions, fwhm_pix,
-                                too_narrow_pix=too_narrow_pix,
-                                too_wide_pix=too_wide_pix,
-                                DEBUG_PLOTS=DEBUG_PLOTS)
 
-    if (np.sum(mask_good) < 5):
-        raise Exception("Not enough calibration lines in order %d" % order.id)
+    ngoods = []
+    for iteration in range(max_iterations):
+        # Fit comparison lines
+        lfit = fit_comparison(linetable, order.comparison,
+                              pixel_window=pixel_window,
+                              DEBUG_PLOTS=DEBUG_PLOTS)
 
-    actual_positions = actual_positions[mask_good]
-    actual_errors = actual_errors[mask_good]
-    fwhm_pix = fwhm_pix[mask_good]
-    line_wls = line_wls[mask_good]
+        actual_positions = lfit["actual_positions"]
+        actual_errors = lfit["actual_errors"]
+        fwhm_pix = lfit["fwhm_pix"]
+        line_wls = lfit["line_wls"]
 
-    # solve the dispersion relation
-    disp = fit_dispersion(x=actual_positions,
-                          y=line_wls,
-                          yerr=actual_errors,
-                          DEBUG_PLOTS=DEBUG_PLOTS)
+        # Mask out bad lines
+        mask_good = mask_good_lines(actual_positions, fwhm_pix,
+                                    too_narrow_pix=too_narrow_pix,
+                                    too_wide_pix=too_wide_pix,
+                                    DEBUG_PLOTS=DEBUG_PLOTS)
 
-    params = disp["params"]
-    mask_good = disp["mask_good"]
+        if np.sum(mask_good) < 5:
+            raise Exception(f"Not enough calibration lines in order {order.id}")
 
-    actual_positions = actual_positions[mask_good]
-    actual_errors = actual_errors[mask_good]
-    fwhm_pix = fwhm_pix[mask_good]
-    line_wls = line_wls[mask_good]
+        actual_positions = actual_positions[mask_good]
+        actual_errors = actual_errors[mask_good]
+        fwhm_pix = fwhm_pix[mask_good]
+        line_wls = line_wls[mask_good]
 
-    # average pixel width in angstroms
-    pix_width = [np.mean(np.diff(polynomial(np.arange(3)+i-1,*params))) for i in actual_positions]
-    pix_width = np.abs(pix_width)
+        # Fit the dispersion relation
+        disp = fit_dispersion(x=actual_positions,
+                              y=line_wls,
+                              yerr=actual_errors,
+                              thar_list=thar_list,
+                              DEBUG_PLOTS=DEBUG_PLOTS)
+        params = disp["params"]
+        mask_good_disp = disp["mask_good"]
+        ngood = np.sum(mask_good_disp)
+        ngoods.append(ngood)
+
+        # Update pixel positions in linetable using current fit
+        # Only first 3 entries matter; first is pixel, second/third are wavelength
+        linetable[:, 0] = wavelength_to_pixel((linetable[:, 1]+linetable[:, 2])/2,
+                                              params, pixels, polynomial)
+
+        # If no ThAr list or last iteration, break
+        if thar_list is None or iteration == max_iterations - 1:
+            break
+
+        # Predict ThAr positions from current fit
+        ythar = thar_list["wave_air"].to_numpy()
+        ypoly = polynomial(pixels, *params)
+        wmin, wmax = np.min(ypoly) + 1, np.max(ypoly) - 1
+        ythar_mask = np.logical_and(ythar > wmin, ythar < wmax)
+        if np.sum(ythar_mask) == 0:
+            break
+        ythar = ythar[ythar_mask]
+        xthar = wavelength_to_pixel(ythar, params, pixels, polynomial)
+
+        # Remove ThAr lines too close to measured lines
+        unmatched_mask = np.ones_like(xthar, dtype=bool)
+        for i, xt in enumerate(xthar):
+            if np.any(np.abs(actual_positions - xt) < 0.2):
+                unmatched_mask[i] = False
+        xthar = xthar[unmatched_mask]
+        ythar = ythar[unmatched_mask]
+
+        if len(xthar) == 0:
+            break
+
+        # Append predicted ThAr lines to linetable for next iteration
+        lt_fake = [[xthar[k], ythar[k], ythar[k], 1.0, 1.0, 1.0] for k in range(len(xthar))]
+        linetable = np.vstack((linetable, lt_fake))
+    print(ngoods)
+
+    # Final mask and measurements
+    actual_positions = actual_positions[mask_good_disp]
+    actual_errors = actual_errors[mask_good_disp]
+    fwhm_pix = fwhm_pix[mask_good_disp]
+    line_wls = line_wls[mask_good_disp]
+
+    # Pixel width in Angstroms
+    pix_width = np.abs([np.mean(np.diff(polynomial(np.arange(3) + i - 1, *params)))
+                        for i in actual_positions])
     fwhm_angstrom = fwhm_pix * np.array(pix_width)
 
+    # Store results in order
     order.wl = polynomial(pixels, *params)
     order.cal_pix = actual_positions
     order.cal_wl = line_wls
@@ -262,10 +331,9 @@ def solve_wavelength(linetable, order, pixel_window=8, DEBUG_PLOTS=False):
     order.cal_wl_fwhm = fwhm_angstrom
 
     if DEBUG_PLOTS:
-        # plot spectral resolution
-        plt.title("Order %d" % order.id)
-        plt.scatter(order.cal_wl, order.cal_wl/fwhm_angstrom, zorder=10)
-        plt.xlabel(r"$\lambda$  /  $\mathrm{\AA}$")
+        plt.title(f"Order {order.id}")
+        plt.scatter(order.cal_wl, order.cal_wl / fwhm_angstrom, zorder=10)
+        plt.xlabel(r"$\lambda$ / $\mathrm{\AA}$")
         plt.ylabel(r"$R = \lambda / \Delta \lambda$")
         plt.show()
 
@@ -273,7 +341,7 @@ def process_dispersion(args):
     """
     wrapper for solving dispersion relations using multiprocessing
     """
-    j, idx_id, idx_order, orders, avg_aps, linelists, DEBUG_PLOTS = args
+    j, idx_id, idx_order, orders, avg_aps, linelists, DEBUG_PLOTS, thar_list = args
     o = orders[idx_order]
     key = avg_aps[idx_id]
     linelist_o = linelists[key]
@@ -281,7 +349,7 @@ def process_dispersion(args):
     # only plot one solution
     debug_solve = DEBUG_PLOTS and (j == 3)
 
-    solve_wavelength(linelist_o, o, DEBUG_PLOTS=debug_solve)
+    solve_wavelength(linelist_o, o, DEBUG_PLOTS=debug_solve, thar_list=thar_list)
     o.pix = np.arange(len(o.wl))
 #    o.plot_frame_1d("comp_orig")
 
@@ -289,6 +357,7 @@ def process_dispersion(args):
 
 def find_dispersion(orders, biases, comps,
                     idcomp_dir, idcomp_offset=-15,
+                    thar_list=None,
                     verbose=False, DEBUG_PLOTS=False):
 
     npix_x = biases.shape[1]
@@ -342,7 +411,7 @@ def find_dispersion(orders, biases, comps,
 
 
     if verbose: print("- solving dispersion relations")
-    args = [(j, p[0], p[1], orders, avg_aps, linelists, DEBUG_PLOTS) \
+    args = [(j, p[0], p[1], orders, avg_aps, linelists, DEBUG_PLOTS, thar_list) \
             for j, p in enumerate(id_order_pairs)]
     with Pool(processes=cpu_count()) as pool:
         results = list(tqdm(pool.imap(process_dispersion, args), total=len(args)))

@@ -3,18 +3,23 @@ import os
 import sys
 import time
 import numpy as np
+import pandas as pd
 from astropy.io import fits
 from matplotlib import pyplot as plt
 from echelle_reduction import extract_spectrum
 
 def main():
-    dir = "20250907/"
+    dir = "20250908/"
 #    dir = "20250904/"
     frame_for_slice = "science"
 
     idcomp_dir = "idcomp_2307/"
     fn_science = None
     #fn_science = "e202408300035.fit"
+
+    # cleaned ThAr line list from 2007A&A...468.1115L
+    thar_list = pd.read_csv("thar_lovis_pepe_clean.csv")
+
     verbose = True
     normalize = True
     save_as_fits = True
@@ -32,6 +37,7 @@ def main():
                  verbose=verbose,
                  save_as_fits=save_as_fits,
                  save_as_ascii=save_as_ascii,
+                 thar_list=thar_list,
                  plot_spectra=plot_spectra,
                  DEBUG_PLOTS=DEBUG_PLOTS)
 
@@ -39,6 +45,7 @@ def reduce_night(dir, idcomp_dir, fn_science=None,
                  frame_for_slice=None,
                  verbose=True,
                  normalize=True,
+                 thar_list=None,
                  save_as_fits=True,
                  save_as_ascii=True,
                  plot_spectra=False,
@@ -101,6 +108,7 @@ def reduce_night(dir, idcomp_dir, fn_science=None,
                                  orders=orders,
                                  normalize=normalize,
                                  idcomp_dir=idcomp_dir,
+                                 thar_list=thar_list,
                                  verbose=verbose,
                                  DEBUG_PLOTS=DEBUG_PLOTS)
             tstop = time.time()

@@ -723,6 +723,7 @@ def extract_spectrum(spectrum, flats, comps, biases, idcomp_offset=-15,
                      apply_barycorr=True,
                      verbose=False,
                      orders=None,
+                     thar_list=None,
                      DEBUG_PLOTS=False, **kwargs):
 
     radvel, bjd = get_barycorr(spectrum)
@@ -764,6 +765,7 @@ def extract_spectrum(spectrum, flats, comps, biases, idcomp_offset=-15,
         # extract calibration and solve dispersion relations for each identified order
         orders = find_dispersion(orders, biases, comps, idcomp_dir,
                                  idcomp_offset=idcomp_offset,
+                                 thar_list=thar_list,
                                  verbose=verbose,
                                  DEBUG_PLOTS=DEBUG_PLOTS)
 
