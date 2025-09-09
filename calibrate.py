@@ -310,7 +310,7 @@ def solve_wavelength(linetable, order,
         # Append predicted ThAr lines to linetable for next iteration
         lt_fake = [[xthar[k], ythar[k], ythar[k], 1.0, 1.0, 1.0] for k in range(len(xthar))]
         linetable = np.vstack((linetable, lt_fake))
-    print(ngoods)
+#    print(ngoods)
 
     # Final mask and measurements
     actual_positions = actual_positions[mask_good_disp]
