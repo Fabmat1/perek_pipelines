@@ -336,9 +336,68 @@ def legendre_normalization(wls, flxs,
 
     return flxs
 
+import numpy as np
+from multiprocessing import Pool
+import matplotlib.pyplot as plt
+
+def process_order(order_data):
+    i, wave_new, wave_order, flux_order, flux_err_order, plot = order_data
+    colors_i = ["tab:orange", "tab:pink"]
+
+    # Sort and mask valid entries
+    isort = np.argsort(wave_order)
+    wave_order = wave_order[isort]
+    flux_order = flux_order[isort]
+    mask = np.isfinite(wave_order) & np.isfinite(flux_order)
+    wave_order = wave_order[mask]
+    flux_order = flux_order[mask]
+
+    if flux_err_order is not None:
+        flux_err_order = flux_err_order[isort][mask]
+
+    # Find indices in wave_new that fall within this order
+    wmin_order = wave_order[0]
+    wmax_order = wave_order[-1]
+    widx_new = np.where((wave_new >= wmin_order) & (wave_new <= wmax_order))[0]
+    wave_order_new = wave_new[widx_new]
+
+    if plot:
+        plt.plot(wave_order, flux_order, color=colors_i[i % 2])
+
+    # Resample flux and flux_err
+    flux_order = resample(wave_order_new, wave_order, flux_order, verbose=False)
+    if flux_err_order is not None:
+        flux_err_order = resample(wave_order_new, wave_order, flux_err_order, verbose=False)
+    else:
+        flux_err_order = estimate_noise(wave_order_new, flux_order)
+
+    mask_err = (~np.isfinite(flux_err_order)) | (flux_err_order <= 0)
+    flux_err_order[mask_err] = np.inf
+
+    return wave_order_new, flux_order, flux_err_order, widx_new
+
+
+def resample_orders_parallel(wave_new, wave, flux, flux_err=None, plot=False, ncpu=4):
+    norder = len(wave)
+
+    # Prepare arguments for each process
+    args_list = [
+        (i, wave_new, wave[i], flux[i], None if flux_err is None else flux_err[i], plot)
+        for i in range(norder)
+    ]
+
+    # Run in parallel
+    with Pool(ncpu) as pool:
+        results = pool.map(process_order, args_list)
+
+    # Unpack results
+    wave_res, flux_res, err_res, widx_res = zip(*results)
+    return wave_res, flux_res, err_res, widx_res
+
 def resample_orders(wave_new, wave, flux, flux_err=None,
                     plot=False):
 
+    """
     wave_res = []
     flux_res = []
     err_res = []
@@ -383,6 +442,8 @@ def resample_orders(wave_new, wave, flux, flux_err=None,
         flux_res.append(flux_order)
         err_res.append(flux_err_order)
         widx_res.append(widx_new)
+    """
+    wave_res, flux_res, err_res, widx_res = resample_orders_parallel(wave_new, wave, flux, flux_err=None, plot=False, ncpu=6)
 
     # --> create lists of fluxes for each pixel; to vecotrize, first flatten
     widx_flat = np.concatenate(widx_res)
