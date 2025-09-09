@@ -443,7 +443,11 @@ def resample_orders(wave_new, wave, flux, flux_err=None,
         err_res.append(flux_err_order)
         widx_res.append(widx_new)
     """
-    wave_res, flux_res, err_res, widx_res = resample_orders_parallel(wave_new, wave, flux, flux_err=None, plot=False, ncpu=6)
+
+    ncpu = max(1, min(6, int(cpu_count()/2)))
+    wave_res, flux_res, err_res, widx_res = resample_orders_parallel(wave_new, wave, flux,
+                                                                     flux_err=None,
+                                                                     plot=False, ncpu=ncpu)
 
     # --> create lists of fluxes for each pixel; to vecotrize, first flatten
     widx_flat = np.concatenate(widx_res)
