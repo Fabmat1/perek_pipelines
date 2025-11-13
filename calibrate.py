@@ -55,6 +55,9 @@ def fit_comparison(linetable, comparison, pixel_window=8, DEBUG_PLOTS=False):
 
     line_wls = (linetable[:, 1] + linetable[:, 2]) / 2
     line_px = linetable[:, 0]
+    mask_good = (line_px>=0) & (line_wls>0)
+    line_px = line_px[mask_good]
+    line_wls = line_wls[mask_good]
 
     if DEBUG_PLOTS:
         plt.vlines(line_px, ymin=1.1, ymax=1.15, color="tab:orange")
@@ -409,11 +412,11 @@ def find_dispersion(orders, biases, comps,
         o.apply_corrections(comparison=True)
     """
 
-
     if verbose: print("- solving dispersion relations")
     args = [(j, p[0], p[1], orders, avg_aps, linelists, DEBUG_PLOTS, thar_list) \
             for j, p in enumerate(id_order_pairs)]
-    with Pool(processes=cpu_count()) as pool:
+    ncpu = cpu_count()
+    with Pool(processes=ncpu) as pool:
         results = list(tqdm(pool.imap(process_dispersion, args), total=len(args)))
     for idx_order, o in results:
         orders[idx_order] = o

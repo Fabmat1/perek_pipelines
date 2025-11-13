@@ -10,7 +10,8 @@ from echelle_reduction import extract_spectrum
 
 def main():
     dir = "20250908/"
-#    dir = "20250904/"
+    dir = "20251003/"
+    dir = "20220711/"
     frame_for_slice = "science"
 
     idcomp_dir = "idcomp_2307/"
@@ -18,7 +19,8 @@ def main():
     #fn_science = "e202408300035.fit"
 
     # cleaned ThAr line list from 2007A&A...468.1115L
-    thar_list = pd.read_csv("thar_lovis_pepe_clean.csv")
+#    thar_list = pd.read_csv("thar_lovis_pepe_clean.csv")
+    thar_list = None
 
     verbose = True
     normalize = True
