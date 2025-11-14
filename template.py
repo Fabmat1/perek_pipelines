@@ -9,8 +9,8 @@ from matplotlib import pyplot as plt
 from echelle_reduction import extract_spectrum
 
 def main():
-    dir = "20250908/"
-    dir = "20251003/"
+    #dir = "20250908/"
+    #dir = "20251003/"
     dir = "20220711/"
     frame_for_slice = "science"
 
@@ -36,6 +36,7 @@ def main():
     reduce_night(dir, idcomp_dir,
                  fn_science=fn_science,
                  frame_for_slice=frame_for_slice,
+                 normalize=normalize,
                  verbose=verbose,
                  save_as_fits=save_as_fits,
                  save_as_ascii=save_as_ascii,
