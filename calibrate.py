@@ -1,3 +1,4 @@
+
 import os
 import numpy as np
 from scipy.optimize import curve_fit
@@ -414,10 +415,20 @@ def find_dispersion(orders, biases, comps,
 
     if verbose: print("- solving dispersion relations")
     args = [(j, p[0], p[1], orders, avg_aps, linelists, DEBUG_PLOTS, thar_list) \
-            for j, p in enumerate(id_order_pairs)]
-    ncpu = cpu_count()
-    with Pool(processes=ncpu) as pool:
-        results = list(tqdm(pool.imap(process_dispersion, args), total=len(args)))
+        for j, p in enumerate(id_order_pairs)]
+
+    if DEBUG_PLOTS:
+        # Sequential processing when DEBUG_PLOTS is enabled (matplotlib compatibility)
+        results = []
+        for arg in tqdm(args, total=len(args)):
+            result = process_dispersion(arg)
+            results.append(result)
+    else:
+        # Parallel processing when DEBUG_PLOTS is disabled
+        ncpu = cpu_count()
+        with Pool(processes=ncpu) as pool:
+            results = list(tqdm(pool.imap(process_dispersion, args), total=len(args)))
+
     for idx_order, o in results:
         orders[idx_order] = o
 
