@@ -84,7 +84,7 @@ def read_fits_header(filepath):
             header["RA"] = np.float64(coord.ra.deg)
             header["DEC"] = np.float64(coord.dec.deg)
         else:
-            print("RA or DEC not found in header.")
+            print("RA or DEC not found in header of %s." % filepath)
 
         bjd = header.get('BJD', None)
         return header, bjd
@@ -96,13 +96,10 @@ def read_fits_data(filepath):
         data_dict = {}
 
         for col in table_data.columns:
-            col_data = table_data[col.name]
-            if hasattr(col_data, 'byteswap'):
-                col_data = col_data.byteswap()
-                if hasattr(col_data, 'newbyteorder'):
-                    col_data = col_data.newbyteorder()
-                else:
-                    col_data = col_data.view(col_data.dtype.newbyteorder())
+            col_data = np.asarray(table_data[col.name])
+            # FITS tables are big-endian; pandas wants native byte order
+            if col_data.dtype.byteorder not in ("=", "|"):
+                col_data = col_data.astype(col_data.dtype.newbyteorder("="))
             data_dict[col.name] = col_data
 
         df = pd.DataFrame(data_dict)

@@ -9,6 +9,8 @@ Both backends are exposed through the same signature, with the same ``fill``
 default, so that results do not depend on which one is installed.
 """
 
+import numpy as np
+
 try:
     from resample_spectres import resample
     BACKEND = "pyresample_spectres (Fortran)"
@@ -19,4 +21,6 @@ except ModuleNotFoundError:
     def resample(wave_out, wave_in, flux_in, fill=0.0, verbose=False):
         # spectres defaults to fill=None, which yields NaN outside the input
         # range; the Fortran backend fills with 0.0. Keep them identical.
+        if len(wave_out) == 0 or len(wave_in) == 0:
+            return np.zeros(len(wave_out), dtype=float)
         return _spectres(wave_out, wave_in, flux_in, fill=fill, verbose=verbose)

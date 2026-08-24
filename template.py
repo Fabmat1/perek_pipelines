@@ -119,15 +119,18 @@ def reduce_night(dir, idcomp_dir, fn_science=None,
 
     for file in sorted(os.listdir(dir)):
         if file.endswith(".fit"):
-            hdul = fits.open(os.path.join(dir, file))
-            header = dict(hdul[0].header)
-            ftype = header["OBJECT"]
+            # read eagerly and close: astropy memory-maps by default, and a full
+            # night of frames would otherwise keep every file handle open
+            with fits.open(os.path.join(dir, file)) as hdul:
+                header = dict(hdul[0].header)
+                ftype = header["OBJECT"]
+                data = np.asarray(hdul[0].data) if ftype in ("zero", "flat", "comp") else None
             if ftype == "zero":
-                biases.append(hdul[0].data)
+                biases.append(data)
             elif ftype == "flat":
-                flats.append(hdul[0].data)
+                flats.append(data)
             elif ftype == "comp":
-                comps.append(hdul[0].data)
+                comps.append(data)
             else:
                 if (fn_science is not None) and (fn_science in file):
                     science.append(file)
@@ -173,8 +176,11 @@ def reduce_night(dir, idcomp_dir, fn_science=None,
             print("> done in %.1f s" % (tstop-tstart))
             orders = s["orders"]
 
-            mask_good = s["error"] > 0
-            SNR = np.nanmedian(s["flux"][mask_good]/s["error"][mask_good])
+            mask_good = np.isfinite(s["error"]) & (s["error"] > 0)
+            if np.any(mask_good):
+                SNR = float(np.nanmedian(s["flux"][mask_good]/s["error"][mask_good]))
+            else:
+                SNR = float("nan")
             print("> median SNR = %.1f" % SNR)
 
             if save_as_fits:
@@ -183,7 +189,9 @@ def reduce_night(dir, idcomp_dir, fn_science=None,
                     header = hdul[0].header
                 if s["bjd"] is not None:
                     header["BJD"] = s["bjd"]
-                header["SNR"] = SNR
+                # FITS cannot store a NaN card value
+                if np.isfinite(SNR):
+                    header["SNR"] = SNR
                 primary_hdu = fits.PrimaryHDU(header=header)
                 fits_cols = [fits.Column(name=key, array=s[key], format='D') for key in s if type(s[key]) == np.ndarray]
                 # the name is always in captials

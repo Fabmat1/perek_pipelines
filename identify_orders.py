@@ -7,7 +7,8 @@ from scipy.ndimage import (minimum_filter, maximum_filter)
 from multiprocessing import Pool, cpu_count
 from tqdm import tqdm
 
-from tools import (mask_section, Gaussian, fill_nan, pair_generation)
+from tools import (mask_section, Gaussian, fill_nan, pair_generation,
+                   polynomial, shared_pool, shared)
 from orders import SpectralOrder
 
 two_log_two = 2 * np.sqrt(2 * np.log(2))
@@ -26,18 +27,32 @@ class SpectralSlice:
         self.order_ownership = np.full(len(self.ys), None)
 
     def clean_ownership(self):
+        n = len(self.order_ownership)
+        if all(o is None for o in self.order_ownership):
+            raise ValueError("slice at x=%s has no order assignments to "
+                             "extrapolate from" % self.x)
         for i, owner in enumerate(self.order_ownership):
             if owner is None:
                 if i == 0:
                     j = 1
-                    while self.order_ownership[i + j] is None:
+                    while (i + j) < n and self.order_ownership[i + j] is None:
                         j += 1
                     self.order_ownership[i] = self.order_ownership[i + j] - j
                 else:
                     self.order_ownership[i] = self.order_ownership[i - 1] + 1
 
 def slice_analysis(pixel, slice_x, slice_y, MIN_WINDOW=15, MAX_WINDOW=15, NOISE_MEASURE_SECTION_WIDTH=0.05,
-                   NOISE_CUTOFF=20, CUTTOFF_MARGIN=5, ORDER_GAUSS_THRESHOLD=0.6, DEBUG_PLOTS=False):
+                   NOISE_CUTOFF=20, CUTTOFF_MARGIN=5, ORDER_GAUSS_THRESHOLD=0.6,
+                   idx_peak_min=700, idx_peak_max=1750, DEBUG_PLOTS=False):
+    """
+    Locate the orders in one cross-dispersion cut of the frame.
+
+    idx_peak_min, idx_peak_max : rows between which real orders are expected.
+        Tuned for the 2048-row OES detector; pass explicit values for others.
+    """
+    if len(slice_x) != len(slice_y):
+        raise ValueError("slice_x and slice_y must have the same length, got "
+                         "%d and %d" % (len(slice_x), len(slice_y)))
 
 #    if abs(pixel-1714) < 2:
 #        DEBUG_PLOTS = True
@@ -68,6 +83,10 @@ def slice_analysis(pixel, slice_x, slice_y, MIN_WINDOW=15, MAX_WINDOW=15, NOISE_
     noise_lvl *= NOISE_CUTOFF
 
     noise_indices = np.where(slice_y > noise_lvl)[0]
+    if len(noise_indices) < 2:
+        raise ValueError("no orders stand out above the noise in the slice at "
+                         "x=%s (%d pixels above cutoff)"
+                         % (pixel, len(noise_indices)))
 
     # hot pixels or other artefacts are usually isolated
     # -> find groups of high-flux pixels (the orders)
@@ -123,11 +142,14 @@ def slice_analysis(pixel, slice_x, slice_y, MIN_WINDOW=15, MAX_WINDOW=15, NOISE_
         plt.show()
 
     # assume that "real" orders only start at pixles > 'idx_peak_min'
-    idx_peak_min = 700
-    idx_peak_max = 1750
     noise_indices = noise_indices[noise_indices>idx_peak_min]
     noise_indices = noise_indices[noise_indices<idx_peak_max]
     n_cross = 2
+    if len(noise_indices) < 2 * n_cross + 1:
+        raise ValueError(
+            "only %d pixels above the noise cutoff in rows %d-%d of the slice "
+            "at x=%s; adjust idx_peak_min/idx_peak_max for this detector"
+            % (len(noise_indices), idx_peak_min, idx_peak_max, pixel))
     first_cross = noise_indices[n_cross] - n_cross
     last_cross = noise_indices[-1-n_cross] + n_cross
 
@@ -242,21 +264,26 @@ def slice_analysis(pixel, slice_x, slice_y, MIN_WINDOW=15, MAX_WINDOW=15, NOISE_
                          np.array(widths))
 
 def process_slice(args):
-    i, pixel, frame_for_slice, npix_x, DEBUG_PLOTS = args
+    i, pixel, npix_x, DEBUG_PLOTS = args
+    frame_for_slice = shared("frame_for_slice")
     xidx = np.arange(3) + pixel - 1
     xidx = xidx[(xidx>=0) & (xidx<npix_x)]
     slice_y = np.sum(frame_for_slice[:, xidx].astype(float), axis=1) / len(xidx)
-    slice_x = np.arange(frame_for_slice.shape[1])
+    # slice_y runs along the cross-dispersion axis, so slice_x indexes rows
+    slice_x = np.arange(frame_for_slice.shape[0])
     debug_slice = (i == 0) and DEBUG_PLOTS
-    slice = slice_analysis(pixel - 1, slice_x, slice_y, DEBUG_PLOTS=debug_slice)
+    # the columns summed above are centred on `pixel`, so that is the x the
+    # trace should be anchored at
+    slice = slice_analysis(pixel, slice_x, slice_y, DEBUG_PLOTS=debug_slice)
     return slice
 
 def find_slices(frame_for_slice, sampling=200, DEBUG_PLOTS=False):
     # Get orders and stuff from flat
     npix_x = frame_for_slice.shape[1]
     pixels = np.linspace(5, npix_x-5, sampling).astype(int)
-    args_list = [(i, pixels[i], frame_for_slice, npix_x, DEBUG_PLOTS) for i in range(sampling)]
-    with Pool(processes=cpu_count()) as pool:
+    args_list = [(i, pixels[i], npix_x, DEBUG_PLOTS) for i in range(sampling)]
+    with shared_pool({"frame_for_slice": frame_for_slice},
+                     processes=cpu_count()) as pool:
         slices = list(tqdm(pool.imap(process_slice, args_list), total=sampling))
 
     if DEBUG_PLOTS and False:
@@ -270,7 +297,6 @@ def find_slices(frame_for_slice, sampling=200, DEBUG_PLOTS=False):
         plt.tight_layout()
         plt.show()
 
-    norders_slice = []
     for i, slice in enumerate(slices):
         if i == 0:
             slice.next_slice = slices[1]
@@ -375,7 +401,6 @@ def assign_orders_polyfit(orders, slicelist: list[SpectralSlice], thres_ydist = 
 
     y_best_plot = []
     for o in orders:
-        lold = len(o.pixel_y)
         if DEBUG_PLOTS:
             plt.scatter(o.pixel_x, o.pixel_y, marker="o")
         o.pixel_x = []
@@ -393,10 +418,11 @@ def assign_orders_polyfit(orders, slicelist: list[SpectralSlice], thres_ydist = 
                 o.pixel_y_err.append(s.y_errs[idx_best])
                 o.order_width.append(s.widths[idx_best])
             y_best_plot.append(ydist[idx_best])
-        lnew = len(o.pixel_y)
 
-    o.pixel_x = np.array(o.pixel_x)
-    o.pixel_y = np.array(o.pixel_y)
+        o.pixel_x = np.array(o.pixel_x)
+        o.pixel_y = np.array(o.pixel_y)
+        o.pixel_y_err = np.array(o.pixel_y_err)
+        o.order_width = np.array(o.order_width)
 
     if DEBUG_PLOTS:
         crot = ["black", "gray"]
@@ -423,8 +449,9 @@ def find_orders(frame_for_slice,
     if verbose: print("- identifying orders")
     slices = find_slices(frame_for_slice, sampling=sampling, DEBUG_PLOTS=DEBUG_PLOTS)
 
-    # find slice with most order identifications
-    norders_slice = [len(s.ys) if abs(s.x - 1024) < 200 else len(s.ys)/2 for s in slices]
+    # find slice with most order identifications, preferring the detector centre
+    xcen = frame_for_slice.shape[1] / 2
+    norders_slice = [len(s.ys) if abs(s.x - xcen) < 200 else len(s.ys)/2 for s in slices]
     max_slice = np.argmax(norders_slice)
 
     # max_slice is the slice that has the largest number of order identifications

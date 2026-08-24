@@ -3,7 +3,8 @@ import os
 import numpy as np
 from scipy.optimize import curve_fit
 from matplotlib import pyplot as plt
-from tools import Gaussian_res, polynomial, curve_fit_reject, pair_generation
+from tools import (Gaussian_res, polynomial, curve_fit_reject, pair_generation,
+                   shared_pool, shared, publish_shared)
 from orders import extract_order_for_calib
 from multiprocessing import Pool, cpu_count
 from tqdm import tqdm
@@ -63,8 +64,6 @@ def fit_comparison(linetable, comparison, pixel_window=8, DEBUG_PLOTS=False):
     if DEBUG_PLOTS:
         plt.vlines(line_px, ymin=1.1, ymax=1.15, color="tab:orange")
 
-    initial_params, _ = curve_fit(polynomial, line_px, line_wls)
-
     pixels = np.arange(len(comparison)) + 1
     actual_positions = []
     actual_errors = []
@@ -118,6 +117,7 @@ def fit_comparison(linetable, comparison, pixel_window=8, DEBUG_PLOTS=False):
 def mask_good_lines(actual_positions, fwhm_pix,
                     too_narrow_pix=2.6,
                     too_wide_pix=7.0,
+                    order_id=None,
                     DEBUG_PLOTS=False):
 
     mask_good = (fwhm_pix < too_wide_pix) & (fwhm_pix > too_narrow_pix)
@@ -130,7 +130,7 @@ def mask_good_lines(actual_positions, fwhm_pix,
     if not_enough_lines:
         mask_good = np.ones(len(fwhm_pix)).astype(bool)
     if (np.sum(mask_good) < 5):
-        raise Exception("Not enough calibration lines in order %d" % order.id)
+        raise Exception("Not enough calibration lines in order %s" % order_id)
 
     # threshold = np.percentile(actual_errors, 0.9)
     # actual_positions = actual_positions[actual_errors <= threshold]
@@ -240,6 +240,10 @@ def solve_wavelength(linetable, order,
         Whether to show debug plots.
     """
 
+    # work on a copy: `linetable` is owned by the shared `linelists` dict and
+    # is mutated below, which would leak between orders in a sequential run
+    linetable = np.array(linetable, dtype=float, copy=True)
+
     pixels = np.arange(len(order.comparison)) + 1
     too_wide_pix = 7
     too_narrow_pix = 2.5
@@ -260,6 +264,7 @@ def solve_wavelength(linetable, order,
         mask_good = mask_good_lines(actual_positions, fwhm_pix,
                                     too_narrow_pix=too_narrow_pix,
                                     too_wide_pix=too_wide_pix,
+                                    order_id=order.id,
                                     DEBUG_PLOTS=DEBUG_PLOTS)
 
         if np.sum(mask_good) < 5:
@@ -345,10 +350,10 @@ def process_dispersion(args):
     """
     wrapper for solving dispersion relations using multiprocessing
     """
-    j, idx_id, idx_order, orders, avg_aps, linelists, DEBUG_PLOTS, thar_list = args
-    o = orders[idx_order]
-    key = avg_aps[idx_id]
-    linelist_o = linelists[key]
+    j, idx_id, idx_order, o, DEBUG_PLOTS = args
+    key = shared("avg_aps")[idx_id]
+    linelist_o = shared("linelists")[key]
+    thar_list = shared("thar_list")
 
     # only plot one solution
     debug_solve = DEBUG_PLOTS and (j == 3)
@@ -382,7 +387,6 @@ def find_dispersion(orders, biases, comps,
             avg_ap = (aplo + aphi) / 2
             linelists[avg_ap+idcomp_offset] = table
     avg_aps = np.array(list(linelists.keys()))
-    nlist = len(avg_aps)
 
 #    if DEBUG_PLOTS:
 #        plt.imshow(flats)
@@ -397,8 +401,9 @@ def find_dispersion(orders, biases, comps,
 
     # extract arc spectra from image
     if verbose: print("- extracting orders")
-    args = [(p[1], orders, biases, comps, times_sigma) for p in id_order_pairs]
-    with Pool(processes=cpu_count()) as pool:
+    args = [(p[1], orders[p[1]], times_sigma) for p in id_order_pairs]
+    with shared_pool({"biases": biases, "comps": comps},
+                     processes=cpu_count()) as pool:
         results = list(tqdm(pool.imap(extract_order_for_calib, args), total=len(args)))
     for idx_order, o in results:
         orders[idx_order] = o
@@ -414,11 +419,14 @@ def find_dispersion(orders, biases, comps,
     """
 
     if verbose: print("- solving dispersion relations")
-    args = [(j, p[0], p[1], orders, avg_aps, linelists, DEBUG_PLOTS, thar_list) \
+    args = [(j, p[0], p[1], orders[p[1]], DEBUG_PLOTS) \
         for j, p in enumerate(id_order_pairs)]
+    calib_data = {"avg_aps": avg_aps, "linelists": linelists,
+                  "thar_list": thar_list}
 
     if DEBUG_PLOTS:
         # Sequential processing when DEBUG_PLOTS is enabled (matplotlib compatibility)
+        publish_shared(calib_data)
         results = []
         for arg in tqdm(args, total=len(args)):
             result = process_dispersion(arg)
@@ -426,7 +434,7 @@ def find_dispersion(orders, biases, comps,
     else:
         # Parallel processing when DEBUG_PLOTS is disabled
         ncpu = cpu_count()
-        with Pool(processes=ncpu) as pool:
+        with shared_pool(calib_data, processes=ncpu) as pool:
             results = list(tqdm(pool.imap(process_dispersion, args), total=len(args)))
 
     for idx_order, o in results:

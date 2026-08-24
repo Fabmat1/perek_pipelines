@@ -1,5 +1,5 @@
 import numpy as np
-from tools import (curve_fit_reject, polynomial, Gaussian, fill_nan)
+from tools import (curve_fit_reject, polynomial, Gaussian, fill_nan, shared)
 from scipy.interpolate import interp1d
 from scipy.ndimage import (minimum_filter, maximum_filter, median_filter)
 from matplotlib import pyplot as plt
@@ -19,6 +19,24 @@ def gaussian_pixel_weights(y_pixels, y0, sigma):
     if np.sum(weights) > 0:
         weights /= np.sum(weights)
     return weights
+
+def gaussian_pixel_weights_2d(y_pixels, y0, sigma, valid):
+    """
+    Row-wise version of ``gaussian_pixel_weights``.
+
+    ``y_pixels`` is (ncolumn, naperture); ``y0`` and ``sigma`` are column
+    vectors. Entries where ``valid`` is False are given zero weight and are
+    excluded from the per-row normalisation.
+    """
+    y_low = (y_pixels - 0.5 - y0) / (np.sqrt(2) * sigma)
+    y_high = (y_pixels + 0.5 - y0) / (np.sqrt(2) * sigma)
+    weights = 0.5 * (erf(y_high) - erf(y_low))
+    weights = np.where(valid, weights, 0.0)
+    # Normalize so each row sums to 1
+    total = weights.sum(axis=1, keepdims=True)
+    np.divide(weights, total, out=weights, where=total > 0)
+    return weights
+
 
 two_log_two = 2 * np.sqrt(2 * np.log(2))
 
@@ -154,7 +172,7 @@ class SpectralOrder:
         self.pixel_y = np.array(list(self.pixel_y))
         self.pixel_y_err = np.array(list(self.pixel_y_err))
         if self.pixel_mask_good is not None:
-            self.pixel_mask_good = np.array(list(self.pixel_mask_goodr))
+            self.pixel_mask_good = np.array(list(self.pixel_mask_good))
 
     def extract_along_order(self, image, type, times_sigma=2):
         if self.solution is None:
@@ -162,38 +180,41 @@ class SpectralOrder:
         if self.w_fcn is None:
             self.generate_width_fcn()
 
-        intensities = []
+        ny, nx = image.shape
+        columns = np.arange(nx)
 
-        for pixel in np.arange(image.shape[1]):
-            sigma = self.w_fcn(pixel) / two_log_two
-            width = times_sigma * sigma
-            # extend the aperture to something safe (avoid clipping)
-            half_height = int(np.ceil(width * 3))  # 3-sigma coverage
+        sigma = self.w_fcn(columns) / two_log_two
+        width = times_sigma * sigma
+        # extend the aperture to something safe (avoid clipping)
+        half_height = np.ceil(width * 3)  # 3-sigma coverage
 
-            y_ind = self.evaluate(pixel)
-            y_ind_round = int(round(y_ind, 0))
-            y_min = int(np.floor(y_ind - half_height))
-            y_max = int(np.ceil(y_ind + half_height))
-            # limit to +-4 pixel; the OES orders are too close together
-            ywidth = 4
-            if self.id > 8:
-                ywidth = 5
-            y_min = y_ind_round - min(ywidth, (y_ind_round - y_min))
-            y_max = y_ind_round + min(ywidth, (y_max - y_ind_round))
+        y_ind = self.evaluate(columns)
+        y_ind_round = np.round(y_ind).astype(int)
+        y_min = np.floor(y_ind - half_height).astype(int)
+        y_max = np.ceil(y_ind + half_height).astype(int)
+        # limit to +-4 pixel; the OES orders are too close together
+        ywidth = 4
+        if self.id > 8:
+            ywidth = 5
+        y_min = y_ind_round - np.minimum(ywidth, y_ind_round - y_min)
+        y_max = y_ind_round + np.minimum(ywidth, y_max - y_ind_round)
 
-            # pixel indices along cross-dispersion
-            y_pixels = np.arange(y_min, y_max)
+        # pixel indices along cross-dispersion, one row per column. The aperture
+        # is at most 2*ywidth wide, so pad to that and mask the unused entries.
+        offsets = np.arange(2 * ywidth)
+        y_pixels = y_min[:, None] + offsets[None, :]
+        in_aperture = y_pixels < y_max[:, None]
+        # apertures running off the detector are clipped rather than wrapped
+        # around to the opposite edge (negative indices) or raising IndexError
+        in_aperture &= (y_pixels >= 0) & (y_pixels < ny)
 
-            # compute proper Gaussian-integrated weights
-            weights = gaussian_pixel_weights(y_pixels, y_ind, sigma)
+        # compute proper Gaussian-integrated weights
+        weights = gaussian_pixel_weights_2d(y_pixels, y_ind[:, None],
+                                            sigma[:, None], in_aperture)
 
-            # weighted sum of flux
-            col = image[y_pixels, int(pixel)]
-            fluxsum = np.sum(col * weights)
-
-            intensities.append(fluxsum)
-
-        intensities = np.array(intensities)
+        # weighted sum of flux
+        col = image[np.clip(y_pixels, 0, ny - 1), columns[:, None]]
+        intensities = np.einsum("ij,ij->i", col.astype(float), weights)
 
         if type == "bias" or type == "zero":
             self.bias = intensities
@@ -298,7 +319,12 @@ class SpectralOrder:
             self.comparison = fill_nan(self.comparison)
 
 def extract_order(o_args):
-    o, spectrum, flats, biases, comps, times_sigma = o_args
+    """Pool worker. The detector frames come from the shared worker payload
+    (keys "spectrum", "flats", "biases", "comps") so that they are not
+    re-pickled for every order."""
+    o, times_sigma = o_args
+    spectrum, flats = shared("spectrum"), shared("flats")
+    biases, comps = shared("biases"), shared("comps")
     o.extract_along_order(spectrum, "science", times_sigma=times_sigma)
     o.extract_along_order(flats, "flat", times_sigma=times_sigma)
     o.extract_along_order(biases, "bias", times_sigma=times_sigma)
@@ -312,8 +338,9 @@ def extract_order(o_args):
     return o
 
 def extract_order_for_calib(args):
-    idx_order, orders, biases, comps, times_sigma = args
-    o = orders[idx_order]
+    """Pool worker; see `extract_order` for where the frames come from."""
+    idx_order, o, times_sigma = args
+    biases, comps = shared("biases"), shared("comps")
     o.extract_along_order(biases, "bias", times_sigma=times_sigma)
     o.extract_along_order(comps, "comp", times_sigma=times_sigma)
     o.apply_corrections(comparison=True)

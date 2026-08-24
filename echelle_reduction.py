@@ -11,11 +11,7 @@ from scipy.ndimage import gaussian_filter1d
 from scipy.optimize import curve_fit
 
 from multiprocessing import Pool, cpu_count
-try:
-    from tqdm import tqdm
-    TQDM_AVAILABLE = True
-except ImportError:
-    TQDM_AVAILABLE = False
+from tqdm import tqdm
 
 import astropy.units as u
 from astropy.coordinates import EarthLocation, SkyCoord
@@ -23,18 +19,9 @@ from astropy.time import Time
 from astropy.io import fits
 from astropy.stats import sigma_clip
 
-import numpy as np
-from scipy.ndimage import median_filter
-from scipy.optimize import curve_fit
-from astropy.stats import sigma_clip
-import matplotlib.pyplot as plt
-from multiprocessing import Pool
-import functools
-
-
 from estimate_noise import estimate_noise
 from tools import (polyfit_reject, curve_fit_reject, pair_generation,
-                   mask_section,
+                   mask_section, shared_pool, shared,
                    fill_nan, Gaussian, Gaussian_res)
 from calibrate import find_dispersion
 from identify_orders import (SpectralSlice, find_orders)
@@ -112,7 +99,10 @@ def open_or_coadd_frame(frame):
             frame = coadd_frames(frame)
         elif all(isinstance(f, str) for f in frame):
             # List of filenames -> open and coadd
-            arrays = [fits.open(f)[0].data for f in frame]
+            arrays = []
+            for f in frame:
+                with fits.open(f) as hdul:
+                    arrays.append(np.asarray(hdul[0].data))
             frame = coadd_frames(arrays)
         else:
             raise ValueError("List must contain either all ndarrays or all strings.")
@@ -137,17 +127,6 @@ def plot_order_list(olist: list[SpectralOrder]):
     plt.show()
 
 
-def mask_intervals(x, intervals):
-    # Initialize a mask that is True for all elements
-    mask = np.ones_like(x, dtype=bool)
-
-    # Loop through each interval and update the mask
-    for interval in intervals:
-        lower_bound, upper_bound = interval
-        mask &= ~((x >= lower_bound) & (x <= upper_bound))
-
-    return mask
-
 def polynomial(x, *p):
     return np.polyval(p, x)
 
@@ -159,7 +138,7 @@ def mask_intervals(wl, intervals):
 
 def normalize_single_order(args):
     """Worker function for multiprocessing"""
-    i, wl, flx, poly_order, ignore_windows, smooth_width, DEBUG_PLOTS = args
+    i, wl, flx, poly_order, ignore_windows, smooth_width, floor_width, DEBUG_PLOTS = args
 
     mask = mask_intervals(wl, ignore_windows)
     mask2 = ~sigma_clip(flx, sigma_lower=8, sigma_upper=8, masked=True).mask
@@ -185,7 +164,11 @@ def normalize_single_order(args):
                             masked=True).mask
 
     flx_cont = polynomial(wl, *params)
-    flx_smooth = median_filter(flx, size=int(len(flx_smooth)/4), mode="nearest")
+    # broad median filter used as a floor under the polynomial continuum. Its
+    # width is a fixed fraction of the order, not of however many pixels
+    # survived masking above -- otherwise it varies from order to order.
+    floor_size = max(1, int(len(flx) * floor_width))
+    flx_smooth = median_filter(flx, size=floor_size, mode="nearest")
     flx_cont = np.maximum(flx_cont, flx_smooth)
     normalized_flx = flx / flx_cont
 
@@ -202,16 +185,21 @@ def poly_normalization(wls, flxs,
                                        (6888.1, 6890.5), (6892, 6893.6),
                                        (7590, 7617), (7622.8, 7625)],
                        smooth_width=31,
+                       floor_width=0.25,
                        DEBUG_PLOTS=False,
                        n_processes=None,
                        show_progress=True):
     """
     Normalize single spectral orders using low-order polynomials with multiprocessing.
+
+    floor_width : fraction of the order length used for the broad median filter
+        that acts as a lower bound on the fitted continuum.
     """
-    args_list = [(i, wl, flxs[i], poly_order, ignore_windows, smooth_width, DEBUG_PLOTS)
+    args_list = [(i, wl, flxs[i], poly_order, ignore_windows, smooth_width,
+                  floor_width, DEBUG_PLOTS)
                  for i, wl in enumerate(wls)]
     with Pool(n_processes) as pool:
-        if TQDM_AVAILABLE and show_progress and len(args_list) > 10:
+        if show_progress and len(args_list) > 10:
             results = list(tqdm(pool.imap(normalize_single_order, args_list),
                                total=len(args_list)))
         else:
@@ -329,13 +317,9 @@ def legendre_normalization(wls, flxs,
 
     return flxs
 
-import numpy as np
-from multiprocessing import Pool
-import matplotlib.pyplot as plt
-
 def process_order(order_data):
-    i, wave_new, wave_order, flux_order, flux_err_order, plot = order_data
-    colors_i = ["tab:orange", "tab:pink"]
+    i, wave_order, flux_order, flux_err_order = order_data
+    wave_new = shared("wave_new")
 
     # Sort and mask valid entries
     isort = np.argsort(wave_order)
@@ -348,14 +332,24 @@ def process_order(order_data):
     if flux_err_order is not None:
         flux_err_order = flux_err_order[isort][mask]
 
+    if len(wave_order) == 0:
+        # nothing usable in this order; contribute no pixels to the merge
+        empty = np.zeros(0)
+        return empty, empty, empty, np.zeros(0, dtype=int), (empty, empty)
+
     # Find indices in wave_new that fall within this order
     wmin_order = wave_order[0]
     wmax_order = wave_order[-1]
     widx_new = np.where((wave_new >= wmin_order) & (wave_new <= wmax_order))[0]
     wave_order_new = wave_new[widx_new]
 
-    if plot:
-        plt.plot(wave_order, flux_order, color=colors_i[i % 2])
+    if len(widx_new) == 0:
+        # this order lies entirely outside the output grid
+        empty = np.zeros(0)
+        return empty, empty, empty, np.zeros(0, dtype=int), (wave_order, flux_order)
+    # kept for the caller to plot: pyplot in a worker draws into a figure
+    # that is discarded when the process exits
+    pre_resample = (wave_order, flux_order)
 
     # Resample flux and flux_err
     flux_order = resample(wave_order_new, wave_order, flux_order, fill=0, verbose=False)
@@ -367,7 +361,7 @@ def process_order(order_data):
     mask_err = (~np.isfinite(flux_err_order)) | (flux_err_order <= 0)
     flux_err_order[mask_err] = np.inf
 
-    return wave_order_new, flux_order, flux_err_order, widx_new
+    return wave_order_new, flux_order, flux_err_order, widx_new, pre_resample
 
 
 def resample_orders_parallel(wave_new, wave, flux, flux_err=None, plot=False, ncpu=4):
@@ -375,16 +369,22 @@ def resample_orders_parallel(wave_new, wave, flux, flux_err=None, plot=False, nc
 
     # Prepare arguments for each process
     args_list = [
-        (i, wave_new, wave[i], flux[i], None if flux_err is None else flux_err[i], plot)
+        (i, wave[i], flux[i], None if flux_err is None else flux_err[i])
         for i in range(norder)
     ]
 
-    # Run in parallel
-    with Pool(ncpu) as pool:
+    # Run in parallel; the common wavelength grid is shared, not re-sent per order
+    with shared_pool({"wave_new": wave_new}, processes=ncpu) as pool:
         results = pool.map(process_order, args_list)
 
     # Unpack results
-    wave_res, flux_res, err_res, widx_res = zip(*results)
+    wave_res, flux_res, err_res, widx_res, pre_res = zip(*results)
+
+    if plot:
+        colors_i = ["tab:orange", "tab:pink"]
+        for i, (w, f) in enumerate(pre_res):
+            plt.plot(w, f, color=colors_i[i % 2])
+
     return wave_res, flux_res, err_res, widx_res
 
 def resample_orders(wave_new, wave, flux, flux_err=None,
@@ -439,45 +439,31 @@ def resample_orders(wave_new, wave, flux, flux_err=None,
 
     ncpu = max(1, min(6, int(cpu_count()/2)))
     wave_res, flux_res, err_res, widx_res = resample_orders_parallel(wave_new, wave, flux,
-                                                                     flux_err=None,
-                                                                     plot=False, ncpu=ncpu)
+                                                                     flux_err=flux_err,
+                                                                     plot=plot, ncpu=ncpu)
 
-    # --> create lists of fluxes for each pixel; to vecotrize, first flatten
+    # --> inverse-variance merging. np.bincount sums per output pixel and does
+    # not care in which order the contributions arrive, so the flattened
+    # per-order arrays can be accumulated directly.
+    nwave = len(wave_new)
     widx_flat = np.concatenate(widx_res)
     flux_flat = np.concatenate(flux_res)
     err_flat = np.concatenate(err_res)
-    # count occurrences of each wavelength index in widx_flat to pre-allocate space
-    nwave = len(wave_new)
-    counts = np.bincount(widx_flat, minlength=nwave)
-    max_count = np.max(counts)
-    # preallocate arrays to store the results
-    flux_re = np.empty((nwave, max_count), dtype=flux_flat.dtype)
-    flux_re.fill(np.nan)
-    err_re = np.empty((nwave, max_count), dtype=err_flat.dtype)
-    err_re.fill(np.nan)
-    # track where to insert the next value for each widx
-    insert_pos = np.zeros(nwave, dtype=int)
-    for i in range(len(widx_flat)):
-        idx = widx_flat[i]
-        flux_re[idx, insert_pos[idx]] = flux_flat[i]
-        err_re[idx, insert_pos[idx]] = err_flat[i]
-        insert_pos[idx] += 1
-    # to remove nans
-    flux_re = [flux_re[i, :counts[i]] for i in range(nwave)]
-    err_re = [err_re[i, :counts[i]] for i in range(nwave)]
 
-    # --> merging
-    flux_concat = np.concatenate(flux_re)
-    err_concat = np.concatenate(err_re)
-    weight = 1 / np.square(err_concat)
-    # create an array of indices corresponding to which wavelength each value belongs to
-    indices = np.concatenate([np.full(len(flux_re[i]), i) for i in range(nwave)])
-    # compute the weighted sum for each wavelength
-    wsum = np.bincount(indices, weights=weight, minlength=nwave)
-    weighted_flux_sum = np.bincount(indices, weights=flux_concat * weight, minlength=nwave)
-    # compute the merged flux and error
-    flux_merge = weighted_flux_sum / wsum
-    err_merge = np.sqrt(1 / wsum)
+    weight = 1 / np.square(err_flat)
+    wsum = np.bincount(widx_flat, weights=weight, minlength=nwave)
+    weighted_flux_sum = np.bincount(widx_flat, weights=flux_flat * weight,
+                                    minlength=nwave)
+
+    # wavelengths no order contributes to (gaps between orders, and the ends of
+    # the grid) have zero total weight: mark them instead of dividing by zero
+    covered = wsum > 0
+    flux_merge = np.full(nwave, np.nan)
+    err_merge = np.full(nwave, np.inf)
+    np.divide(weighted_flux_sum, wsum, out=flux_merge, where=covered)
+    variance = np.zeros(nwave)
+    np.divide(1.0, wsum, out=variance, where=covered)
+    np.sqrt(variance, out=err_merge, where=covered)
 
     if plot:
         plt.plot(wave_new, flux_merge)
@@ -495,15 +481,15 @@ def resample_orders(wave_new, wave, flux, flux_err=None,
 
 def generate_wave_grid(wmin, wmax, resolution,
                        sampling=2.7):
+    if not (0 < wmin < wmax):
+        raise ValueError("need 0 < wmin < wmax, got wmin=%r wmax=%r" % (wmin, wmax))
     temp = (2 * sampling * resolution + 1) / (2 * sampling * resolution - 1)
     nwave = np.ceil(np.log(wmax / wmin) / np.log(temp))
-    if wmin > 0 and np.isfinite(nwave):
-        t2 = np.arange(nwave)
-        new_grid = temp ** t2 * wmin
-    else:
-        print("WARNING: could not find nwave, using old grid")
-        new_grid = wl
-    return new_grid
+    if not np.isfinite(nwave):
+        raise ValueError("could not determine grid length for "
+                         "wmin=%r wmax=%r resolution=%r" % (wmin, wmax, resolution))
+    t2 = np.arange(nwave)
+    return temp ** t2 * wmin
 
 
 def align_normalization(wave, flux, DEBUG_PLOTS=False):
@@ -541,7 +527,7 @@ def align_normalization(wave, flux, DEBUG_PLOTS=False):
             ml = np.nanmedian(f[mask_left])
             wl = np.nanmedian(w[mask_left])
             mr = np.nan
-            mr = np.nan
+            wr = np.nan
         else:
             mask_right = w > wmin[i+1]
             mask_left = w < wmax[i-1]
@@ -587,10 +573,8 @@ def merge_orders(olist: list[SpectralOrder], normalize=True, margin=2, max_wl=89
     # sort orders by median wave
     wmed = [np.nanmedian(i) for i in wave]
     isort = np.argsort(wmed)
-    wave = np.array(wave, dtype=object)[isort]
-    flux = np.array(flux, dtype=object)[isort]
-    wave = [np.array(i, dtype=float) for i in wave]
-    flux = [np.array(i, dtype=float) for i in flux]
+    wave = [np.asarray(wave[i], dtype=float) for i in isort]
+    flux = [np.asarray(flux[i], dtype=float) for i in isort]
 
     if DEBUG_PLOTS:
         for w, f in zip(wave, flux):
@@ -805,7 +789,11 @@ def extract_spectrum(spectrum, flats, comps, biases, idcomp_offset=-15,
             frame_for_slice = flats
         else:
             frame_for_slice = open_or_coadd_frame(frame_for_slice)
-            frame_for_slice = (frame_for_slice + flats) / 2
+            # cast first: raw frames are uint16, and uint16 + uint16 wraps
+            # around in numpy instead of promoting, which silently corrupts
+            # exactly the bright order cores we are trying to trace
+            frame_for_slice = (frame_for_slice.astype(float)
+                               + np.asarray(flats, dtype=float)) / 2
             """
             plt.imshow(frame_for_slice, norm="log")
             plt.gca().set_aspect('auto')
@@ -831,8 +819,10 @@ def extract_spectrum(spectrum, flats, comps, biases, idcomp_offset=-15,
         orders = [o for o in orders if o.wl is not None]
 
     if verbose: print("- extracting orders")
-    args = [(o, spectrum, flats, biases, comps, times_sigma) for o in orders]
-    with Pool(processes=cpu_count()) as pool:
+    args = [(o, times_sigma) for o in orders]
+    frames = {"spectrum": spectrum, "flats": flats,
+              "biases": biases, "comps": comps}
+    with shared_pool(frames, processes=cpu_count()) as pool:
         results = list(tqdm(pool.imap(extract_order, args), total=len(args)))
         orders = results
 
@@ -910,10 +900,12 @@ if __name__ == "__main__":
     bp = DEFAULT_DATA_DIR + os.sep
     idcomp_dir = DEFAULT_IDCOMP_DIR
     verbose = True
-    spec = extract_spectrum(spectrum=bp+"e202409010007.fit",
+    # e202409010033 is the science target (OBJECT = 'BD+26 2766'),
+    # e202409010007 is the bias (OBJECT = 'zero')
+    spec = extract_spectrum(spectrum=bp+"e202409010033.fit",
                             flats=bp+"e202409010019.fit",
                             comps=bp+"e202409010029.fit",
-                            biases=bp+"e202409010033.fit",
+                            biases=bp+"e202409010007.fit",
                             frame_for_slice=bp+"e202409020033.fit",
                             idcomp_dir=idcomp_dir,
                             verbose=verbose)

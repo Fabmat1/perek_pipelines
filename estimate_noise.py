@@ -1,4 +1,5 @@
 import numpy as np
+from numpy.lib.stride_tricks import sliding_window_view
 from scipy.special import binom
 
 def estimate_noise_scalar(flux, **kwargs):
@@ -35,8 +36,12 @@ def estimate_noise_scalar(flux, **kwargs):
 def fill_nan(y):
     '''replace nan values in 1-array by interpolated values'''
 
-    y = np.array(y)
+    y = np.array(y, dtype=float)
     nans = np.isnan(y)
+    if not nans.any() or nans.all():
+        # nothing to do, or nothing to interpolate from -- np.interp raises
+        # on an empty set of sample points
+        return y
     x = lambda z: z.nonzero()[0]
     y[nans]= np.interp(x(nans), x(~nans), y[~nans])
 
@@ -62,17 +67,40 @@ def estimate_noise(wave, flux, winsize_aa='guess'):
     winsize_aa_half = winsize_aa / 2
 
     # approx. translate Angstrom to pixel using average spacing
-    avspacing = np.median([wave[i+1] - wave[i] for i in range(len(wave)-1)])
+    avspacing = np.median(np.diff(wave))
 
     winsize_pix_av = int(winsize_aa_half / avspacing)
     winsize_min = 20
     winsize_max = int(len(wave)/10)
     winsize = max(min(winsize_pix_av, winsize_max), winsize_min)
 
-    keyw = {'order':3}
-    noise = [estimate_noise_scalar(flux[i-winsize:i+winsize], **keyw) for i in range(len(flux))]
+    n = len(flux)
+    noise = np.full(n, np.nan)
 
-    # replace nan values by interpolated values
+    # 3rd-order median estimator, evaluated over a 2*winsize window centred on
+    # each pixel. `estimate_noise_scalar` reduces to f3 * median(|d|) over the
+    # window, with d the same for every window, so d is formed once and the
+    # medians are taken with a sliding view instead of re-slicing per pixel.
+    f3 = 0.6052697319
+    window = 2 * winsize
+    if n > window and window > 4:
+        d = np.abs(2.0 * flux[2:n-2] - flux[0:n-4] - flux[4:n])
+        # the window covering flux[i-winsize:i+winsize] is d[i-winsize : i+winsize-4]
+        views = sliding_window_view(d, window - 4)
+        med = np.median(views, axis=-1)
+        noise[winsize:winsize + len(med)] = f3 * med
+
+    # The first and last `winsize` pixels have no full window. Measure them on
+    # the truncated window that is available rather than leaving them to be
+    # extrapolated -- a plain flux[i-winsize:i+winsize] would wrap around to an
+    # empty slice for i < winsize and silently yield NaN.
+    keyw = {'order': 3}
+    edges = list(range(0, min(winsize, n))) + \
+            list(range(max(0, n - winsize), n))
+    for i in edges:
+        noise[i] = estimate_noise_scalar(flux[max(0, i-winsize):i+winsize], **keyw)
+
+    # replace any remaining nan values by interpolated values
     noise = fill_nan(noise)
 
     return noise
