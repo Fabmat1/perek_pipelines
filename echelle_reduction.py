@@ -40,15 +40,8 @@ from calibrate import find_dispersion
 from identify_orders import (SpectralSlice, find_orders)
 from orders import (SpectralOrder, extract_order)
 
-try:
-    from resample_spectres import resample
-except ModuleNotFoundError:
-    print("compile 'pyresample_spectres' like this:")
-    print("python3 -m numpy.f2py -c -m pyresample_spectres resample_spectres.f90")
-    try:
-        from spectres import spectres as resample
-    except ModuleNotFoundError:
-        raise Exception("Need either 'spectres' or 'resample_spectres'")
+from resample_backend import resample
+from paths import DEFAULT_IDCOMP_DIR, DEFAULT_DATA_DIR
 
 two_log_two = 2 * np.sqrt(2 * np.log(2))
 
@@ -365,9 +358,9 @@ def process_order(order_data):
         plt.plot(wave_order, flux_order, color=colors_i[i % 2])
 
     # Resample flux and flux_err
-    flux_order = resample(wave_order_new, wave_order, flux_order, verbose=False)
+    flux_order = resample(wave_order_new, wave_order, flux_order, fill=0, verbose=False)
     if flux_err_order is not None:
-        flux_err_order = resample(wave_order_new, wave_order, flux_err_order, verbose=False)
+        flux_err_order = resample(wave_order_new, wave_order, flux_err_order, fill=0, verbose=False)
     else:
         flux_err_order = estimate_noise(wave_order_new, flux_order)
 
@@ -427,10 +420,10 @@ def resample_orders(wave_new, wave, flux, flux_err=None,
             plt.plot(wave_order, flux_order, color=colors_i[i%2])
 
         flux_order = resample(wave_order_new, wave_order, flux_order,
-                              verbose=False)
+                              fill=0, verbose=False)
         if not (flux_err is None):
             flux_err_order = resample(wave_order_new, wave_order, flux_err_order,
-                                      verbose=False)
+                                      fill=0, verbose=False)
         else:
             flux_err_order = estimate_noise(wave_order_new, flux_order)
 
@@ -783,7 +776,7 @@ def merge_resolution(wave_merged, orders, dres, npix=45, DEBUG_PLOTS=False):
 
 def extract_spectrum(spectrum, flats, comps, biases, idcomp_offset=-15,
                      frame_for_slice=None,
-                     normalize=True, idcomp_dir="idcomp",
+                     normalize=True, idcomp_dir=DEFAULT_IDCOMP_DIR,
                      sampling=200, min_order_samples=6,
                      apply_barycorr=True,
                      verbose=False,
@@ -914,8 +907,8 @@ def extract_spectrum(spectrum, flats, comps, biases, idcomp_offset=-15,
 
 if __name__ == "__main__":
     # spectrum, flats, comps, biases
-    bp = "20240901/"
-    idcomp_dir = "idcomp_2307/"
+    bp = DEFAULT_DATA_DIR + os.sep
+    idcomp_dir = DEFAULT_IDCOMP_DIR
     verbose = True
     spec = extract_spectrum(spectrum=bp+"e202409010007.fit",
                             flats=bp+"e202409010019.fit",

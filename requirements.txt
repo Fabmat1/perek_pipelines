@@ -1,0 +1,8 @@
+# For plain pip/venv users. `uv sync` reads pyproject.toml instead.
+numpy>=1.24
+scipy>=1.10
+matplotlib>=3.7
+pandas>=2.0
+astropy>=5.3
+tqdm>=4.65
+spectres>=2.2

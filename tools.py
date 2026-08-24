@@ -1,15 +1,7 @@
 import numpy as np
 from astropy.stats import mad_std
 from scipy.optimize import curve_fit
-try:
-    from resample_spectres import resample
-except ModuleNotFoundError:
-    print("compile 'pyresample_spectres' like this:")
-    print("python3 -m numpy.f2py -c -m pyresample_spectres resample_spectres.f90")
-    try:
-        from spectres import spectres as resample
-    except ModuleNotFoundError:
-        raise Exception("Need either 'spectres' or 'resample_spectres'")
+from resample_backend import resample
 
 def polynomial(x, a, b, c, d):
     return a * x ** 3 + b * x ** 2 + c * x + d

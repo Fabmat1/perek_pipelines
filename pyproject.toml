@@ -1,0 +1,19 @@
+[project]
+name = "perek-pipeline"
+version = "0.1.0"
+description = "Echelle data reduction pipeline for the Perek 2m telescope"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy>=1.24",
+    "scipy>=1.10",
+    "matplotlib>=3.7",
+    "pandas>=2.0",
+    "astropy>=5.3",
+    "tqdm>=4.65",
+    "spectres>=2.2",
+]
+
+# Flat script layout, not an installable package: `uv sync` should only create
+# the environment and install the dependencies above.
+[tool.uv]
+package = false
