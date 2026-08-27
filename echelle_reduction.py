@@ -758,7 +758,7 @@ def merge_resolution(wave_merged, orders, dres, npix=45, DEBUG_PLOTS=False):
     return res_merged
 
 
-def extract_spectrum(spectrum, flats, comps, biases, idcomp_offset=-15,
+def extract_spectrum(spectrum, flats, comps, biases, idcomp_offset="auto",
                      frame_for_slice=None,
                      normalize=True, idcomp_dir=DEFAULT_IDCOMP_DIR,
                      sampling=200, min_order_samples=6,

@@ -39,6 +39,10 @@ def parse_args(argv=None):
     p.add_argument("--idcomp-dir", default=DEFAULT_IDCOMP_DIR,
                    help="directory with idcomp line identifications "
                         "(default: the bundled idcomp_2307)")
+    p.add_argument("--idcomp-offset", default="auto", metavar="PX",
+                   help="cross-dispersion shift in pixels between the idcomp "
+                        "reference and this night; \"auto\" measures it from "
+                        "the data (default: %(default)s)")
     p.add_argument("--frame-for-slice", default="science", metavar="FRAME",
                    help='frame used to trace the orders: "science" to use the '
                         'science frames themselves, or a path to a FITS file '
@@ -86,8 +90,16 @@ def main(argv=None):
     if args.verbose:
         print("> resampling backend: %s" % BACKEND)
 
+    idcomp_offset = args.idcomp_offset
+    if idcomp_offset != "auto":
+        try:
+            idcomp_offset = float(idcomp_offset)
+        except ValueError:
+            sys.exit('--idcomp-offset must be a number or "auto"')
+
     reduce_night(args.data_dir, args.idcomp_dir,
                  fn_science=args.science,
+                 idcomp_offset=idcomp_offset,
                  frame_for_slice=frame_for_slice,
                  outdir=args.outdir,
                  normalize=args.normalize,
@@ -100,6 +112,7 @@ def main(argv=None):
 
 
 def reduce_night(dir, idcomp_dir, fn_science=None,
+                 idcomp_offset="auto",
                  frame_for_slice=None,
                  outdir="done",
                  verbose=True,
@@ -165,6 +178,7 @@ def reduce_night(dir, idcomp_dir, fn_science=None,
             else:
                 frame_for_slice_i = frame_for_slice
             s = extract_spectrum(os.path.join(dir, fp), flats, comps, biases,
+                                 idcomp_offset=idcomp_offset,
                                  frame_for_slice=frame_for_slice_i,
                                  orders=orders,
                                  normalize=normalize,

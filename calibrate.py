@@ -1,5 +1,6 @@
 
 import os
+import warnings
 import numpy as np
 from scipy.optimize import curve_fit
 from matplotlib import pyplot as plt
@@ -358,14 +359,174 @@ def process_dispersion(args):
     # only plot one solution
     debug_solve = DEBUG_PLOTS and (j == 3)
 
-    solve_wavelength(linelist_o, o, DEBUG_PLOTS=debug_solve, thar_list=thar_list)
+    try:
+        solve_wavelength(linelist_o, o, DEBUG_PLOTS=debug_solve, thar_list=thar_list)
+    except Exception as exc:
+        # too few usable lines in this order, or a fit that will not converge.
+        # leave o.wl as None: the caller drops orders without a solution rather
+        # than losing the whole night over one unusable order at the edge.
+        warnings.warn("no dispersion solution for order %s: %s" % (o.id, exc))
+        return idx_order, o
     o.pix = np.arange(len(o.wl))
 #    o.plot_frame_1d("comp_orig")
 
     return idx_order, o
 
+
+def _nearest_signed(ap_measure, ap_shifted):
+    """Signed distance from each order to its nearest reference aperture."""
+    d = np.asarray(ap_measure)[:, None] - np.asarray(ap_shifted)[None, :]
+    j = np.argmin(np.abs(d), axis=1)
+    return d[np.arange(len(d)), j]
+
+
+def _plot_idcomp_offset(ap_idcomp, ap_measure, offs, cost, offset, residual,
+                        quality, spacing):
+    """Show how the idcomp offset was chosen, and what the alternatives look like.
+
+    Top: the scan. Every candidate shift of the reference apertures, and how
+    well the detected orders line up with them. The correct shift sits in a
+    deep, narrow well; the shallow minima roughly one order spacing away are
+    the off-by-one alignments, which are exactly the ones that used to be
+    picked silently by a hardcoded offset.
+
+    Bottom: the alignment itself. At the chosen offset every order sits within
+    a fraction of a pixel of a reference aperture. Shifted by one order spacing
+    the orders no longer land on the apertures -- and because the spacing
+    varies across the detector, the mismatch grows across the frame instead of
+    being a constant, which is what makes the correct shift identifiable.
+    """
+    figsize = np.array([8, 6])
+    fig, axs = plt.subplots(2, 1, figsize=figsize)
+
+    # --- top: the scan -------------------------------------------------
+    axs[0].plot(offs, cost, color="black", lw=1)
+    axs[0].axvline(offset, color="tab:green", lw=1.5,
+                   label="chosen: %+.2f px (%.2f px)" % (offset, residual))
+    far = np.abs(offs - offset) > 0.5 * spacing
+    if np.any(far):
+        alt = offs[far][np.argmin(cost[far])]
+        axs[0].axvline(alt, color="tab:orange", ls="--", lw=1.2,
+                       label="best alternative: %+.0f px (%.2f px)"
+                             % (alt, cost[far].min()))
+    axs[0].axhline(0.3 * spacing, color="tab:red", ls=":", lw=1,
+                   label="warn above %.1f px" % (0.3 * spacing))
+    axs[0].set_xlabel("shift applied to reference apertures  /  pix")
+    axs[0].set_ylabel("median distance\norder -> aperture  /  pix")
+    axs[0].set_title("idcomp offset scan: chosen minimum is %.1fx deeper "
+                     "than any other" % quality)
+    axs[0].legend(fontsize=8)
+
+    # --- bottom: this alignment vs the off-by-one ones -------------------
+    # orders beyond the ends of the reference set have no aperture to match and
+    # would otherwise set the scale for the whole panel
+    inside = ((np.asarray(ap_measure) > np.min(ap_idcomp) + offset - spacing)
+              & (np.asarray(ap_measure) < np.max(ap_idcomp) + offset + spacing))
+    alt_resid = []
+    for delta, color, style, name in [
+            (-spacing, "tab:orange", "^", "one order low"),
+            (0.0, "tab:green", "o", "chosen"),
+            (+spacing, "tab:purple", "v", "one order high")]:
+        resid = _nearest_signed(ap_measure, np.asarray(ap_idcomp) + offset + delta)
+        if delta != 0:
+            alt_resid.append(np.abs(resid[inside]))
+        axs[1].scatter(ap_measure, resid, s=14, color=color, marker=style,
+                       label="%s (median |d| = %.2f px)"
+                             % (name, np.median(np.abs(resid[inside]))))
+    axs[1].axhline(0, ls="--", color="gray", zorder=0)
+    # scale to the off-by-one alignments, not to the unmatchable edge orders
+    span = 1.5 * np.percentile(np.concatenate(alt_resid), 90) if alt_resid else spacing
+    axs[1].set_ylim(-span, span)
+    axs[1].set_xlabel("order position on detector  /  pix")
+    axs[1].set_ylabel("distance to nearest\naperture  /  pix")
+    axs[1].set_title("orders off the top/bottom of this panel lie beyond the "
+                     "reference set", fontsize=8)
+    axs[1].legend(fontsize=8)
+
+    plt.tight_layout()
+    plt.show()
+
+
+def solve_idcomp_offset(ap_idcomp, ap_measure, search=None, coarse=0.5, fine=0.02,
+                        verbose=False, DEBUG_PLOTS=False):
+    """Measure the cross-dispersion shift between the idcomp reference and this night.
+
+    The idcomp line lists are tied to the aperture positions of the night they
+    were taken on. The spectrograph shifts in the cross-dispersion direction
+    between runs, so orders can only be paired with their line list after that
+    shift is applied. It used to be a hardcoded constant, which quietly pairs
+    orders with a *neighbouring* aperture once the drift grows comparable to the
+    order spacing (~15 px) -- the reduction still completes, but every order
+    carries the wrong line list and the wavelength solution is wrong.
+
+    Here the shift is measured from the data: scan candidate offsets and keep
+    the one minimising the median distance from each detected order to the
+    nearest reference aperture. Using the median makes this insensitive to
+    spurious order detections, and the minimum is sharp because the order
+    spacing varies across the detector -- a wrong-by-one alignment cannot be
+    absorbed by a rigid shift, so it leaves a much larger residual.
+
+    Returns
+    -------
+    offset : float
+        Shift in pixels to add to the reference aperture positions.
+    residual : float
+        Median distance from an order to its reference aperture, in pixels.
+    quality : float
+        Residual of the best rejected alternative divided by ``residual``.
+        Values near 1 mean the alignment is ambiguous.
+
+    With ``DEBUG_PLOTS`` the scan is shown together with the alignment it
+    produces, next to the off-by-one alignments it rejected.
+    """
+    ap_idcomp = np.asarray(ap_idcomp, dtype=float)
+    ap_measure = np.asarray(ap_measure, dtype=float)
+
+    spacing = np.median(np.diff(np.sort(ap_measure)))
+    if search is None:
+        # a few order spacings either side covers any realistic drift
+        search = 4 * spacing
+
+    def cost(offsets):
+        # median nearest-neighbour distance, robust against spurious orders
+        d = np.abs(ap_measure[:, None, None]
+                   - (ap_idcomp[None, :, None] + offsets[None, None, :]))
+        return np.median(d.min(axis=1), axis=0)
+
+    offs = np.arange(-search, search + coarse, coarse)
+    c = cost(offs)
+    best = offs[np.argmin(c)]
+
+    # sub-pixel refinement around the coarse minimum
+    fine_offs = np.arange(best - coarse, best + coarse + fine, fine)
+    fc = cost(fine_offs)
+    offset = float(fine_offs[np.argmin(fc)])
+    residual = float(fc.min())
+
+    # how well separated is this minimum from the best alternative alignment?
+    others = c[np.abs(offs - best) > 0.5 * spacing]
+    quality = float(others.min() / residual) if len(others) and residual > 0 else np.inf
+
+    if DEBUG_PLOTS:
+        _plot_idcomp_offset(ap_idcomp, ap_measure, offs, c, offset, residual,
+                            quality, spacing)
+
+    if verbose:
+        print("- idcomp offset = %+.2f px (residual %.2f px, %.1fx better than "
+              "next candidate)" % (offset, residual, quality))
+    if residual > 0.3 * spacing:
+        warnings.warn("idcomp offset residual is %.2f px for an order spacing of "
+                      "%.1f px: the detected orders do not line up with the "
+                      "reference apertures." % (residual, spacing))
+    elif quality < 2:
+        warnings.warn("idcomp offset %+.2f px is only %.1fx better than the next "
+                      "candidate: the order identification may be off by one."
+                      % (offset, quality))
+    return offset, residual, quality
+
+
 def find_dispersion(orders, biases, comps,
-                    idcomp_dir, idcomp_offset=-15,
+                    idcomp_dir, idcomp_offset="auto",
                     thar_list=None,
                     verbose=False, DEBUG_PLOTS=False):
 
@@ -379,13 +540,22 @@ def find_dispersion(orders, biases, comps,
 
     times_sigma = 2
 
-    linelists = {}
+    raw_lists = {}
     fp_idcomp = sorted(os.listdir(idcomp_dir))
     for file in fp_idcomp:
         if "idiazcomp" in file:
             aplo, aphi, table = parse_idcomp(idcomp_dir + "/" + file)
             avg_ap = (aplo + aphi) / 2
-            linelists[avg_ap+idcomp_offset] = table
+            raw_lists[avg_ap] = table
+
+    if isinstance(idcomp_offset, str) and idcomp_offset == "auto":
+        idcomp_offset, _, _ = solve_idcomp_offset(
+            list(raw_lists.keys()), ap_measure, verbose=verbose,
+            DEBUG_PLOTS=DEBUG_PLOTS)
+    elif verbose:
+        print("- idcomp offset = %+.2f px (fixed)" % idcomp_offset)
+
+    linelists = {ap + idcomp_offset: table for ap, table in raw_lists.items()}
     avg_aps = np.array(list(linelists.keys()))
 
 #    if DEBUG_PLOTS:
