@@ -212,7 +212,12 @@ def poly_normalization(wls, flxs,
                                        (4842, 4888), (6540, 6590),
                                        (6860, 6880),
                                        (6888.1, 6890.5), (6892, 6893.6),
-                                       (7590, 7617), (7622.8, 7625)],
+                                       # the O2 A-band runs to ~7660, not 7617:
+                                       # it is still 0.4 deep at 7627, so the
+                                       # old windows left the trough's red half
+                                       # in the fit and pulled the continuum
+                                       # down into it
+                                       (7590, 7660)],
                        smooth_width=31,
                        floor_width=0.25,
                        DEBUG_PLOTS=False,
