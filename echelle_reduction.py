@@ -227,7 +227,11 @@ def poly_normalization(wls, flxs,
     args_list = [(i, wl, flxs[i], poly_order, ignore_windows, smooth_width,
                   floor_width, DEBUG_PLOTS)
                  for i, wl in enumerate(wls)]
-    with Pool(n_processes) as pool:
+    # `Pool(None)` asks for one worker per core, which ignores --ncpu and
+    # oversubscribes the machine the flag exists to protect
+    if n_processes is None:
+        n_processes = get_ncpu()
+    with Pool(max(1, int(n_processes))) as pool:
         if show_progress and len(args_list) > 10:
             results = list(tqdm(pool.imap(normalize_single_order, args_list),
                                total=len(args_list)))

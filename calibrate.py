@@ -247,6 +247,9 @@ def wavelength_to_pixel(wavelengths, params, x, polynomial):
 
 def fit_dispersion(x, y, yerr, thar_list=None, DEBUG_PLOTS=False):
 
+    # sort for the fit and the residual plot, but remember the permutation:
+    # the mask returned below has to line up with the caller's arrays, not with
+    # the sorted copies made here
     isort = np.argsort(x)
     x = x[isort]
     y = y[isort]
@@ -297,9 +300,18 @@ def fit_dispersion(x, y, yerr, thar_list=None, DEBUG_PLOTS=False):
         plt.tight_layout()
         plt.show()
 
+    # `mask_good` indexes the sorted arrays; the caller still holds the
+    # unsorted ones. Undo the permutation so that applying the mask there
+    # keeps the lines the fit actually kept. Without this the clip silently
+    # discards a different set of lines than the one it rejected -- harmless
+    # while the input happens to be sorted by pixel, but the ThAr refinement
+    # appends its predicted lines with `vstack` and so does not.
+    mask_orig = np.zeros_like(mask_good)
+    mask_orig[isort] = mask_good
+
     dout = {"params": params,
             "errs": errs,
-            "mask_good": mask_good,
+            "mask_good": mask_orig,
             "rms": rms}
 
     return dout
