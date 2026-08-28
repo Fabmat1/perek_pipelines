@@ -62,6 +62,10 @@ class SpectralOrder:
         self.comparison_orig = None
         self.bias = None
 
+        # Photon noise, from the counts as extracted -- before normalisation
+        # rescales everything to order unity.
+        self.science_err = None
+
         self.wl = None
         self.pix = None
 
@@ -269,7 +273,7 @@ class SpectralOrder:
         plt.show()
 
     def apply_corrections(self, med_win_size=25, min_win_size=15, max_win_size=15,
-                          comparison=False, DEBUG_PLOTS=False):
+                          comparison=False, read_noise=2.0, DEBUG_PLOTS=False):
 
         DEBUG_PLOTS = False
 
@@ -299,11 +303,32 @@ class SpectralOrder:
             plt.show()
 
         if self.flat is not None:
+            # Measured scatter, not sqrt(counts): the flat is averaged over a
+            # night, over the aperture and by this filter, so Poisson noise
+            # overstates it 38x in the blue.
             norm_flat = median_filter(self.flat, size=med_win_size)
+            resid = self.flat - norm_flat
+            flat_sigma = 1.4826 * np.median(np.abs(resid - np.median(resid)))
+            if not np.isfinite(flat_sigma) or flat_sigma <= 0:
+                flat_sigma = 0.0
             self.flat = norm_flat
 
         if (self.science is not None) and (self.flat is not None):
-            self.science /= norm_flat
+            # The flat is the divisor, so where it holds few counts the
+            # quotient is poorly determined however bright the star is.
+            with np.errstate(divide="ignore", invalid="ignore"):
+                var_sci = np.abs(self.science) + np.abs(self.bias) + read_noise ** 2
+                var_flat = np.full_like(norm_flat, flat_sigma ** 2)
+                ratio = self.science / norm_flat
+                rel = np.sqrt(
+                    np.divide(var_sci, np.square(self.science),
+                              out=np.full_like(var_sci, np.inf),
+                              where=self.science != 0)
+                    + np.divide(var_flat, np.square(norm_flat),
+                                out=np.full_like(var_flat, np.inf),
+                                where=norm_flat != 0))
+                self.science_err = np.abs(ratio) * rel
+            self.science = ratio
 
         if comparison and self.comparison is not None:
             self.comparison_orig = self.comparison.copy()
@@ -313,8 +338,13 @@ class SpectralOrder:
             self.comparison_orig = fill_nan(self.comparison_orig)
 
             self.comparison -= minimum_filter(self.comparison, size=min_win_size)
-            # should clip the filter here, force to exceed noise level
-            self.comparison /= maximum_filter(self.comparison, size=max_win_size)
+            # Never 0/0: across a lineless stretch the running min equals the
+            # running max, and `fill_nan` would interpolate the nans as data.
+            peak = maximum_filter(self.comparison, size=max_win_size)
+            noise = np.median(np.abs(self.comparison))
+            if not np.isfinite(noise) or noise <= 0:
+                noise = 1.0
+            self.comparison /= np.maximum(peak, noise)
 
             qhi = np.quantile(self.comparison, 0.9)
             mask = self.comparison < -qhi

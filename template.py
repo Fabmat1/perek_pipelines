@@ -83,6 +83,12 @@ def parse_args(argv=None):
                         "list of paths (default: disabled)")
     p.add_argument("--no-normalize", dest="normalize", action="store_false",
                    help="skip continuum normalisation")
+    p.add_argument("--no-scattered", dest="remove_scattered",
+                   action="store_false",
+                   help="keep the grating's scattered-light halo. It is only "
+                        "2-3%% of a red order but comparable to the signal in "
+                        "the blue, where leaving it in stops flat division "
+                        "removing the blaze and makes the order ends droop")
     p.add_argument("--no-fits", dest="save_as_fits", action="store_false",
                    help="do not write the .fits output")
     p.add_argument("--no-ascii", dest="save_as_ascii", action="store_false",
@@ -150,6 +156,7 @@ def main(argv=None):
                  trace_stack=args.trace_stack,
                  outdir=args.outdir,
                  normalize=args.normalize,
+                 remove_scattered=args.remove_scattered,
                  verbose=args.verbose,
                  save_as_fits=args.save_as_fits,
                  save_as_ascii=args.save_as_ascii,
@@ -165,6 +172,7 @@ def reduce_night(dir, idcomp_dir, fn_science=None,
                  outdir="done",
                  verbose=True,
                  normalize=True,
+                 remove_scattered=True,
                  thar_list=None,
                  save_as_fits=True,
                  save_as_ascii=True,
@@ -252,6 +260,7 @@ def reduce_night(dir, idcomp_dir, fn_science=None,
                                  frame_for_slice=frame_for_slice_i,
                                  orders=orders,
                                  normalize=normalize,
+                                 remove_scattered=remove_scattered,
                                  idcomp_dir=idcomp_dir,
                                  thar_list=thar_list,
                                  verbose=verbose,
