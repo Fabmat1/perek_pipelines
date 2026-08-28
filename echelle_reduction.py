@@ -1,4 +1,5 @@
 import os
+import warnings
 from time import time
 import numpy as np
 from numpy.polynomial import legendre
@@ -21,7 +22,7 @@ from astropy.stats import sigma_clip
 
 from estimate_noise import estimate_noise
 from tools import (polyfit_reject, curve_fit_reject, pair_generation,
-                   mask_section, shared_pool, shared,
+                   mask_section, shared_pool, shared, get_ncpu,
                    fill_nan, Gaussian, Gaussian_res)
 from calibrate import find_dispersion
 from identify_orders import (SpectralSlice, find_orders)
@@ -77,6 +78,34 @@ def get_barycorr(frame):
 def coadd_frames(frames):
     frame = np.sum(frames, axis=0).astype(float) / len(frames)
     return frame
+
+
+def combine_arcs(comps, verbose=False):
+    """Combine the comparison exposures of a night into one arc.
+
+    Two things a plain mean gets wrong here:
+
+    * a cosmic ray on one exposure survives averaging as a sharp, line-shaped
+      artefact, which is exactly what the line fitter is looking for;
+    * the ThAr lamp is still warming up on the first exposure of a set. On
+      20260826 it is 19% fainter than the rest, which then agree to within 5%,
+      so including it dilutes the stack.
+
+    Median-combine instead, and drop the leading exposure when enough others
+    remain. Arcs taken hours apart are still combined: the measured drift
+    across a night is ~0.1 px in both directions, far below a resolution
+    element.
+    """
+    arrays = [np.asarray(open_or_coadd_frame(c), dtype=float) for c in comps] \
+        if isinstance(comps, list) else [np.asarray(comps, dtype=float)]
+
+    if len(arrays) > 3:
+        arrays = arrays[1:]
+    if len(arrays) == 1:
+        return arrays[0]
+    if verbose:
+        print("- combining %d arc exposures (median)" % len(arrays))
+    return np.median(arrays, axis=0)
 
 def open_or_coadd_frame_old(frame):
     if isinstance(frame, np.ndarray):
@@ -437,7 +466,7 @@ def resample_orders(wave_new, wave, flux, flux_err=None,
         widx_res.append(widx_new)
     """
 
-    ncpu = max(1, min(6, int(cpu_count()/2)))
+    ncpu = get_ncpu()
     wave_res, flux_res, err_res, widx_res = resample_orders_parallel(wave_new, wave, flux,
                                                                      flux_err=flux_err,
                                                                      plot=plot, ncpu=ncpu)
@@ -772,7 +801,9 @@ def extract_spectrum(spectrum, flats, comps, biases, idcomp_offset="auto",
 
     spectrum = open_or_coadd_frame(spectrum)
     flats = open_or_coadd_frame(flats)
-    comps = open_or_coadd_frame(comps)
+    # the arc gets its own combine: cosmics and the lamp warm-up matter here
+    # in a way they do not for the flat or bias
+    comps = combine_arcs(comps, verbose=verbose)
     biases = open_or_coadd_frame(biases)
 
     """
@@ -788,7 +819,15 @@ def extract_spectrum(spectrum, flats, comps, biases, idcomp_offset="auto",
         if frame_for_slice is None:
             frame_for_slice = flats
         else:
-            frame_for_slice = open_or_coadd_frame(frame_for_slice)
+            # median-combine several trace frames rather than averaging them:
+            # a cosmic ray on one frame is a bright, order-shaped artefact that
+            # a mean carries straight into the trace
+            if isinstance(frame_for_slice, list) and len(frame_for_slice) > 2:
+                stack = [np.asarray(open_or_coadd_frame(f), dtype=float)
+                         for f in frame_for_slice]
+                frame_for_slice = np.median(stack, axis=0)
+            else:
+                frame_for_slice = open_or_coadd_frame(frame_for_slice)
             # cast first: raw frames are uint16, and uint16 + uint16 wraps
             # around in numpy instead of promoting, which silently corrupts
             # exactly the bright order cores we are trying to trace
@@ -822,7 +861,7 @@ def extract_spectrum(spectrum, flats, comps, biases, idcomp_offset="auto",
     args = [(o, times_sigma) for o in orders]
     frames = {"spectrum": spectrum, "flats": flats,
               "biases": biases, "comps": comps}
-    with shared_pool(frames, processes=cpu_count()) as pool:
+    with shared_pool(frames) as pool:
         results = list(tqdm(pool.imap(extract_order, args), total=len(args)))
         orders = results
 

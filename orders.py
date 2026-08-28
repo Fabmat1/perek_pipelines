@@ -1,3 +1,5 @@
+import warnings
+
 import numpy as np
 from tools import (curve_fit_reject, polynomial, Gaussian, fill_nan, shared)
 from scipy.interpolate import interp1d
@@ -212,10 +214,13 @@ class SpectralOrder:
         weights = gaussian_pixel_weights_2d(y_pixels, y_ind[:, None],
                                             sigma[:, None], in_aperture)
 
-        # weighted sum of flux
-        col = image[np.clip(y_pixels, 0, ny - 1), columns[:, None]]
-        intensities = np.einsum("ij,ij->i", col.astype(float), weights)
+        col = image[np.clip(y_pixels, 0, ny - 1), columns[:, None]].astype(float)
 
+        intensities = np.einsum("ij,ij->i", col, weights)
+        self._store(type, intensities)
+
+    def _store(self, type, intensities):
+        """File an extracted 1D spectrum under the frame type it came from."""
         if type == "bias" or type == "zero":
             self.bias = intensities
         elif type == "flat":
@@ -224,8 +229,6 @@ class SpectralOrder:
             self.comparison = intensities
         elif type == "science":
             self.science = intensities
-#            plt.plot(np.arange(len(self.science)), self.science)
-#            plt.show()
         else:
             raise Exception("Unknown frame type!")
 

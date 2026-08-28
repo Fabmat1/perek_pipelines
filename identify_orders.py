@@ -1,4 +1,7 @@
+import os
+
 import numpy as np
+from astropy.io import fits
 from matplotlib import pyplot as plt
 from matplotlib.colors import LogNorm
 from scipy.optimize import curve_fit
@@ -12,6 +15,10 @@ from tools import (mask_section, Gaussian, fill_nan, pair_generation,
 from orders import SpectralOrder
 
 two_log_two = 2 * np.sqrt(2 * np.log(2))
+
+# background-removal window shared by slice_analysis and blue_order_signal, so
+# the two measure the order profile the same way
+MIN_WINDOW_DEFAULT = 15
 
 class SpectralSlice:
     def __init__(self, x, ys, y_errs, widths):
@@ -41,7 +48,7 @@ class SpectralSlice:
                 else:
                     self.order_ownership[i] = self.order_ownership[i - 1] + 1
 
-def slice_analysis(pixel, slice_x, slice_y, MIN_WINDOW=15, MAX_WINDOW=15, NOISE_MEASURE_SECTION_WIDTH=0.05,
+def slice_analysis(pixel, slice_x, slice_y, MIN_WINDOW=MIN_WINDOW_DEFAULT, MAX_WINDOW=15, NOISE_MEASURE_SECTION_WIDTH=0.05,
                    NOISE_CUTOFF=20, CUTTOFF_MARGIN=5, ORDER_GAUSS_THRESHOLD=0.6,
                    idx_peak_min=700, idx_peak_max=1750, DEBUG_PLOTS=False):
     """
@@ -277,13 +284,97 @@ def process_slice(args):
     slice = slice_analysis(pixel, slice_x, slice_y, DEBUG_PLOTS=debug_slice)
     return slice
 
+def blue_order_signal(frame, bias=None, row_lo=770, row_hi=800,
+                      col_lo=900, col_hi=1150, noise_lo=100, noise_hi=600):
+    """How well the bluest orders stand out in one frame, in units of noise.
+
+    The bluest orders are the first to be lost when tracing, because the flat
+    lamp has almost no output there: on the 2026 detector it peaks around 20
+    counts at row 780 against 20000 at row 1400. Which science frame the orders
+    are traced on therefore decides how far into the blue the reduction
+    reaches, and optical brightness is a poor guide -- a red star with a long
+    exposure can be brighter overall and still leave the blue orders invisible.
+
+    The score is the peak of the cross-dispersion profile in `row_lo:row_hi`,
+    after removing the local background the same way `slice_analysis` does,
+    divided by the noise measured in an empty part of the same profile. Frames
+    that cannot be scored (wrong shape, no signal) get -inf so they sort last
+    rather than raising.
+    """
+    frame = np.asarray(frame, dtype=float)
+    if bias is not None:
+        frame = frame - np.asarray(bias, dtype=float)
+    ny, nx = frame.shape
+    if row_hi > ny or col_hi > nx or noise_hi > ny:
+        return -np.inf
+
+    profile = frame[:, col_lo:col_hi].mean(axis=1)
+    profile = profile - minimum_filter(profile, MIN_WINDOW_DEFAULT)
+    noise = np.std(profile[noise_lo:noise_hi])
+    if not np.isfinite(noise) or noise <= 0:
+        return -np.inf
+    peak = np.max(profile[row_lo:row_hi])
+    if not np.isfinite(peak):
+        return -np.inf
+    return float(peak / noise)
+
+
+def select_trace_frames(frames, bias=None, nstack=4, verbose=False):
+    """Pick the frames to trace the orders on.
+
+    Ranking purely on blue signal picks hot blue stars, and those are faint in
+    the reddest orders: on 20260826 it reached 3834 A but lost everything
+    redward of 8540 A, because the reddest order was no longer visible in any
+    trace frame. So take the best blue frame first -- that is what sets how far
+    into the blue the reduction reaches -- and then fill the stack with the
+    frames that best cover the red end.
+
+    Returns up to `nstack` frames, or an empty list if none can be scored;
+    callers fall back to the flat, which is what the pipeline did before.
+    """
+    scored = []
+    for f in frames:
+        arr = f
+        if isinstance(f, str):
+            try:
+                with fits.open(f) as hdul:
+                    arr = np.asarray(hdul[0].data)
+            except Exception:
+                continue
+        blue = blue_order_signal(arr, bias=bias)
+        red = blue_order_signal(arr, bias=bias, row_lo=1620, row_hi=1670)
+        if np.isfinite(blue):
+            scored.append((blue, red, f))
+
+    if not scored:
+        if verbose:
+            print("- no frame could be scored; tracing on the flat")
+        return []
+
+    by_blue = sorted(scored, key=lambda t: t[0], reverse=True)
+    chosen = [by_blue[0]]
+    for cand in sorted(scored, key=lambda t: t[1], reverse=True):
+        if len(chosen) >= nstack:
+            break
+        if cand[2] not in [c[2] for c in chosen]:
+            chosen.append(cand)
+
+    if verbose:
+        print("- tracing orders on %d frame(s):" % len(chosen))
+        for i, (blue, red, f) in enumerate(chosen):
+            nm = os.path.basename(f) if isinstance(f, str) else "frame"
+            print("    %s %-20s blue %6.0f sigma, red %6.0f sigma"
+                  % ("bluest:" if i == 0 else "       ", nm, blue, red))
+
+    return [f for _, _, f in chosen]
+
+
 def find_slices(frame_for_slice, sampling=200, DEBUG_PLOTS=False):
     # Get orders and stuff from flat
     npix_x = frame_for_slice.shape[1]
     pixels = np.linspace(5, npix_x-5, sampling).astype(int)
     args_list = [(i, pixels[i], npix_x, DEBUG_PLOTS) for i in range(sampling)]
-    with shared_pool({"frame_for_slice": frame_for_slice},
-                     processes=cpu_count()) as pool:
+    with shared_pool({"frame_for_slice": frame_for_slice}) as pool:
         slices = list(tqdm(pool.imap(process_slice, args_list), total=sampling))
 
     if DEBUG_PLOTS and False:

@@ -10,8 +10,20 @@ To reduce your own data, point it at the directory holding the FITS frames:
     python template.py /path/to/20250903
     python template.py 20250903 --science e202509030022 --plot
 """
-import re
 import os
+
+# Pin the linear-algebra libraries to a single thread. This has to happen
+# before numpy is imported: OpenBLAS, MKL and Accelerate read these variables
+# once, at load time, and otherwise each starts a thread per core. That nests
+# underneath our own process pool -- ncpu workers times one thread per core
+# each -- and the threads then contend rather than compute. The names cover the
+# backends numpy is built against on Linux, macOS and Windows; setting one that
+# does not apply is harmless.
+for _var in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS",
+             "NUMEXPR_NUM_THREADS", "VECLIB_MAXIMUM_THREADS"):
+    os.environ.setdefault(_var, "1")
+
+import re
 import sys
 import time
 import argparse
@@ -20,8 +32,12 @@ import pandas as pd
 from astropy.io import fits
 from matplotlib import pyplot as plt
 from echelle_reduction import extract_spectrum
+from identify_orders import select_trace_frames
 from resample_backend import BACKEND
-from paths import DEFAULT_IDCOMP_DIR, DEFAULT_THAR_LIST, DEFAULT_DATA_DIR
+from calibrate import load_thar_list
+from tools import set_ncpu
+from paths import (DEFAULT_IDCOMP_DIR, DEFAULT_THAR_LIST, DEFAULT_DATA_DIR,
+                   MURPHY_THAR_LIST)
 
 
 def parse_args(argv=None):
@@ -43,15 +59,28 @@ def parse_args(argv=None):
                    help="cross-dispersion shift in pixels between the idcomp "
                         "reference and this night; \"auto\" measures it from "
                         "the data (default: %(default)s)")
-    p.add_argument("--frame-for-slice", default="science", metavar="FRAME",
-                   help='frame used to trace the orders: "science" to use the '
-                        'science frames themselves, or a path to a FITS file '
+    p.add_argument("--frame-for-slice", default="auto", metavar="FRAME",
+                   help='frame used to trace the orders: "auto" to stack the '
+                        'science frames with the most signal in the bluest '
+                        'orders, "science" to use all of them, "flat" to use '
+                        'only the flat, or a path to a FITS file '
                         '(default: %(default)s)')
-    p.add_argument("--thar-list", nargs="?", const=DEFAULT_THAR_LIST,
-                   default=None, metavar="CSV",
-                   help="refine the wavelength solution against a ThAr line "
-                        "list; without a value the bundled Lovis & Pepe (2007) "
-                        "list is used (default: disabled)")
+    p.add_argument("--trace-stack", type=int, default=4, metavar="N",
+                   help="how many science frames \"auto\" stacks to trace on; "
+                        "the blue cutoff is set by the best frame, the rest "
+                        "guard against cosmics and a bad pick "
+                        "(default: %(default)s)")
+    # takes a value always, and a comma-separated one for several lists:
+    # an optional-argument form (nargs="?"/"*") is ambiguous against the
+    # positional data_dir, which argparse resolves by eating the directory
+    p.add_argument("--thar-list", default=None, metavar="LIST",
+                   help="refine the wavelength solution against ThAr line "
+                        "lists. Without a value the bundled Lovis & Pepe "
+                        "(2007) and Murphy (2007) lists are merged; Lovis & "
+                        "Pepe ends at 6912 A, so Murphy is what covers the "
+                        'reddest orders. Pass "both" (or "lovis,murphy") for '
+                        'the merge, "lovis", "murphy", or a comma-separated '
+                        "list of paths (default: disabled)")
     p.add_argument("--no-normalize", dest="normalize", action="store_false",
                    help="skip continuum normalisation")
     p.add_argument("--no-fits", dest="save_as_fits", action="store_false",
@@ -62,6 +91,11 @@ def parse_args(argv=None):
                    help="show the merged spectrum for each frame")
     p.add_argument("--debug-plots", dest="DEBUG_PLOTS", action="store_true",
                    help="show diagnostic plots from every reduction step")
+    p.add_argument("--ncpu", type=int, default=1, metavar="N",
+                   help="worker processes to use (default: %(default)s). "
+                        "The default of one keeps the pipeline polite on a "
+                        "shared machine; asking for more workers than you have "
+                        "free cores makes them contend rather than run")
     p.add_argument("-q", "--quiet", dest="verbose", action="store_false",
                    help="less output")
     return p.parse_args(argv)
@@ -76,19 +110,31 @@ def main(argv=None):
         sys.exit("idcomp directory does not exist: %s" % args.idcomp_dir)
 
     frame_for_slice = args.frame_for_slice
-    if frame_for_slice != "science" and not os.path.exists(frame_for_slice):
+    if frame_for_slice not in ("auto", "science", "flat") \
+            and not os.path.exists(frame_for_slice):
         print(frame_for_slice + " does not exist")
         frame_for_slice = None
 
     thar_list = None
     if args.thar_list is not None:
-        if not os.path.exists(args.thar_list):
-            sys.exit("ThAr line list does not exist: %s" % args.thar_list)
-        # cleaned ThAr line list from 2007A&A...468.1115L
-        thar_list = pd.read_csv(args.thar_list)
+        names = {"lovis": DEFAULT_THAR_LIST, "murphy": MURPHY_THAR_LIST}
+        spec = "lovis,murphy" if args.thar_list == "both" else args.thar_list
+        wanted = [w.strip() for w in spec.split(",") if w.strip()]
+        paths = [names.get(w, w) for w in wanted]
+        for p in paths:
+            if not os.path.exists(p):
+                sys.exit("ThAr line list does not exist: %s" % p)
+        thar_list = load_thar_list(*paths)
+        if args.verbose:
+            print("> ThAr lines: %d covering %.0f-%.0f A"
+                  % (len(thar_list), thar_list["wave_air"].min(),
+                     thar_list["wave_air"].max()))
 
+    ncpu = set_ncpu(args.ncpu)
     if args.verbose:
         print("> resampling backend: %s" % BACKEND)
+        print("> using %d worker process%s"
+              % (ncpu, "" if ncpu == 1 else "es"))
 
     idcomp_offset = args.idcomp_offset
     if idcomp_offset != "auto":
@@ -101,6 +147,7 @@ def main(argv=None):
                  fn_science=args.science,
                  idcomp_offset=idcomp_offset,
                  frame_for_slice=frame_for_slice,
+                 trace_stack=args.trace_stack,
                  outdir=args.outdir,
                  normalize=args.normalize,
                  verbose=args.verbose,
@@ -114,6 +161,7 @@ def main(argv=None):
 def reduce_night(dir, idcomp_dir, fn_science=None,
                  idcomp_offset="auto",
                  frame_for_slice=None,
+                 trace_stack=4,
                  outdir="done",
                  verbose=True,
                  normalize=True,
@@ -129,6 +177,10 @@ def reduce_night(dir, idcomp_dir, fn_science=None,
 
     science = []
     scname = []
+    # every science frame of the night, whether or not --science selected it:
+    # the orders are traced on the frames with the most blue signal, and that
+    # is a property of the night, not of the frame being reduced
+    all_science = []
 
     for file in sorted(os.listdir(dir)):
         if file.endswith(".fit"):
@@ -145,10 +197,8 @@ def reduce_night(dir, idcomp_dir, fn_science=None,
             elif ftype == "comp":
                 comps.append(data)
             else:
-                if (fn_science is not None) and (fn_science in file):
-                    science.append(file)
-                    scname.append(ftype.strip().replace(" ", "_"))
-                elif fn_science is None:
+                all_science.append(file)
+                if (fn_science is None) or (fn_science in file):
                     science.append(file)
                     scname.append(ftype.strip().replace(" ", "_"))
 
@@ -158,6 +208,22 @@ def reduce_night(dir, idcomp_dir, fn_science=None,
         sys.exit("no science frames found in %s" % dir)
 
     os.makedirs(outdir, exist_ok=True)
+
+    # Resolve "auto" once: the trace frames describe the night, so choosing
+    # them per science frame would only repeat the same measurement.
+    trace_frames = None
+    if frame_for_slice == "auto":
+        bias_ref = np.median(biases, axis=0) if len(biases) else None
+        trace_frames = select_trace_frames(
+            [os.path.join(dir, sc) for sc in all_science],
+            bias=bias_ref, nstack=trace_stack, verbose=verbose)
+        if not trace_frames:
+            # calibration-only night, or nothing scorable: the flat is the
+            # only thing left to trace on, which is what find_orders uses
+            # when it is handed nothing
+            if verbose:
+                print("- no usable science frame to trace on; using the flat")
+            trace_frames = None
 
     orders = None
     for i in range(len(science)):
@@ -173,8 +239,12 @@ def reduce_night(dir, idcomp_dir, fn_science=None,
            (save_as_ascii and (not os.path.exists(fp_save_ascii))):
             print("> reducing %s (%s)" % (fp, name))
             tstart = time.time()
-            if frame_for_slice == "science":
+            if frame_for_slice == "auto":
+                frame_for_slice_i = trace_frames
+            elif frame_for_slice == "science":
                 frame_for_slice_i = [os.path.join(dir, sc) for sc in science]
+            elif frame_for_slice == "flat":
+                frame_for_slice_i = None
             else:
                 frame_for_slice_i = frame_for_slice
             s = extract_spectrum(os.path.join(dir, fp), flats, comps, biases,
