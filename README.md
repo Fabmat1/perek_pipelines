@@ -71,6 +71,71 @@ identifiable at all.
 Pass `--idcomp-offset <px>` to force a particular shift instead of measuring
 it.
 
+## Which frame the orders are traced on
+
+The orders have to be traced on something before they can be identified, and
+that choice decides how far into the blue the reduction reaches. The flat lamp
+has almost no output there -- on the 2026 detector it peaks near 20 counts in
+the bluest orders against 20000 in the red -- so tracing on the flat alone
+loses them. Science frames have the signal, but only some of them: a red star
+through a long exposure can be the brightest frame of the night and still leave
+the bluest orders invisible.
+
+By default the pipeline measures this instead of guessing. Every science frame
+is scored by how far its bluest orders rise above the noise, the orders are
+traced on a median stack of the best few, and the choice is reported:
+
+```
+- tracing orders on 4 frame(s):
+    bluest: e202608260044.fit    blue    187 sigma, red     43 sigma
+            e202608260036.fit    blue      8 sigma, red     29 sigma
+```
+
+The first frame is the one with the most blue signal and sets the blue cutoff;
+the rest are chosen for the red end, because the bluest-strong frames are hot
+blue stars that are faint in the reddest orders. On the 2026 night this reaches
+3829 A, against 4009 A when tracing on the flat.
+
+Use `--trace-stack N` to change how many frames are stacked, or
+`--frame-for-slice` to override the choice entirely: `flat` for the flat alone,
+`science` for all science frames, or a path to one FITS file. If no science
+frame can be scored -- a calibration-only directory, say -- the pipeline falls
+back to the flat.
+
+## ThAr line lists for the red orders
+
+`--thar-list` refines the wavelength solution against a ThAr atlas after the
+`idcomp` lists have seeded it. The bundled Lovis & Pepe (2007) list stops at
+6912 A, so the reddest orders have nothing to refine against; the Murphy et al.
+(2007) atlas reaches 10506 A. Pass `lovis`, `murphy`, `both`, or a
+comma-separated list of your own files.
+
+What this buys, measured on 20260826 in the orders past 7300 A, is coverage
+across the detector rather than a smaller residual:
+
+```
+                lines/order   fraction of the order extrapolated
+without ThAr        6-12                  5-18%
+with Murphy        25-43                  2-7%
+```
+
+The fit residual goes *up* (0.007 -> 0.15 A in the best case), and so does the
+reported resolution. Neither means the solution got worse: a cubic through
+seven points sits close to those seven points and then extrapolates blind over
+the rest of the order, and R is measured from the widths of whatever lines were
+used, so a sample of six bright narrow ones flatters the instrument. The
+merged spectra from the two settings agree to 0.04-0.05 A in the red, well
+inside one resolution element (0.27 A at 7600 A).
+
+Orders that fail to solve are still dropped rather than guessed at. Seeding
+them from their solved neighbours was tried and removed: the grating relation
+predicts an unsolved order's wavelengths to a few Angstrom, but the order
+spacing at the red end is only ~10 A, so the prediction can be a whole order
+out. Checking the refit against the arc does not settle it either -- a ThAr arc
+has ~150 lines across 2048 pixels, so a wrong-by-one-order solution still puts
+catalogue lines on top of real peaks about as often as the right one does. On
+four test orders that test picked the wrong order twice.
+
 Reduced spectra are written to `done/` as both FITS tables and plain text
 (`wavelength  flux  error  resolution`). See all options with:
 

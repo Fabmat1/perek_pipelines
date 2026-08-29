@@ -7,11 +7,71 @@ from matplotlib import pyplot as plt
 from tools import (Gaussian_res, polynomial, curve_fit_reject, pair_generation,
                    shared_pool, shared, publish_shared)
 from orders import extract_order_for_calib
+from grating import enforce_invariant
 from multiprocessing import Pool, cpu_count
 from tqdm import tqdm
 from scipy.interpolate import interp1d
 
+
 two_log_two = 2 * np.sqrt(2 * np.log(2))
+
+
+def load_thar_list(*paths):
+    """Read one or more ThAr line lists into the DataFrame the fit expects.
+
+    Two formats are understood:
+
+    * the cleaned Lovis & Pepe CSV, which already has a ``wave_air`` column;
+    * the Murphy et al. (2007) atlas, whitespace-separated, whose second
+      column is the air wavelength (its first column is the wavenumber, and
+      1e8/wavenumber recovers the *vacuum* value -- the two differ by the
+      refractive index of air, ~2.8e-4, which is 1.4 A at 5000 A and would
+      quietly bias every wavelength if the wrong column were used).
+
+    Lovis & Pepe ends at 6912 A, so the reddest OES orders have no lines in it
+    at all. Passing both merges them: lines closer than 0.01 A are treated as
+    the same line and only the first list's value is kept.
+
+    Note when comparing runs: adding lines *lowers* the reported resolution,
+    because R is measured from the fitted width of the calibration lines
+    themselves. With six lines an order is calibrated on the few brightest and
+    narrowest features; with twenty-six the sample includes normal-width lines
+    and the median widens. The lower number is the more honest estimate of the
+    instrument, and the fit it comes from is far better constrained.
+    """
+    import pandas as pd
+
+    frames = []
+    for path in paths:
+        if path is None:
+            continue
+        with open(path) as fh:
+            head = fh.readline()
+        if "," in head and "wave_air" in head:
+            frames.append(pd.read_csv(path))
+            continue
+        # Murphy: wavenumber, air wavelength, uncertainty, species, flag
+        arr = np.loadtxt(path, usecols=(0, 1, 2))
+        frames.append(pd.DataFrame({"wave_air": arr[:, 1],
+                                    "wave_vac": 1e8 / arr[:, 0],
+                                    "wave_err": arr[:, 2]}))
+
+    if not frames:
+        return None
+    if len(frames) == 1:
+        return frames[0].sort_values("wave_air").reset_index(drop=True)
+
+    merged = frames[0]
+    for extra in frames[1:]:
+        have = np.sort(merged["wave_air"].to_numpy())
+        w = extra["wave_air"].to_numpy()
+        idx = np.searchsorted(have, w)
+        left = np.abs(w - have[np.clip(idx - 1, 0, len(have) - 1)])
+        right = np.abs(w - have[np.clip(idx, 0, len(have) - 1)])
+        new = np.minimum(left, right) > 0.01
+        merged = pd.concat([merged, extra[new]], ignore_index=True)
+    return merged.sort_values("wave_air").reset_index(drop=True)
+
 
 def parse_idcomp(file_path):
     with open(file_path, 'r') as file:
@@ -52,8 +112,17 @@ def parse_idcomp(file_path):
 
     return aplow, aphigh, np.array(table_data)
 
-def fit_comparison(linetable, comparison, pixel_window=8, DEBUG_PLOTS=False):
+def fit_comparison(linetable, comparison, pixel_window=8, DEBUG_PLOTS=False,
+                   raw=None, saturation=60000.0):
+    """Fit the arc lines of one order.
 
+    `raw` is the same order's arc in counts, before the running-maximum
+    normalisation. It is used only to drop saturated lines: a clipped line has
+    a flat top, so its fitted centre is set by wherever the plateau happens to
+    be brightest rather than by the line, and its width is overestimated. Which
+    lines saturate depends on the lamp and the exposure, not on the line, so
+    this has to be decided per exposure rather than from a fixed list.
+    """
 #    DEBUG_PLOTS = True
 
     line_wls = (linetable[:, 1] + linetable[:, 2]) / 2
@@ -70,11 +139,21 @@ def fit_comparison(linetable, comparison, pixel_window=8, DEBUG_PLOTS=False):
     actual_errors = []
     fwhm_pix = []
 
-    for l in line_px:
+    kept = []
+    for idx, l in enumerate(line_px):
         px_window = np.logical_and(pixels > l - pixel_window,
                                    pixels < l + pixel_window)
         pwin = pixels[px_window]
         intensities = comparison[px_window]
+
+        if raw is not None:
+            seg = np.asarray(raw, dtype=float)[px_window]
+            if seg.size:
+                top = float(np.max(seg))
+                # at the detector ceiling, or flat-topped below it
+                if top >= saturation or \
+                   (top > 0 and np.sum(seg > 0.98 * top) >= 3):
+                    continue
 
         psigma_ini = 3.5 / 2.355
         psigma_min = 1.5 / 2.355
@@ -93,12 +172,20 @@ def fit_comparison(linetable, comparison, pixel_window=8, DEBUG_PLOTS=False):
         actual_positions.append(params[1])
         actual_errors.append(errs[1])
         fwhm_pix.append(params[2]*two_log_two)
+        # skipping a saturated line above would otherwise leave `line_wls`
+        # longer than the fitted arrays, silently pairing every later
+        # measurement with the wrong catalogue wavelength. Keep indices, not
+        # values: two lines can share a pixel position.
+        kept.append(idx)
         if DEBUG_PLOTS:
             plt.plot(pwin, Gaussian_res(pwin, *params), color="red", zorder=20)
 
     actual_positions = np.array(actual_positions)
     actual_errors = np.array(actual_errors)
     fwhm_pix = np.array(fwhm_pix)
+    if raw is not None:
+        line_wls = line_wls[np.array(kept, dtype=int)] if kept \
+            else line_wls[:0]
 
     if DEBUG_PLOTS:
         plt.plot(pixels, comparison, zorder=10)
@@ -160,6 +247,9 @@ def wavelength_to_pixel(wavelengths, params, x, polynomial):
 
 def fit_dispersion(x, y, yerr, thar_list=None, DEBUG_PLOTS=False):
 
+    # sort for the fit and the residual plot, but remember the permutation:
+    # the mask returned below has to line up with the caller's arrays, not with
+    # the sorted copies made here
     isort = np.argsort(x)
     x = x[isort]
     y = y[isort]
@@ -210,9 +300,18 @@ def fit_dispersion(x, y, yerr, thar_list=None, DEBUG_PLOTS=False):
         plt.tight_layout()
         plt.show()
 
+    # `mask_good` indexes the sorted arrays; the caller still holds the
+    # unsorted ones. Undo the permutation so that applying the mask there
+    # keeps the lines the fit actually kept. Without this the clip silently
+    # discards a different set of lines than the one it rejected -- harmless
+    # while the input happens to be sorted by pixel, but the ThAr refinement
+    # appends its predicted lines with `vstack` and so does not.
+    mask_orig = np.zeros_like(mask_good)
+    mask_orig[isort] = mask_good
+
     dout = {"params": params,
             "errs": errs,
-            "mask_good": mask_good,
+            "mask_good": mask_orig,
             "rms": rms}
 
     return dout
@@ -253,6 +352,7 @@ def solve_wavelength(linetable, order,
     for iteration in range(max_iterations):
         # Fit comparison lines
         lfit = fit_comparison(linetable, order.comparison,
+                              raw=getattr(order, "comparison_orig", None),
                               pixel_window=pixel_window,
                               DEBUG_PLOTS=DEBUG_PLOTS)
 
@@ -572,8 +672,7 @@ def find_dispersion(orders, biases, comps,
     # extract arc spectra from image
     if verbose: print("- extracting orders")
     args = [(p[1], orders[p[1]], times_sigma) for p in id_order_pairs]
-    with shared_pool({"biases": biases, "comps": comps},
-                     processes=cpu_count()) as pool:
+    with shared_pool({"biases": biases, "comps": comps}) as pool:
         results = list(tqdm(pool.imap(extract_order_for_calib, args), total=len(args)))
     for idx_order, o in results:
         orders[idx_order] = o
@@ -603,12 +702,21 @@ def find_dispersion(orders, biases, comps,
             results.append(result)
     else:
         # Parallel processing when DEBUG_PLOTS is disabled
-        ncpu = cpu_count()
-        with shared_pool(calib_data, processes=ncpu) as pool:
+        with shared_pool(calib_data) as pool:
             results = list(tqdm(pool.imap(process_dispersion, args), total=len(args)))
 
     for idx_order, o in results:
         orders[idx_order] = o
+
+    # Each order above was fitted in isolation. The spectrograph does not work
+    # that way -- m*lambda is the same for every order to a part in 10^4 -- so
+    # use that to catch and repair any order whose own fit has drifted. The
+    # sparsest orders have thirteen lines against four free parameters and are
+    # the ones this protects.
+    try:
+        enforce_invariant(orders, verbose=verbose)
+    except Exception as exc:
+        warnings.warn("grating-relation check skipped: %s" % exc)
 
     """
     for j, p in enumerate(id_order_pairs):

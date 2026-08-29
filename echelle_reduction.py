@@ -1,4 +1,5 @@
 import os
+import warnings
 from time import time
 import numpy as np
 from numpy.polynomial import legendre
@@ -21,11 +22,12 @@ from astropy.stats import sigma_clip
 
 from estimate_noise import estimate_noise
 from tools import (polyfit_reject, curve_fit_reject, pair_generation,
-                   mask_section, shared_pool, shared,
+                   mask_section, shared_pool, shared, get_ncpu,
                    fill_nan, Gaussian, Gaussian_res)
 from calibrate import find_dispersion
 from identify_orders import (SpectralSlice, find_orders)
 from orders import (SpectralOrder, extract_order)
+from scattered import remove_background
 
 from resample_backend import resample
 from paths import DEFAULT_IDCOMP_DIR, DEFAULT_DATA_DIR
@@ -77,6 +79,34 @@ def get_barycorr(frame):
 def coadd_frames(frames):
     frame = np.sum(frames, axis=0).astype(float) / len(frames)
     return frame
+
+
+def combine_arcs(comps, verbose=False):
+    """Combine the comparison exposures of a night into one arc.
+
+    Two things a plain mean gets wrong here:
+
+    * a cosmic ray on one exposure survives averaging as a sharp, line-shaped
+      artefact, which is exactly what the line fitter is looking for;
+    * the ThAr lamp is still warming up on the first exposure of a set. On
+      20260826 it is 19% fainter than the rest, which then agree to within 5%,
+      so including it dilutes the stack.
+
+    Median-combine instead, and drop the leading exposure when enough others
+    remain. Arcs taken hours apart are still combined: the measured drift
+    across a night is ~0.1 px in both directions, far below a resolution
+    element.
+    """
+    arrays = [np.asarray(open_or_coadd_frame(c), dtype=float) for c in comps] \
+        if isinstance(comps, list) else [np.asarray(comps, dtype=float)]
+
+    if len(arrays) > 3:
+        arrays = arrays[1:]
+    if len(arrays) == 1:
+        return arrays[0]
+    if verbose:
+        print("- combining %d arc exposures (median)" % len(arrays))
+    return np.median(arrays, axis=0)
 
 def open_or_coadd_frame_old(frame):
     if isinstance(frame, np.ndarray):
@@ -136,34 +166,125 @@ def mask_intervals(wl, intervals):
         mask &= ~((wl > lo) & (wl < hi))
     return mask
 
+def _fit_continuum(wl, flx, poly_order):
+    """Polynomial continuum, clipped asymmetrically so lines pull it down less.
+
+    Fitted against wavelength mapped to [-1, 1]: on the raw scale the design
+    matrix is ill-conditioned enough that the fit collapses to zero above
+    cubic. Returns a callable, since the coefficients are meaningless without
+    that mapping.
+    """
+    lo_wl, hi_wl = float(np.min(wl)), float(np.max(wl))
+    span = hi_wl - lo_wl
+    scale = (lambda x: 2 * (np.asarray(x, float) - lo_wl) / span - 1) \
+        if span > 0 else (lambda x: np.zeros_like(np.asarray(x, float)))
+
+    xs = scale(wl)
+    keep = np.ones(len(wl), dtype=bool)
+    for lo, hi in ((3.5, 5), (2.5, 4), (2.0, 3.5), (1.8, 3)):
+        params = np.polyfit(xs[keep], flx[keep], poly_order)
+        ratio = flx / np.polyval(params, xs)
+        keep = ~sigma_clip(ratio, sigma_lower=lo, sigma_upper=hi,
+                           masked=True).mask
+    return lambda x: np.polyval(params, scale(x))
+
+
+def red_edge_keep(wl, flx, width=1.5):
+    """Drop the reddest `width` Angstrom of an order, and any non-finite pixel.
+
+    There the flat holds almost no lamp signal, so dividing by it spikes the
+    flux. A fixed cut rather than one that follows the spike: the flux-based
+    detectors tried here needed constant tuning and still missed edges.
+    """
+    return np.isfinite(flx) & (wl < wl.max() - width)
+
+
 def normalize_single_order(args):
-    """Worker function for multiprocessing"""
-    i, wl, flx, poly_order, ignore_windows, smooth_width, floor_width, DEBUG_PLOTS = args
+    """Worker function for multiprocessing. Returns the continuum too, so the
+    caller can divide the errors by it and keep each pixel's S/N."""
+    (i, wl, flx, poly_order, ignore_windows, smooth_width, floor_width,
+     edge_width, neighbours, runaway_range,
+     extrapolated_out, extrapolate_max, steep_range, max_poly_order,
+     DEBUG_PLOTS) = args
 
+    keep = red_edge_keep(wl, flx, width=edge_width)
+
+    # sigma_clip passes inf through, and one is enough to drag the continuum
+    finite = np.isfinite(flx)
     mask = mask_intervals(wl, ignore_windows)
-    mask2 = ~sigma_clip(flx, sigma_lower=8, sigma_upper=8, masked=True).mask
-    mask = mask & mask2
-    flx_smooth = median_filter(flx[mask], size=smooth_width, mode="nearest")
-    wl_for_interpol = wl[mask]
-    flx_for_interpol = flx_smooth
-    mask2 = np.ones_like(wl_for_interpol).astype(bool)
-    sigmas_lo = [3, 2.5, 2.0, 1.8]
-    sigmas_hi = [5, 4, 3.5, 3]
-    nit = len(sigmas_lo)
+    mask2 = ~sigma_clip(np.where(finite, flx, np.nan),
+                        sigma_lower=8, sigma_upper=8, masked=True).mask
+    mask = mask & mask2 & keep
 
-    for k in range(nit):
-        params, *_ = curve_fit(lambda x, *p: polynomial(x, *p),
-                              wl_for_interpol[mask2],
-                              flx_for_interpol[mask2],
-                              p0=np.ones(poly_order+1))
-        flx_cont = polynomial(wl_for_interpol, *params)
-        ratio = flx_for_interpol / flx_cont
-        mask2 = ~sigma_clip(ratio,
-                            sigma_lower=sigmas_lo[k],
-                            sigma_upper=sigmas_hi[k],
-                            masked=True).mask
+    own_wl = wl[mask]
+    own_flx = median_filter(flx[mask], size=smooth_width, mode="nearest")
 
-    flx_cont = polynomial(wl, *params)
+    # Lower the degree where an order cannot support one. Below ~3900 A the
+    # Balmer wings overlap and there is no continuum between them, so a cubic
+    # has nothing to fit and bends to follow the lines; a straight line at
+    # least stays put. Never raise it -- the extra freedom is spent running
+    # away at the order ends, where the data stops.
+    poly_order = min(poly_order, max_poly_order)
+    dynamic = np.percentile(own_flx, 99) / max(np.percentile(own_flx, 1), 1e-9)
+    if dynamic > steep_range:
+        poly_order = max(1, poly_order - 2)
+
+    trial = _fit_continuum(own_wl, own_flx, poly_order)
+    span = trial(wl)
+    finite = np.isfinite(span) & (span > 0)
+    runaway = (finite.sum() > 0 and
+               span[finite].max() / span[finite].min() > runaway_range)
+
+    wl_fit, flx_fit = [own_wl], [own_flx]
+    for wl_n, flx_n in (neighbours or []) if runaway else []:
+        sel = ((wl_n >= wl.min()) & (wl_n <= wl.max())
+               & np.isfinite(flx_n) & mask_intervals(wl_n, ignore_windows)
+               & red_edge_keep(wl_n, flx_n, width=edge_width))
+        if sel.sum() < 20:
+            continue
+        # match the neighbour's throughput to this order before using it
+        both = mask & (wl >= wl_n[sel].min()) & (wl <= wl_n[sel].max())
+        if both.sum() < 20:
+            continue
+        own = np.median(flx[both])
+        scale = np.median(np.interp(wl[both], wl_n[sel], flx_n[sel])) / own \
+            if own != 0 else 0.0
+        if not np.isfinite(scale) or scale <= 0:
+            continue
+        wl_fit.append(wl_n[sel])
+        flx_fit.append(median_filter(flx_n[sel] / scale, size=smooth_width,
+                                     mode="nearest"))
+
+    wl_for_interpol = np.concatenate(wl_fit)
+    flx_for_interpol = np.concatenate(flx_fit)
+    isort = np.argsort(wl_for_interpol)
+    continuum = _fit_continuum(wl_for_interpol[isort], flx_for_interpol[isort],
+                               poly_order)
+
+    flx_cont = continuum(wl)
+
+    # Outside the fitted range use the tangent: a cubic with no data on one
+    # side invents curvature there (0.61 against 1.04 at 3964 A on 20260826).
+    own_fitted = own_wl
+    for limit, side in ((own_fitted.min(), wl < own_fitted.min()),
+                        (own_fitted.max(), wl > own_fitted.max())):
+        if side.sum() == 0:
+            continue
+        edge_value = float(continuum(limit))
+        step = 1e-3 * max(own_fitted.max() - own_fitted.min(), 1.0)
+        slope = float(continuum(limit + step) - continuum(limit - step)) / (2 * step)
+        # bounded, or a steep slope run far enough drives the continuum to zero
+        span = np.clip(wl[side] - limit, -extrapolate_max, extrapolate_max)
+        flx_cont[side] = np.maximum(edge_value + slope * span,
+                                    0.5 * abs(edge_value))
+
+    # Extrapolated continuum is not measured: still anchors the neighbours'
+    # fits, but a neighbour that did measure those wavelengths supplies them.
+    # Bounded, or a broad line at an order end would drop most of the order.
+    if extrapolated_out:
+        keep = keep & (wl >= own_fitted.min() - extrapolate_max) \
+                    & (wl <= own_fitted.max() + extrapolate_max)
+
     # broad median filter used as a floor under the polynomial continuum. Its
     # width is a fixed fraction of the order, not of however many pixels
     # survived masking above -- otherwise it varies from order to order.
@@ -172,53 +293,110 @@ def normalize_single_order(args):
     flx_cont = np.maximum(flx_cont, flx_smooth)
     normalized_flx = flx / flx_cont
 
-    return i, normalized_flx, (wl, flx, flx_smooth, flx_cont) if DEBUG_PLOTS else None
+    return (i, normalized_flx, flx_cont, keep,
+            (wl, flx, flx_smooth, flx_cont, keep) if DEBUG_PLOTS else None)
 
 def poly_normalization(wls, flxs,
                        poly_order=3,
                        ignore_windows=[(3831.4, 3839.4),
                                        (3883, 3893), (3933-3, 3933+3),
-                                       (3963.5, 3981),
+                                       (3965.5, 3980),
                                        (4090, 4115), (4320, 4355),
                                        (4842, 4888), (6540, 6590),
                                        (6860, 6880),
                                        (6888.1, 6890.5), (6892, 6893.6),
-                                       (7590, 7617), (7622.8, 7625)],
+                                       # the O2 A-band runs to ~7660, not 7617:
+                                       # it is still 0.4 deep at 7627, so the
+                                       # old windows left the trough's red half
+                                       # in the fit and pulled the continuum
+                                       # down into it
+                                       (7590, 7660)],
                        smooth_width=31,
                        floor_width=0.25,
+                       edge_width=1.5,
+                       use_neighbours=True,
+                       runaway_range=3.0,
+                       extrapolated_out=True,
+                       extrapolate_max=8.0,
+                       steep_range=6.0,
+                       max_poly_order=4,
                        DEBUG_PLOTS=False,
                        n_processes=None,
+                       errs=None,
                        show_progress=True):
     """
     Normalize single spectral orders using low-order polynomials with multiprocessing.
 
-    floor_width : fraction of the order length used for the broad median filter
-        that acts as a lower bound on the fitted continuum.
+    An order that cannot constrain its own continuum is fitted together with
+    the overlapping parts of its neighbours, so adjacent continua agree.
+
+    floor_width : fraction of the order used for the median filter that floors
+        the continuum.
+    edge_width : Angstrom cut from each order's red end.
+    runaway_range : bring in the neighbours only when an order's own continuum
+        spans more than this factor across the order.
+    extrapolated_out : keep extrapolated pixels out of the merge.
+    extrapolate_max : how far the tangent runs beyond the fitted range.
+    steep_range : orders whose flux spans more than this get a lower degree --
+        they have no continuum to fit, so less freedom is safer.
+    max_poly_order : hard ceiling on the continuum degree.
+    errs : per-order uncertainties, divided by the same continuum as the flux.
+        Modified in place.
     """
+    # the list is wavelength-sorted, so list neighbours are detector neighbours
+    def near(i):
+        if not use_neighbours:
+            return []
+        return [(np.asarray(wls[j], float), np.asarray(flxs[j], float))
+                for j in (i - 1, i + 1) if 0 <= j < len(wls)]
+
     args_list = [(i, wl, flxs[i], poly_order, ignore_windows, smooth_width,
-                  floor_width, DEBUG_PLOTS)
+                  floor_width, edge_width, near(i), runaway_range,
+                  extrapolated_out, extrapolate_max, steep_range,
+                  max_poly_order, DEBUG_PLOTS)
                  for i, wl in enumerate(wls)]
-    with Pool(n_processes) as pool:
+    # `Pool(None)` asks for one worker per core, which ignores --ncpu and
+    # oversubscribes the machine the flag exists to protect
+    if n_processes is None:
+        n_processes = get_ncpu()
+    with Pool(max(1, int(n_processes))) as pool:
         if show_progress and len(args_list) > 10:
             results = list(tqdm(pool.imap(normalize_single_order, args_list),
                                total=len(args_list)))
         else:
             results = pool.map(normalize_single_order, args_list)
 
-    for i, normalized_flx, debug_data in results:
+    keeps = [None] * len(wls)
+    for i, normalized_flx, flx_cont, keep, debug_data in results:
         flxs[i] = normalized_flx
+        keeps[i] = keep
+        if errs is not None and errs[i] is not None:
+            with np.errstate(divide="ignore", invalid="ignore"):
+                errs[i] = np.divide(errs[i], flx_cont,
+                                    out=np.full_like(np.asarray(errs[i], float),
+                                                     np.inf),
+                                    where=flx_cont != 0)
         if DEBUG_PLOTS and debug_data:
-            wl, flx, flx_smooth, flx_cont = debug_data
-            plt.plot(wl, flx, "k-")
-            plt.plot(wl, flx_smooth, "gray")
-            plt.plot(wl, flx_cont, "r-", lw=2)
+            wl, flx, flx_smooth, flx_cont, keep = debug_data
+            obs, fit = ("black", "red") if i % 2 == 0 else ("gray", "tab:orange")
+            plt.plot(wl, flx, "-", color=obs, lw=1)
+            plt.plot(wl, flx_cont, "-", color=fit, lw=2)
+            if not keep.all():
+                plt.plot(wl[~keep], flx[~keep], "-", color="tab:blue", lw=2)
+            # alternate the label height so neighbours do not overprint
+            plt.annotate(str(i), (np.median(wl), np.nanmedian(flx_cont)),
+                         textcoords="offset points",
+                         xytext=(0, 12 if i % 2 == 0 else -16),
+                         ha="center", fontsize=7, color=fit)
 
     if DEBUG_PLOTS:
-        plt.title("Normalisation")
+        plt.title("Normalisation (blue = rising red edge, dropped)")
+        plt.xlabel("Wavelength  /  Angstrom")
+        plt.ylabel("Flux")
         plt.tight_layout()
         plt.show()
 
-    return flxs
+    return flxs, keeps
 
 def legendre_normalization(wls, flxs,
                            poly_order=3,
@@ -437,7 +615,7 @@ def resample_orders(wave_new, wave, flux, flux_err=None,
         widx_res.append(widx_new)
     """
 
-    ncpu = max(1, min(6, int(cpu_count()/2)))
+    ncpu = get_ncpu()
     wave_res, flux_res, err_res, widx_res = resample_orders_parallel(wave_new, wave, flux,
                                                                      flux_err=flux_err,
                                                                      plot=plot, ncpu=ncpu)
@@ -567,14 +745,23 @@ def align_normalization(wave, flux, DEBUG_PLOTS=False):
 
 def merge_orders(olist: list[SpectralOrder], normalize=True, margin=2, max_wl=8900,
                  resolution=30000, DEBUG_PLOTS=False, verbose=True):
-    wave = [o.wl[margin:-margin] for o in olist if o.wl.min() < max_wl]
-    flux = [o.science[margin:-margin] for o in olist if o.wl.min() < max_wl]
+    keep = [o for o in olist if o.wl.min() < max_wl]
+    wave = [o.wl[margin:-margin] for o in keep]
+    flux = [o.science[margin:-margin] for o in keep]
+    # Photon errors from before normalisation: a real measurement and a blue
+    # edge divided by an almost-empty flat both come out near unity after it.
+    errs = [None if o.science_err is None else o.science_err[margin:-margin]
+            for o in keep]
 
     # sort orders by median wave
     wmed = [np.nanmedian(i) for i in wave]
     isort = np.argsort(wmed)
     wave = [np.asarray(wave[i], dtype=float) for i in isort]
     flux = [np.asarray(flux[i], dtype=float) for i in isort]
+    errs = [None if errs[i] is None else np.asarray(errs[i], dtype=float)
+            for i in isort]
+    if all(e is None for e in errs):
+        errs = None
 
     if DEBUG_PLOTS:
         for w, f in zip(wave, flux):
@@ -586,11 +773,33 @@ def merge_orders(olist: list[SpectralOrder], normalize=True, margin=2, max_wl=89
         plt.show()
 
     if verbose: print("- normalising orders")
+    keeps = None
     if normalize:
-        flux = poly_normalization(wave, flux, DEBUG_PLOTS=DEBUG_PLOTS)
+        flux, keeps = poly_normalization(wave, flux, errs=errs,
+                                         DEBUG_PLOTS=DEBUG_PLOTS)
 #        flux = legendre_normalization(wave, flux, DEBUG_PLOTS=DEBUG_PLOTS)
     else:
+        flux_before = [f.copy() for f in flux]
         flux = align_normalization(wave, flux, DEBUG_PLOTS=DEBUG_PLOTS)
+        if errs is not None:
+            # align_normalization scales each order by a constant; errors must
+            # follow or the weights no longer match
+            for i, (before, after) in enumerate(zip(flux_before, flux)):
+                if errs[i] is None:
+                    continue
+                nz = before != 0
+                scale = np.median(after[nz] / before[nz]) if nz.any() else 1.0
+                errs[i] = errs[i] * abs(scale)
+
+    # never calibrated, so they must not reach the merge
+    if keeps is not None and any(k is not None and not k.all() for k in keeps):
+        ndrop = sum(int((~k).sum()) for k in keeps if k is not None)
+        wave = [w[k] for w, k in zip(wave, keeps)]
+        flux = [f[k] for f, k in zip(flux, keeps)]
+        if errs is not None:
+            errs = [None if e is None else e[k] for e, k in zip(errs, keeps)]
+        if verbose:
+            print("- dropped %d pixels on rising red order edges" % ndrop)
 
     # only to get min and max wavelength
     wave_flat = np.concatenate(wave)
@@ -607,8 +816,11 @@ def merge_orders(olist: list[SpectralOrder], normalize=True, margin=2, max_wl=89
     if verbose: print("- merging orders")
     common_wl = generate_wave_grid(wmin, wmax, resolution=resolution)
     plot_resample = False
-    common_flx, common_err = resample_orders(common_wl, wave, flux, flux_err=None,
-                                 plot=plot_resample)
+    # Measured errors, not `process_order`'s local scatter: that cannot tell an
+    # inflated blue edge from a real measurement.
+    common_flx, common_err = resample_orders(common_wl, wave, flux,
+                                             flux_err=errs,
+                                             plot=plot_resample)
 
     if DEBUG_PLOTS:
         plt.plot(common_wl, common_flx)
@@ -758,6 +970,20 @@ def merge_resolution(wave_merged, orders, dres, npix=45, DEBUG_PLOTS=False):
     return res_merged
 
 
+def _clean_scattered(spectrum, flats, comps, biases, orders, verbose=False):
+    """Take the grating's scattered-light halo off the three lit frames. The
+    bias comes off before measuring and back on after, because
+    `apply_corrections` subtracts it again later."""
+    biases = np.asarray(biases, dtype=float)
+    out = []
+    for frame, label in ((spectrum, "science"), (flats, "flat"),
+                         (comps, "arc")):
+        clean = remove_background(np.asarray(frame, dtype=float) - biases,
+                                  orders, verbose=verbose, label=label)
+        out.append(clean + biases)
+    return out
+
+
 def extract_spectrum(spectrum, flats, comps, biases, idcomp_offset="auto",
                      frame_for_slice=None,
                      normalize=True, idcomp_dir=DEFAULT_IDCOMP_DIR,
@@ -766,13 +992,16 @@ def extract_spectrum(spectrum, flats, comps, biases, idcomp_offset="auto",
                      verbose=False,
                      orders=None,
                      thar_list=None,
+                     remove_scattered=True,
                      DEBUG_PLOTS=False, **kwargs):
 
     radvel, bjd = get_barycorr(spectrum)
 
     spectrum = open_or_coadd_frame(spectrum)
     flats = open_or_coadd_frame(flats)
-    comps = open_or_coadd_frame(comps)
+    # the arc gets its own combine: cosmics and the lamp warm-up matter here
+    # in a way they do not for the flat or bias
+    comps = combine_arcs(comps, verbose=verbose)
     biases = open_or_coadd_frame(biases)
 
     """
@@ -788,7 +1017,15 @@ def extract_spectrum(spectrum, flats, comps, biases, idcomp_offset="auto",
         if frame_for_slice is None:
             frame_for_slice = flats
         else:
-            frame_for_slice = open_or_coadd_frame(frame_for_slice)
+            # median-combine several trace frames rather than averaging them:
+            # a cosmic ray on one frame is a bright, order-shaped artefact that
+            # a mean carries straight into the trace
+            if isinstance(frame_for_slice, list) and len(frame_for_slice) > 2:
+                stack = [np.asarray(open_or_coadd_frame(f), dtype=float)
+                         for f in frame_for_slice]
+                frame_for_slice = np.median(stack, axis=0)
+            else:
+                frame_for_slice = open_or_coadd_frame(frame_for_slice)
             # cast first: raw frames are uint16, and uint16 + uint16 wraps
             # around in numpy instead of promoting, which silently corrupts
             # exactly the bright order cores we are trying to trace
@@ -808,6 +1045,13 @@ def extract_spectrum(spectrum, flats, comps, biases, idcomp_offset="auto",
 #        for o in orders:
 #            o.extract_along_order(spectrum, "science", times_sigma=times_sigma)
 
+        # Must happen here: the halo is measured between the orders, and
+        # extraction collapses those pixels away. Doing it before
+        # find_dispersion keeps the arc consistent with what it calibrates.
+        if remove_scattered:
+            spectrum, flats, comps = _clean_scattered(
+                spectrum, flats, comps, biases, orders, verbose=verbose)
+
         # extract calibration and solve dispersion relations for each identified order
         orders = find_dispersion(orders, biases, comps, idcomp_dir,
                                  idcomp_offset=idcomp_offset,
@@ -817,12 +1061,16 @@ def extract_spectrum(spectrum, flats, comps, biases, idcomp_offset="auto",
 
         # only keep orders that have a wavelength solution
         orders = [o for o in orders if o.wl is not None]
+    elif remove_scattered:
+        # geometry reused from an earlier frame, but this frame's halo is its own
+        spectrum, flats, comps = _clean_scattered(
+            spectrum, flats, comps, biases, orders, verbose=verbose)
 
     if verbose: print("- extracting orders")
     args = [(o, times_sigma) for o in orders]
     frames = {"spectrum": spectrum, "flats": flats,
               "biases": biases, "comps": comps}
-    with shared_pool(frames, processes=cpu_count()) as pool:
+    with shared_pool(frames) as pool:
         results = list(tqdm(pool.imap(extract_order, args), total=len(args)))
         orders = results
 

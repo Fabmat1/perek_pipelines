@@ -1,3 +1,5 @@
+import os
+
 import numpy as np
 from astropy.stats import mad_std
 from multiprocessing import Pool
@@ -16,15 +18,45 @@ from resample_backend import resample
 
 _WORKER_DATA = {}
 
+# How many worker processes the pools may use. One by default: the pipeline
+# opens a pool several times per frame, and asking for every core is a poor
+# default on a shared machine -- more workers than cores makes them contend
+# rather than run, and the pools are opened often enough that the setup cost
+# then dominates. Raise it with --ncpu once you know the machine is yours.
+_NCPU = int(os.environ.get("PEREK_NCPU", "1") or 1)
+
+
+def set_ncpu(n):
+    """Set the worker count for every pool the pipeline opens.
+
+    Also exported to the environment. Workers started with "spawn" -- the
+    default on Windows and macOS -- re-import this module rather than
+    inheriting the parent's memory, so a module-level variable alone would
+    reset to the default inside them.
+    """
+    global _NCPU
+    _NCPU = max(1, int(n))
+    os.environ["PEREK_NCPU"] = str(_NCPU)
+    return _NCPU
+
+
+def get_ncpu():
+    return _NCPU
+
 
 def _init_worker(payload):
     _WORKER_DATA.update(payload)
 
 
 def shared_pool(payload, processes=None):
-    """A Pool whose workers can reach `payload` (a dict) via `shared()`."""
-    return Pool(processes=processes, initializer=_init_worker,
-                initargs=(payload,))
+    """A Pool whose workers can reach `payload` (a dict) via `shared()`.
+
+    `processes` defaults to the value set by `set_ncpu`.
+    """
+    if processes is None:
+        processes = _NCPU
+    return Pool(processes=max(1, int(processes)),
+                initializer=_init_worker, initargs=(payload,))
 
 
 def publish_shared(payload):
@@ -35,9 +67,14 @@ def publish_shared(payload):
     _init_worker(payload)
 
 
-def shared(key):
-    """Read a value published to the workers by `shared_pool`."""
-    return _WORKER_DATA[key]
+def shared(key, default=None):
+    """Read a value published to the workers by `shared_pool`.
+
+    Missing keys give `default` rather than raising, so a worker can ask for an
+    optional payload (the slit tilt, say) without every caller having to
+    publish it.
+    """
+    return _WORKER_DATA.get(key, default)
 
 def polynomial(x, a, b, c, d):
     return a * x ** 3 + b * x ** 2 + c * x + d
@@ -183,12 +220,22 @@ def curve_fit_reject(x, y, function, thres=2, thres_max=None, **kwargs):
             yfit = y
             kwargs_fit = kwargs.copy()
         else:
-            if np.sum(mask) < 3:
-                # too few points survived clipping: keep the previous fit.
-                # (also happens for a near-exact fit, where mad_std == 0)
+            # too few points survived clipping: keep the previous fit.
+            # (also happens for a near-exact fit, where mad_std == 0)
+            # curve_fit needs at least as many points as the function has free
+            # parameters, so count them rather than assuming 3: the cubic used
+            # for the dispersion has 4, and the sparsest red line lists (9
+            # lines before masking) really do clip below that.
+            try:
+                nparam = function.__code__.co_argcount - 1
+            except AttributeError:
+                nparam = 3
+            if np.sum(mask) < max(3, nparam):
                 return params, errs, mask
             else:
-                xfit = x[mask]
+                # index the last axis: `x` is 1D for the usual fits, but a
+                # 2D model is passed its coordinates as (2, npoint)
+                xfit = x[..., mask]
                 yfit = y[mask]
                 for key in kwargs:
                     if type(kwargs[key]) == np.ndarray and \
