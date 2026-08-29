@@ -35,6 +35,49 @@ from paths import DEFAULT_IDCOMP_DIR, DEFAULT_DATA_DIR
 two_log_two = 2 * np.sqrt(2 * np.log(2))
 
 
+def get_detector_noise(frame, default_gain=1.0, default_read_noise=0.0,
+                       verbose=False):
+    """Gain (e-/ADU) and read noise (e-) of the frame, from its header.
+
+    OES writes both: GAIN in e-/ADU and READNOIS in e-, with BUNIT = ADU. They
+    are worth reading rather than assuming, because assuming gets the noise
+    wrong in both directions at once. With GAIN = 2 and READNOIS = 10, the
+    variance of a pixel holding N ADU is N/2 + 25 ADU^2; taking the gain to be
+    1 doubles the photon term, and taking the read noise to be 2 ADU divides
+    the floor by six. The two errors do not cancel -- they pull apart with
+    count rate, so the relative weight of a bright order against a faint one
+    comes out wrong, and those weights now drive the inverse-variance merge.
+
+    Falls back to gain 1 and zero read noise, i.e. plain shot noise on the
+    recorded ADU, if the keywords are missing.
+    """
+    gain, read_noise = default_gain, default_read_noise
+    try:
+        if isinstance(frame, list):
+            frame = frame[0] if frame else None
+        if isinstance(frame, str):
+            with fits.open(frame) as hdul:
+                header = hdul[0].header
+            if "GAIN" in header:
+                gain = float(header["GAIN"])
+            if "READNOIS" in header:
+                read_noise = float(header["READNOIS"])
+    except Exception as exc:
+        warnings.warn("could not read GAIN/READNOIS from the header (%s); "
+                      "falling back to gain %g, read noise %g"
+                      % (exc, default_gain, default_read_noise))
+        return default_gain, default_read_noise
+
+    if not np.isfinite(gain) or gain <= 0:
+        gain = default_gain
+    if not np.isfinite(read_noise) or read_noise < 0:
+        read_noise = default_read_noise
+    if verbose:
+        print("- detector: gain %.2f e-/ADU, read noise %.1f e- (%.1f ADU)"
+              % (gain, read_noise, read_noise / gain))
+    return gain, read_noise
+
+
 def get_barycorr(frame):
     """
     comute:
@@ -181,9 +224,22 @@ def _fit_continuum(wl, flx, poly_order):
 
     xs = scale(wl)
     keep = np.ones(len(wl), dtype=bool)
+    # np.polyfit needs more points than the degree; below that it returns
+    # garbage with a RankWarning rather than raising. A line-crowded order can
+    # clip that far at the tightest threshold, so stop rather than refit on
+    # whatever is left -- the previous iteration's coefficients are still the
+    # best estimate available.
+    # ...and drop the degree instead of failing if the order is that sparse to
+    # begin with, so a callable always comes back.
+    poly_order = max(0, min(poly_order, len(wl) - 2))
+    nmin = poly_order + 2
+    params = np.polyfit(xs, flx, poly_order)
     for lo, hi in ((3.5, 5), (2.5, 4), (2.0, 3.5), (1.8, 3)):
+        if keep.sum() < nmin:
+            break
         params = np.polyfit(xs[keep], flx[keep], poly_order)
-        ratio = flx / np.polyval(params, xs)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            ratio = flx / np.polyval(params, xs)
         keep = ~sigma_clip(ratio, sigma_lower=lo, sigma_upper=hi,
                            masked=True).mask
     return lambda x: np.polyval(params, scale(x))
@@ -278,12 +334,33 @@ def normalize_single_order(args):
         flx_cont[side] = np.maximum(edge_value + slope * span,
                                     0.5 * abs(edge_value))
 
-    # Extrapolated continuum is not measured: still anchors the neighbours'
-    # fits, but a neighbour that did measure those wavelengths supplies them.
-    # Bounded, or a broad line at an order end would drop most of the order.
+    # Where the continuum had to be extrapolated the normalisation is a guess,
+    # so those pixels are dropped -- but *only* where an adjacent order
+    # actually measured the same wavelengths and can supply them instead.
+    #
+    # The bound must not come from `own_fitted` alone. That is the set of
+    # pixels the polynomial was fitted to, which already has `ignore_windows`
+    # removed, so an ignore window sitting on an order's end drags
+    # `own_fitted.max()` inwards by the width of the window and everything
+    # beyond it is discarded. With the O2 A-band window at (7590, 7660) and an
+    # order running to 7630.9 A that deleted 7598-7630.9 outright: 33 A of real
+    # spectrum that the previous version delivered. Past ~5900 A the orders no
+    # longer overlap, so nothing fills the gap and it reaches the output as a
+    # hole. The same list masks H-alpha, H-beta, H-gamma and H-delta, and on
+    # this night the order carrying H-alpha begins only 7.6 A blueward of its
+    # window -- close enough that a small change in order placement would have
+    # silently deleted H-alpha from a Balmer-line spectrum.
     if extrapolated_out:
-        keep = keep & (wl >= own_fitted.min() - extrapolate_max) \
-                    & (wl <= own_fitted.max() + extrapolate_max)
+        extrapolated = (wl < own_fitted.min()) | (wl > own_fitted.max())
+        if extrapolated.any():
+            covered = np.zeros(len(wl), dtype=bool)
+            for wl_n, flx_n in (neighbours or []):
+                good_n = np.isfinite(flx_n)
+                if good_n.sum() < 20:
+                    continue
+                covered |= ((wl >= np.min(wl_n[good_n]))
+                            & (wl <= np.max(wl_n[good_n])))
+            keep = keep & ~(extrapolated & covered)
 
     # broad median filter used as a floor under the polynomial continuum. Its
     # width is a fixed fraction of the order, not of however many pixels
@@ -291,7 +368,15 @@ def normalize_single_order(args):
     floor_size = max(1, int(len(flx) * floor_width))
     flx_smooth = median_filter(flx, size=floor_size, mode="nearest")
     flx_cont = np.maximum(flx_cont, flx_smooth)
-    normalized_flx = flx / flx_cont
+    # A zero or non-finite continuum gives 0/0 -> nan and a RuntimeWarning per
+    # order. The pixel has no usable normalisation either way, so mark it nan
+    # deliberately and let `keep` drop it rather than letting numpy warn.
+    bad_cont = ~np.isfinite(flx_cont) | (flx_cont == 0)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        normalized_flx = np.divide(flx, flx_cont,
+                                   out=np.full_like(flx, np.nan),
+                                   where=~bad_cont)
+    keep = keep & ~bad_cont
 
     return (i, normalized_flx, flx_cont, keep,
             (wl, flx, flx_smooth, flx_cont, keep) if DEBUG_PLOTS else None)
@@ -996,8 +1081,12 @@ def extract_spectrum(spectrum, flats, comps, biases, idcomp_offset="auto",
                      DEBUG_PLOTS=False, **kwargs):
 
     radvel, bjd = get_barycorr(spectrum)
+    gain, read_noise = get_detector_noise(spectrum, verbose=verbose)
 
     spectrum = open_or_coadd_frame(spectrum)
+    # kept as read off the detector: the shot noise belongs to the electrons
+    # that were collected, not to what is left after the halo is subtracted
+    spectrum_raw = np.asarray(spectrum, dtype=float)
     flats = open_or_coadd_frame(flats)
     # the arc gets its own combine: cosmics and the lamp warm-up matter here
     # in a way they do not for the flat or bias
@@ -1069,7 +1158,9 @@ def extract_spectrum(spectrum, flats, comps, biases, idcomp_offset="auto",
     if verbose: print("- extracting orders")
     args = [(o, times_sigma) for o in orders]
     frames = {"spectrum": spectrum, "flats": flats,
-              "biases": biases, "comps": comps}
+              "biases": biases, "comps": comps,
+              "spectrum_raw": spectrum_raw,
+              "gain": gain, "read_noise": read_noise}
     with shared_pool(frames) as pool:
         results = list(tqdm(pool.imap(extract_order, args), total=len(args)))
         orders = results

@@ -50,11 +50,17 @@ def load_thar_list(*paths):
         if "," in head and "wave_air" in head:
             frames.append(pd.read_csv(path))
             continue
-        # Murphy: wavenumber, air wavelength, uncertainty, species, flag
+        # Murphy: wavenumber, air wavelength, uncertainty, species, flag.
+        # The third column is carried through as `wave_err_raw` and is
+        # deliberately *not* called an Angstrom uncertainty: its values run
+        # 1.4-4.5, which is far too large to be Angstroms and is consistent
+        # with either 1e-3 cm^-1 or m/s. Nothing reads it. Check the paper
+        # before using it as a fit weight -- taking it for Angstroms would
+        # weight every line by a number three orders of magnitude too big.
         arr = np.loadtxt(path, usecols=(0, 1, 2))
         frames.append(pd.DataFrame({"wave_air": arr[:, 1],
                                     "wave_vac": 1e8 / arr[:, 0],
-                                    "wave_err": arr[:, 2]}))
+                                    "wave_err_raw": arr[:, 2]}))
 
     if not frames:
         return None

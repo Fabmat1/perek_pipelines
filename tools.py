@@ -2,7 +2,7 @@ import os
 
 import numpy as np
 from astropy.stats import mad_std
-from multiprocessing import Pool
+from multiprocessing import Pool, cpu_count
 from scipy.optimize import curve_fit
 from resample_backend import resample
 
@@ -18,12 +18,28 @@ from resample_backend import resample
 
 _WORKER_DATA = {}
 
-# How many worker processes the pools may use. One by default: the pipeline
-# opens a pool several times per frame, and asking for every core is a poor
-# default on a shared machine -- more workers than cores makes them contend
-# rather than run, and the pools are opened often enough that the setup cost
-# then dominates. Raise it with --ncpu once you know the machine is yours.
-_NCPU = int(os.environ.get("PEREK_NCPU", "1") or 1)
+def _default_ncpu():
+    """Every core, unless PEREK_NCPU says otherwise.
+
+    This is what the pipeline did before the worker count was made
+    configurable, and it is the right default for the machine the reduction
+    normally runs on. `--ncpu` exists to turn it *down* on a shared box; it
+    only takes effect when it is actually passed.
+    """
+    env = os.environ.get("PEREK_NCPU")
+    if env:
+        try:
+            return max(1, int(env))
+        except ValueError:
+            pass
+    try:
+        return max(1, cpu_count())
+    except NotImplementedError:
+        return 1
+
+
+# How many worker processes the pools may use.
+_NCPU = _default_ncpu()
 
 
 def set_ncpu(n):
@@ -67,14 +83,24 @@ def publish_shared(payload):
     _init_worker(payload)
 
 
-def shared(key, default=None):
+_MISSING = object()
+
+
+def shared(key, default=_MISSING):
     """Read a value published to the workers by `shared_pool`.
 
-    Missing keys give `default` rather than raising, so a worker can ask for an
-    optional payload (the slit tilt, say) without every caller having to
-    publish it.
+    A worker can ask for an optional payload by passing `default` explicitly.
+    Without one a missing key raises, because the alternative is a typo'd key
+    silently handing back None and the caller reducing the night without
+    whatever it was asking for.
     """
-    return _WORKER_DATA.get(key, default)
+    value = _WORKER_DATA.get(key, _MISSING)
+    if value is _MISSING:
+        if default is _MISSING:
+            raise KeyError("no %r in the worker payload (published: %s)"
+                           % (key, ", ".join(sorted(_WORKER_DATA)) or "nothing"))
+        return default
+    return value
 
 def polynomial(x, a, b, c, d):
     return a * x ** 3 + b * x ** 2 + c * x + d
