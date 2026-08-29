@@ -273,7 +273,9 @@ class SpectralOrder:
         plt.show()
 
     def apply_corrections(self, med_win_size=25, min_win_size=15, max_win_size=15,
-                          comparison=False, read_noise=2.0, DEBUG_PLOTS=False):
+                          comparison=False, read_noise=2.0,
+                          flat_noise_target=0.02, max_win_flat=601,
+                          DEBUG_PLOTS=False):
 
         DEBUG_PLOTS = False
 
@@ -311,6 +313,20 @@ class SpectralOrder:
             flat_sigma = 1.4826 * np.median(np.abs(resid - np.median(resid)))
             if not np.isfinite(flat_sigma) or flat_sigma <= 0:
                 flat_sigma = 0.0
+
+            # Widen the filter where the lamp is faint. In the bluest orders
+            # the flat holds under a count per pixel, so at the default width
+            # its own noise (35%) exceeds the star's (3-8%) and the division
+            # injects the structure it is meant to remove. The width needed to
+            # get the flat's noise below `flat_noise_target` goes as (S/N)^-2:
+            # ~550 px at 0.7 counts, 43 px by 3.7 counts, the default in the red.
+            level = float(np.median(norm_flat))
+            if flat_sigma > 0 and level > 0:
+                want = (1.253 * flat_sigma / (flat_noise_target * level)) ** 2
+                win = int(np.clip(want, med_win_size, max_win_flat))
+                if win > med_win_size:
+                    norm_flat = median_filter(self.flat, size=win)
+                    flat_sigma /= np.sqrt(win / med_win_size)
             self.flat = norm_flat
 
         if (self.science is not None) and (self.flat is not None):
@@ -319,7 +335,11 @@ class SpectralOrder:
             with np.errstate(divide="ignore", invalid="ignore"):
                 var_sci = np.abs(self.science) + np.abs(self.bias) + read_noise ** 2
                 var_flat = np.full_like(norm_flat, flat_sigma ** 2)
-                ratio = self.science / norm_flat
+                # a zero in the flat gives 0/0 -> nan, which `fill_nan` would
+                # later interpolate over as if it were data
+                ratio = np.divide(self.science, norm_flat,
+                                  out=np.full_like(norm_flat, np.inf),
+                                  where=norm_flat != 0)
                 rel = np.sqrt(
                     np.divide(var_sci, np.square(self.science),
                               out=np.full_like(var_sci, np.inf),

@@ -167,16 +167,26 @@ def mask_intervals(wl, intervals):
     return mask
 
 def _fit_continuum(wl, flx, poly_order):
-    """Polynomial continuum, clipped asymmetrically so lines pull it down less."""
+    """Polynomial continuum, clipped asymmetrically so lines pull it down less.
+
+    Fitted against wavelength mapped to [-1, 1]: on the raw scale the design
+    matrix is ill-conditioned enough that the fit collapses to zero above
+    cubic. Returns a callable, since the coefficients are meaningless without
+    that mapping.
+    """
+    lo_wl, hi_wl = float(np.min(wl)), float(np.max(wl))
+    span = hi_wl - lo_wl
+    scale = (lambda x: 2 * (np.asarray(x, float) - lo_wl) / span - 1) \
+        if span > 0 else (lambda x: np.zeros_like(np.asarray(x, float)))
+
+    xs = scale(wl)
     keep = np.ones(len(wl), dtype=bool)
     for lo, hi in ((3.5, 5), (2.5, 4), (2.0, 3.5), (1.8, 3)):
-        params, *_ = curve_fit(lambda x, *p: polynomial(x, *p),
-                               wl[keep], flx[keep],
-                               p0=np.ones(poly_order + 1))
-        ratio = flx / polynomial(wl, *params)
+        params = np.polyfit(xs[keep], flx[keep], poly_order)
+        ratio = flx / np.polyval(params, xs)
         keep = ~sigma_clip(ratio, sigma_lower=lo, sigma_upper=hi,
                            masked=True).mask
-    return params
+    return lambda x: np.polyval(params, scale(x))
 
 
 def red_edge_keep(wl, flx, width=1.5):
@@ -194,7 +204,8 @@ def normalize_single_order(args):
     caller can divide the errors by it and keep each pixel's S/N."""
     (i, wl, flx, poly_order, ignore_windows, smooth_width, floor_width,
      edge_width, neighbours, runaway_range,
-     extrapolated_out, extrapolate_max, DEBUG_PLOTS) = args
+     extrapolated_out, extrapolate_max, steep_range, max_poly_order,
+     DEBUG_PLOTS) = args
 
     keep = red_edge_keep(wl, flx, width=edge_width)
 
@@ -208,10 +219,18 @@ def normalize_single_order(args):
     own_wl = wl[mask]
     own_flx = median_filter(flx[mask], size=smooth_width, mode="nearest")
 
-    # Only orders whose own fit runs away need a neighbour to anchor them;
-    # for the rest it would just add the neighbour's noise.
+    # Lower the degree where an order cannot support one. Below ~3900 A the
+    # Balmer wings overlap and there is no continuum between them, so a cubic
+    # has nothing to fit and bends to follow the lines; a straight line at
+    # least stays put. Never raise it -- the extra freedom is spent running
+    # away at the order ends, where the data stops.
+    poly_order = min(poly_order, max_poly_order)
+    dynamic = np.percentile(own_flx, 99) / max(np.percentile(own_flx, 1), 1e-9)
+    if dynamic > steep_range:
+        poly_order = max(1, poly_order - 2)
+
     trial = _fit_continuum(own_wl, own_flx, poly_order)
-    span = polynomial(wl, *trial)
+    span = trial(wl)
     finite = np.isfinite(span) & (span > 0)
     runaway = (finite.sum() > 0 and
                span[finite].max() / span[finite].min() > runaway_range)
@@ -239,10 +258,10 @@ def normalize_single_order(args):
     wl_for_interpol = np.concatenate(wl_fit)
     flx_for_interpol = np.concatenate(flx_fit)
     isort = np.argsort(wl_for_interpol)
-    params = _fit_continuum(wl_for_interpol[isort], flx_for_interpol[isort],
-                            poly_order)
+    continuum = _fit_continuum(wl_for_interpol[isort], flx_for_interpol[isort],
+                               poly_order)
 
-    flx_cont = polynomial(wl, *params)
+    flx_cont = continuum(wl)
 
     # Outside the fitted range use the tangent: a cubic with no data on one
     # side invents curvature there (0.61 against 1.04 at 3964 A on 20260826).
@@ -251,8 +270,9 @@ def normalize_single_order(args):
                         (own_fitted.max(), wl > own_fitted.max())):
         if side.sum() == 0:
             continue
-        edge_value = polynomial(limit, *params)
-        slope = np.polyval(np.polyder(np.asarray(params)), limit)
+        edge_value = float(continuum(limit))
+        step = 1e-3 * max(own_fitted.max() - own_fitted.min(), 1.0)
+        slope = float(continuum(limit + step) - continuum(limit - step)) / (2 * step)
         # bounded, or a steep slope run far enough drives the continuum to zero
         span = np.clip(wl[side] - limit, -extrapolate_max, extrapolate_max)
         flx_cont[side] = np.maximum(edge_value + slope * span,
@@ -280,7 +300,7 @@ def poly_normalization(wls, flxs,
                        poly_order=3,
                        ignore_windows=[(3831.4, 3839.4),
                                        (3883, 3893), (3933-3, 3933+3),
-                                       (3963.5, 3981),
+                                       (3965.5, 3980),
                                        (4090, 4115), (4320, 4355),
                                        (4842, 4888), (6540, 6590),
                                        (6860, 6880),
@@ -298,6 +318,8 @@ def poly_normalization(wls, flxs,
                        runaway_range=3.0,
                        extrapolated_out=True,
                        extrapolate_max=8.0,
+                       steep_range=6.0,
+                       max_poly_order=4,
                        DEBUG_PLOTS=False,
                        n_processes=None,
                        errs=None,
@@ -315,6 +337,9 @@ def poly_normalization(wls, flxs,
         spans more than this factor across the order.
     extrapolated_out : keep extrapolated pixels out of the merge.
     extrapolate_max : how far the tangent runs beyond the fitted range.
+    steep_range : orders whose flux spans more than this get a lower degree --
+        they have no continuum to fit, so less freedom is safer.
+    max_poly_order : hard ceiling on the continuum degree.
     errs : per-order uncertainties, divided by the same continuum as the flux.
         Modified in place.
     """
@@ -327,7 +352,8 @@ def poly_normalization(wls, flxs,
 
     args_list = [(i, wl, flxs[i], poly_order, ignore_windows, smooth_width,
                   floor_width, edge_width, near(i), runaway_range,
-                  extrapolated_out, extrapolate_max, DEBUG_PLOTS)
+                  extrapolated_out, extrapolate_max, steep_range,
+                  max_poly_order, DEBUG_PLOTS)
                  for i, wl in enumerate(wls)]
     # `Pool(None)` asks for one worker per core, which ignores --ncpu and
     # oversubscribes the machine the flag exists to protect
