@@ -114,8 +114,10 @@ their depths are unreliable below a few tens of counts.
 `--thar-list` refines the wavelength solution against a ThAr atlas after the
 `idcomp` lists have seeded it. The bundled Lovis & Pepe (2007) list stops at
 6912 A, so the reddest orders have nothing to refine against; the Murphy et al.
-(2007) atlas reaches 10506 A. Pass `lovis`, `murphy`, `both`, or a
-comma-separated list of your own files.
+(2007) atlas reaches 10506 A. It always takes a value -- `lovis`, `murphy`,
+`both`, or a comma-separated list of your own files -- because an optional
+argument would be ambiguous against the positional data directory. Without the
+flag the refinement is off.
 
 What this buys, measured on 20260826 in the orders past 7300 A, is coverage
 across the detector rather than a smaller residual:
@@ -172,3 +174,34 @@ uv run python -m numpy.f2py -c -m pyresample_spectres resample_spectres.f90
 
 It is picked up automatically once built. Both backends produce the same
 results. `template.py` reports which one is in use.
+
+## Worker processes
+
+Every pool uses one worker per core. `--ncpu N` turns that down, which is worth
+doing on a shared machine; it has no effect unless you pass it. `PEREK_NCPU`
+does the same through the environment.
+
+## Uncertainties
+
+The pipeline propagates photon noise from the raw frame, reading `GAIN`
+(e-/ADU) and `READNOIS` (e-) out of the frame header rather than assuming
+them, and combines the aperture pixels with the square of the extraction
+weights -- the extracted value is a weighted mean, not a sum. The scattered
+light is counted before it is subtracted, because its shot noise stays in the
+spectrum after the halo has gone.
+
+On a bright star the result is not what sets the error bars. The science is
+divided by a *median-filtered* flat, so whatever structure the flat has on
+scales shorter than the filter is never corrected, and that residual dominates
+the photon term about thirty to one. Measured against the scatter of a
+line-free continuum on alp Cyg the whole budget still comes out roughly a
+factor two small, so the relative weighting is sound but the absolute scale
+wants calibrating on a clean-continuum star before it is quoted.
+
+## Tests
+
+```
+python tests/test_pipeline.py     # or: pytest tests/
+```
+
+Synthetic only -- no frames are read -- so it runs in under a second.

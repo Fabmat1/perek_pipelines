@@ -65,6 +65,10 @@ class SpectralOrder:
         # Photon noise, from the counts as extracted -- before normalisation
         # rescales everything to order unity.
         self.science_err = None
+        # Variance of the extracted science spectrum in ADU^2, filled in by
+        # `extract_variance_along_order` from the raw frame and the detector
+        # gain and read noise.
+        self.science_var = None
 
         self.wl = None
         self.pix = None
@@ -180,13 +184,23 @@ class SpectralOrder:
         if self.pixel_mask_good is not None:
             self.pixel_mask_good = np.array(list(self.pixel_mask_good))
 
-    def extract_along_order(self, image, type, times_sigma=2):
+    def aperture(self, ny, nx, times_sigma=2):
+        """Pixel indices and weights of the extraction aperture.
+
+        Returns ``(columns, y_pixels, weights)``: one row per detector column,
+        the cross-dispersion pixel indices in that column, and the weight each
+        carries. The weights are normalised to sum to 1 per column, so the
+        extracted value is a weighted *mean* over the aperture, not a sum --
+        which is what the variance propagation has to account for.
+
+        Split out of `extract_along_order` so that the flux and its variance
+        are guaranteed to use the same aperture.
+        """
         if self.solution is None:
             raise Exception("Generate a solution first!")
         if self.w_fcn is None:
             self.generate_width_fcn()
 
-        ny, nx = image.shape
         columns = np.arange(nx)
 
         sigma = self.w_fcn(columns) / two_log_two
@@ -217,11 +231,55 @@ class SpectralOrder:
         # compute proper Gaussian-integrated weights
         weights = gaussian_pixel_weights_2d(y_pixels, y_ind[:, None],
                                             sigma[:, None], in_aperture)
+        return columns, y_pixels, weights
+
+    def extract_along_order(self, image, type, times_sigma=2):
+        ny, nx = image.shape
+        columns, y_pixels, weights = self.aperture(ny, nx,
+                                                   times_sigma=times_sigma)
 
         col = image[np.clip(y_pixels, 0, ny - 1), columns[:, None]].astype(float)
 
         intensities = np.einsum("ij,ij->i", col, weights)
         self._store(type, intensities)
+
+    def extract_variance_along_order(self, raw, bias, gain, read_noise,
+                                     times_sigma=2):
+        """Variance of the extracted science spectrum, in ADU^2 per pixel.
+
+        `raw` is the science frame as read off the detector -- before the bias
+        and before the scattered-light halo are taken off. Both matter: the
+        shot noise is set by every electron that was actually collected, so
+        subtracting the halo removes signal but not the noise it brought with
+        it, and in the bluest orders the halo is comparable to the star.
+
+        Per detector pixel, in ADU,
+
+            var = (raw - bias) / gain + (read_noise / gain)^2
+
+        with `gain` in e-/ADU and `read_noise` in e-. The pixels are then
+        combined with the square of the extraction weights, because the
+        extracted value is a weighted mean: var(sum w*c) = sum w^2 * var(c).
+        For the OES aperture sum(w^2) is about 0.1, so treating the extracted
+        value as a single pixel count overstates the noise threefold.
+
+        The bias frame's own noise is neglected: it is a coadd of ten or more
+        zero exposures, so it contributes read_noise/sqrt(N) before the same
+        sum(w^2) suppression.
+        """
+        raw = np.asarray(raw, dtype=float)
+        bias = np.asarray(bias, dtype=float)
+        ny, nx = raw.shape
+        columns, y_pixels, weights = self.aperture(ny, nx,
+                                                   times_sigma=times_sigma)
+
+        yc = np.clip(y_pixels, 0, ny - 1)
+        counts = raw[yc, columns[:, None]] - bias[yc, columns[:, None]]
+        # a pixel that reads below bias collected no photons; its variance is
+        # the read noise alone rather than something negative
+        var_pix = np.maximum(counts, 0.0) / gain + (read_noise / gain) ** 2
+        self.science_var = np.einsum("ij,ij->i", var_pix, np.square(weights))
+        return self.science_var
 
     def _store(self, type, intensities):
         """File an extracted 1D spectrum under the frame type it came from."""
@@ -273,9 +331,13 @@ class SpectralOrder:
         plt.show()
 
     def apply_corrections(self, med_win_size=25, min_win_size=15, max_win_size=15,
-                          comparison=False, read_noise=2.0,
+                          comparison=False, gain=1.0, read_noise=0.0,
                           flat_noise_target=0.02, max_win_flat=601,
                           DEBUG_PLOTS=False):
+        """`gain` in e-/ADU and `read_noise` in e- are only used by the
+        fallback in the science-error branch; the real propagation happens in
+        `extract_variance_along_order`, which sees the raw frame. Both should
+        come from the frame header (GAIN, READNOIS), not from a default."""
 
         DEBUG_PLOTS = False
 
@@ -333,7 +395,29 @@ class SpectralOrder:
             # The flat is the divisor, so where it holds few counts the
             # quotient is poorly determined however bright the star is.
             with np.errstate(divide="ignore", invalid="ignore"):
-                var_sci = np.abs(self.science) + np.abs(self.bias) + read_noise ** 2
+                if self.science_var is not None:
+                    var_sci = np.asarray(self.science_var, dtype=float)
+                else:
+                    # No raw frame was handed to `extract_variance_along_order`
+                    # (calibration-only paths, or a caller that predates it).
+                    # Fall back to shot noise on the extracted counts, which is
+                    # the right shape even if the scale is approximate.
+                    var_sci = np.abs(self.science) / gain \
+                        + (read_noise / gain) ** 2
+                # Not the noise of the divisor. The science is divided by the
+                # *median-filtered* flat, so the flat's structure on scales
+                # shorter than the filter is never corrected and stays in the
+                # spectrum: `flat_sigma` is the size of what is left behind,
+                # and that is what this term carries. (Read as divisor noise it
+                # would be too big by sqrt(med_win_size) -- the median of 25
+                # pixels is far better determined than one pixel.)
+                #
+                # On a bright star this dominates the science shot noise about
+                # thirty to one, so the error bars are set by the flat, not by
+                # photon statistics. Measured against the scatter of a
+                # line-free continuum on alp Cyg the total still comes out
+                # about 2x small, so treat the absolute scale as provisional;
+                # it wants calibrating on a clean-continuum star.
                 var_flat = np.full_like(norm_flat, flat_sigma ** 2)
                 # a zero in the flat gives 0/0 -> nan, which `fill_nan` would
                 # later interpolate over as if it were data
@@ -378,11 +462,20 @@ def extract_order(o_args):
     o, times_sigma = o_args
     spectrum, flats = shared("spectrum"), shared("flats")
     biases, comps = shared("biases"), shared("comps")
+    gain = shared("gain", 1.0)
+    read_noise = shared("read_noise", 0.0)
     o.extract_along_order(spectrum, "science", times_sigma=times_sigma)
     o.extract_along_order(flats, "flat", times_sigma=times_sigma)
     o.extract_along_order(biases, "bias", times_sigma=times_sigma)
     o.extract_along_order(comps, "comp", times_sigma=times_sigma)
-    o.apply_corrections(comparison=True, DEBUG_PLOTS=False)
+    # from the frame as read off the detector, so that the shot noise of the
+    # scattered light that was subtracted out is still counted
+    raw = shared("spectrum_raw", None)
+    if raw is not None:
+        o.extract_variance_along_order(raw, biases, gain, read_noise,
+                                       times_sigma=times_sigma)
+    o.apply_corrections(comparison=True, gain=gain, read_noise=read_noise,
+                        DEBUG_PLOTS=False)
     # o.plot_frame_1d("science")
     # o.plot_frame_1d("flat")
     # o.plot_frame_1d("bias")

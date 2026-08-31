@@ -284,8 +284,130 @@ def process_slice(args):
     slice = slice_analysis(pixel, slice_x, slice_y, DEBUG_PLOTS=debug_slice)
     return slice
 
-def blue_order_signal(frame, bias=None, row_lo=770, row_hi=800,
-                      col_lo=900, col_hi=1150, noise_lo=100, noise_hi=600):
+# Fallback cross-dispersion windows, in rows, for the detector this pipeline
+# was developed on. They are only used when the layout cannot be measured from
+# the frames themselves; see `trace_windows`.
+FALLBACK_WINDOWS = {"blue": (770, 800), "red": (1620, 1670),
+                    "noise": (100, 600), "cols": (900, 1150)}
+
+
+def column_profile(frame, bias=None, cols=None, col_frac=0.12):
+    """Cross-dispersion profile of one frame, background removed.
+
+    Averaged over a slice of columns near the middle of the dispersion axis --
+    wide enough to beat the noise down, narrow enough that the orders have not
+    curved appreciably across it.
+    """
+    frame = np.asarray(frame, dtype=float)
+    if bias is not None:
+        frame = frame - np.asarray(bias, dtype=float)
+    ny, nx = frame.shape
+    if cols is None:
+        half = max(1, int(0.5 * col_frac * nx))
+        cols = (max(0, nx // 2 - half), min(nx, nx // 2 + half))
+    profile = frame[:, cols[0]:cols[1]].mean(axis=1)
+    return profile - minimum_filter(profile, MIN_WINDOW_DEFAULT)
+
+
+def trace_windows(profiles, flat_profile=None, verbose=False):
+    """Where on the detector to measure blue signal, red signal and noise.
+
+    Measured from the data rather than assumed. The previous version hard-coded
+    the rows of one detector (blue at 770-800, red at 1620-1670, noise at
+    100-600), which is silently wrong on any other chip, binning or readout
+    window -- and this runs on the default trace path, so a mismatch would
+    quietly degrade every frame ranking rather than fail.
+
+    `profiles` are the per-frame cross-dispersion profiles; their elementwise
+    maximum shows every order that any frame caught, including the bluest ones
+    no single frame may have. `flat_profile` orients the result: the flat lamp
+    falls away towards the blue, so the faint end of the order block is the
+    blue end. Without it the windows are still returned, oriented by the
+    fallback's convention (blue at low row numbers).
+
+    Falls back to `FALLBACK_WINDOWS` if the orders cannot be located.
+    """
+    if not profiles:
+        return dict(FALLBACK_WINDOWS), False
+    ref = np.max(np.vstack(profiles), axis=0)
+    ny = len(ref)
+
+    # Rows carrying an order, against the scatter of the empty ones. The MAD
+    # can be exactly zero here and still be a perfectly good profile:
+    # `column_profile` subtracts a running minimum, so a clean stretch between
+    # orders comes out flat at zero. Fall back to a fraction of the profile's
+    # own dynamic range in that case rather than giving up on the measurement.
+    med = np.median(ref)
+    mad = 1.4826 * np.median(np.abs(ref - med))
+    peak = float(np.max(ref) - med)
+    if not np.isfinite(peak) or peak <= 0:
+        return dict(FALLBACK_WINDOWS), False
+    if np.isfinite(mad) and mad > 0:
+        threshold = 5 * mad
+    else:
+        threshold = 0.01 * peak
+    lit = np.where(ref - med > threshold)[0]
+    if len(lit) < 20:
+        return dict(FALLBACK_WINDOWS), False
+
+    # robust extent, so one hot pixel outside the orders cannot stretch it
+    lo = int(np.percentile(lit, 0.5))
+    hi = int(np.percentile(lit, 99.5))
+    span = hi - lo
+    if span < 50:
+        return dict(FALLBACK_WINDOWS), False
+
+    # width of an end window: a couple of order spacings
+    width = int(max(20, round(0.035 * span)))
+    end_a = (lo, min(hi, lo + width))
+    end_b = (max(lo, hi - width), hi)
+
+    # the flat is bright in the red and dark in the blue, so the end where it
+    # holds less light is the blue one
+    blue, red = end_a, end_b
+    if flat_profile is not None and len(flat_profile) == ny:
+        fa = float(np.median(flat_profile[end_a[0]:end_a[1]]))
+        fb = float(np.median(flat_profile[end_b[0]:end_b[1]]))
+        if np.isfinite(fa) and np.isfinite(fb) and fa > fb:
+            blue, red = end_b, end_a
+
+    # noise from the largest order-free block, above or below the orders
+    below, above = lo, ny - hi
+    if max(below, above) < 50:
+        return dict(FALLBACK_WINDOWS), False
+    if below >= above:
+        noise = (int(0.15 * below), int(0.85 * below))
+    else:
+        noise = (int(hi + 0.15 * above), int(hi + 0.85 * above))
+
+    if verbose:
+        print("- order block spans rows %d-%d; blue %d-%d, red %d-%d, "
+              "noise %d-%d" % (lo, hi, blue[0], blue[1], red[0], red[1],
+                               noise[0], noise[1]))
+    return {"blue": blue, "red": red, "noise": noise, "cols": None}, True
+
+
+def window_signal(profile, rows, noise_rows):
+    """Peak of `profile` in `rows`, in units of its scatter in `noise_rows`.
+
+    Frames that cannot be scored (wrong shape, no signal) get -inf so they sort
+    last rather than raising.
+    """
+    ny = len(profile)
+    if rows[1] > ny or noise_rows[1] > ny or rows[0] >= rows[1] \
+            or noise_rows[0] >= noise_rows[1]:
+        return -np.inf
+    noise = np.std(profile[noise_rows[0]:noise_rows[1]])
+    if not np.isfinite(noise) or noise <= 0:
+        return -np.inf
+    peak = np.max(profile[rows[0]:rows[1]])
+    if not np.isfinite(peak):
+        return -np.inf
+    return float(peak / noise)
+
+
+def blue_order_signal(frame, bias=None, row_lo=None, row_hi=None,
+                      col_lo=None, col_hi=None, noise_lo=None, noise_hi=None):
     """How well the bluest orders stand out in one frame, in units of noise.
 
     The bluest orders are the first to be lost when tracing, because the flat
@@ -295,31 +417,25 @@ def blue_order_signal(frame, bias=None, row_lo=770, row_hi=800,
     reaches, and optical brightness is a poor guide -- a red star with a long
     exposure can be brighter overall and still leave the blue orders invisible.
 
-    The score is the peak of the cross-dispersion profile in `row_lo:row_hi`,
-    after removing the local background the same way `slice_analysis` does,
-    divided by the noise measured in an empty part of the same profile. Frames
-    that cannot be scored (wrong shape, no signal) get -inf so they sort last
-    rather than raising.
+    Kept for one-off use on a single frame; `select_trace_frames` measures the
+    windows from the whole set instead of relying on these defaults.
     """
+    w = FALLBACK_WINDOWS
+    rows = (w["blue"][0] if row_lo is None else row_lo,
+            w["blue"][1] if row_hi is None else row_hi)
+    noise_rows = (w["noise"][0] if noise_lo is None else noise_lo,
+                  w["noise"][1] if noise_hi is None else noise_hi)
+    cols = (w["cols"][0] if col_lo is None else col_lo,
+            w["cols"][1] if col_hi is None else col_hi)
     frame = np.asarray(frame, dtype=float)
-    if bias is not None:
-        frame = frame - np.asarray(bias, dtype=float)
-    ny, nx = frame.shape
-    if row_hi > ny or col_hi > nx or noise_hi > ny:
+    if frame.ndim != 2 or cols[1] > frame.shape[1]:
         return -np.inf
-
-    profile = frame[:, col_lo:col_hi].mean(axis=1)
-    profile = profile - minimum_filter(profile, MIN_WINDOW_DEFAULT)
-    noise = np.std(profile[noise_lo:noise_hi])
-    if not np.isfinite(noise) or noise <= 0:
-        return -np.inf
-    peak = np.max(profile[row_lo:row_hi])
-    if not np.isfinite(peak):
-        return -np.inf
-    return float(peak / noise)
+    return window_signal(column_profile(frame, bias=bias, cols=cols),
+                         rows, noise_rows)
 
 
-def select_trace_frames(frames, bias=None, nstack=4, verbose=False):
+def select_trace_frames(frames, bias=None, nstack=4, verbose=False,
+                        flat=None):
     """Pick the frames to trace the orders on.
 
     Ranking purely on blue signal picks hot blue stars, and those are faint in
@@ -329,10 +445,15 @@ def select_trace_frames(frames, bias=None, nstack=4, verbose=False):
     into the blue the reduction reaches -- and then fill the stack with the
     frames that best cover the red end.
 
+    Each frame is read once and reduced to a cross-dispersion profile; the
+    windows the scores are measured in come from those profiles rather than
+    from hard-coded rows, so the ranking survives a change of detector,
+    binning or readout window. `flat` orients blue against red.
+
     Returns up to `nstack` frames, or an empty list if none can be scored;
     callers fall back to the flat, which is what the pipeline did before.
     """
-    scored = []
+    profiles, kept = [], []
     for f in frames:
         arr = f
         if isinstance(f, str):
@@ -341,8 +462,37 @@ def select_trace_frames(frames, bias=None, nstack=4, verbose=False):
                     arr = np.asarray(hdul[0].data)
             except Exception:
                 continue
-        blue = blue_order_signal(arr, bias=bias)
-        red = blue_order_signal(arr, bias=bias, row_lo=1620, row_hi=1670)
+        arr = np.asarray(arr)
+        if arr.ndim != 2:
+            continue
+        try:
+            profiles.append(column_profile(arr, bias=bias))
+        except Exception:
+            continue
+        kept.append(f)
+
+    if not profiles:
+        if verbose:
+            print("- no frame could be scored; tracing on the flat")
+        return []
+
+    flat_profile = None
+    if flat is not None:
+        try:
+            flat_profile = column_profile(flat, bias=bias)
+        except Exception:
+            flat_profile = None
+
+    win, measured = trace_windows(profiles, flat_profile=flat_profile,
+                                  verbose=verbose)
+    if verbose and not measured:
+        print("- could not locate the orders; using the built-in "
+              "cross-dispersion windows")
+
+    scored = []
+    for prof, f in zip(profiles, kept):
+        blue = window_signal(prof, win["blue"], win["noise"])
+        red = window_signal(prof, win["red"], win["noise"])
         if np.isfinite(blue):
             scored.append((blue, red, f))
 

@@ -35,7 +35,7 @@ from echelle_reduction import extract_spectrum
 from identify_orders import select_trace_frames
 from resample_backend import BACKEND
 from calibrate import load_thar_list
-from tools import set_ncpu
+from tools import set_ncpu, get_ncpu
 from paths import (DEFAULT_IDCOMP_DIR, DEFAULT_THAR_LIST, DEFAULT_DATA_DIR,
                    MURPHY_THAR_LIST)
 
@@ -74,13 +74,12 @@ def parse_args(argv=None):
     # an optional-argument form (nargs="?"/"*") is ambiguous against the
     # positional data_dir, which argparse resolves by eating the directory
     p.add_argument("--thar-list", default=None, metavar="LIST",
-                   help="refine the wavelength solution against ThAr line "
-                        "lists. Without a value the bundled Lovis & Pepe "
-                        "(2007) and Murphy (2007) lists are merged; Lovis & "
-                        "Pepe ends at 6912 A, so Murphy is what covers the "
-                        'reddest orders. Pass "both" (or "lovis,murphy") for '
-                        'the merge, "lovis", "murphy", or a comma-separated '
-                        "list of paths (default: disabled)")
+                   help='refine the wavelength solution against ThAr line '
+                        'lists. Requires a value: "both" (or "lovis,murphy") '
+                        'to merge the two bundled lists, "lovis", "murphy", '
+                        'or a comma-separated list of paths. Lovis & Pepe '
+                        '(2007) ends at 6912 A, so Murphy (2007) is what '
+                        'covers the reddest orders (default: disabled)')
     p.add_argument("--no-normalize", dest="normalize", action="store_false",
                    help="skip continuum normalisation")
     p.add_argument("--no-scattered", dest="remove_scattered",
@@ -97,11 +96,11 @@ def parse_args(argv=None):
                    help="show the merged spectrum for each frame")
     p.add_argument("--debug-plots", dest="DEBUG_PLOTS", action="store_true",
                    help="show diagnostic plots from every reduction step")
-    p.add_argument("--ncpu", type=int, default=1, metavar="N",
-                   help="worker processes to use (default: %(default)s). "
-                        "The default of one keeps the pipeline polite on a "
-                        "shared machine; asking for more workers than you have "
-                        "free cores makes them contend rather than run")
+    p.add_argument("--ncpu", type=int, default=None, metavar="N",
+                   help="worker processes to use (default: every core). Pass "
+                        "this to turn the worker count down on a shared "
+                        "machine; asking for more workers than you have free "
+                        "cores makes them contend rather than run")
     p.add_argument("-q", "--quiet", dest="verbose", action="store_false",
                    help="less output")
     return p.parse_args(argv)
@@ -136,7 +135,8 @@ def main(argv=None):
                   % (len(thar_list), thar_list["wave_air"].min(),
                      thar_list["wave_air"].max()))
 
-    ncpu = set_ncpu(args.ncpu)
+    # only override the default (every core) when --ncpu was actually given
+    ncpu = set_ncpu(args.ncpu) if args.ncpu is not None else get_ncpu()
     if args.verbose:
         print("> resampling backend: %s" % BACKEND)
         print("> using %d worker process%s"
@@ -222,9 +222,13 @@ def reduce_night(dir, idcomp_dir, fn_science=None,
     trace_frames = None
     if frame_for_slice == "auto":
         bias_ref = np.median(biases, axis=0) if len(biases) else None
+        # the flat tells blue from red: it falls away towards the blue, so the
+        # faint end of the order block is the one that sets the blue cutoff
+        flat_ref = np.median(flats, axis=0) if len(flats) else None
         trace_frames = select_trace_frames(
             [os.path.join(dir, sc) for sc in all_science],
-            bias=bias_ref, nstack=trace_stack, verbose=verbose)
+            bias=bias_ref, nstack=trace_stack, verbose=verbose,
+            flat=flat_ref)
         if not trace_frames:
             # calibration-only night, or nothing scorable: the flat is the
             # only thing left to trace on, which is what find_orders uses
