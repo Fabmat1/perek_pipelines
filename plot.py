@@ -1,3 +1,4 @@
+import os
 import argparse
 import matplotlib.pyplot as plt
 import pandas as pd
@@ -131,10 +132,13 @@ def main():
 
     fps = args.files
     show_plots = not args.no_plots
-    if "*" in fps:
-        fps = list(glob(fps))
-    else:
+    # an existing path wins over pattern expansion: older reductions wrote the
+    # OBJECT name into the filename unsanitised, so "e202608290033_*_psi_cyg
+    # .fits" is a real file rather than a pattern
+    if os.path.exists(fps):
         fps = [fps]
+    else:
+        fps = sorted(glob(fps))
     print(fps)
 
 #    groups, coords = group_close_stars_with_bjd(fps, max_sep_arcsec=30)

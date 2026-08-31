@@ -18,8 +18,9 @@ from echelle_reduction import (normalize_single_order, _fit_continuum,
                                get_detector_noise, red_edge_keep)
 from identify_orders import trace_windows, FALLBACK_WINDOWS
 from orders import SpectralOrder, gaussian_pixel_weights_2d
-from calibrate import fit_dispersion
+from calibrate import fit_dispersion, parse_idcomp
 from tools import shared, publish_shared, polynomial
+from template import output_stem
 
 
 # --------------------------------------------------------------------------
@@ -298,6 +299,84 @@ def test_red_edge_keep_cuts_only_the_red_end():
     keep = red_edge_keep(wl, flx, width=1.5)
     assert keep[0] and not keep[-1]
     assert wl[keep].max() < wl.max() - 1.4
+
+
+# --------------------------------------------------------------------------
+# output filenames
+# --------------------------------------------------------------------------
+
+def test_output_stem_strips_glob_characters_from_the_object_name():
+    # "* psi cyg" is a real OBJECT value; an asterisk in the filename is a
+    # wildcard to every shell and tool that reads the spectra back
+    stem = output_stem("e202608290033.fit", "*_psi_cyg")
+    assert "*" not in stem
+    assert stem == "e202608290033_psi_cyg"
+
+
+def test_output_stem_keeps_the_designation_of_a_variable_star():
+    assert output_stem("e202608270038.fit", "V*_BP_Boo") == "e202608270038_V_BP_Boo"
+
+
+def test_output_stem_leaves_ordinary_names_alone():
+    assert output_stem("e202409010033.fit", "BD+26_2766") == "e202409010033_BD+26_2766"
+
+
+def test_output_stem_only_drops_the_trailing_extension():
+    # ".fit" also appears inside the name here
+    assert output_stem("fit.fit", "HD_1") == "fit_HD_1"
+
+
+# --------------------------------------------------------------------------
+# idcomp line lists
+# --------------------------------------------------------------------------
+
+_IDCOMP_RECORD = """begin\tidentify tzc01 - Ap 1
+\taplow\t%(lo).2f
+\taphigh\t%(hi).2f
+\tfeatures\t%(n)d
+%(rows)s\tfunction chebyshev
+\torder 4
+"""
+
+
+def _idcomp_text(records):
+    out = []
+    for lo, hi, waves in records:
+        rows = "".join("\t%10.2f %s  %s   4.0 1 1 \n" % (100.0 * (i + 1), w, w)
+                       for i, w in enumerate(waves))
+        out.append(_IDCOMP_RECORD % dict(lo=lo, hi=hi, n=len(waves), rows=rows))
+    return "".join(out)
+
+
+def test_parse_idcomp_keeps_only_the_last_record():
+    # IRAF appends a record per save; the 2026 lists ship with four or five of
+    # them, and concatenating them would feed the fit the same line repeatedly
+    import tempfile
+    text = _idcomp_text([(853.04, 861.27, ["4027.0091", "4024.8025"]),
+                         (853.04, 861.27, ["4027.0091", "4024.8025",
+                                           "4022.0674"])])
+    with tempfile.NamedTemporaryFile("w", suffix=".idcomp", delete=False) as fh:
+        fh.write(text)
+        path = fh.name
+    try:
+        aplow, aphigh, table = parse_idcomp(path)
+    finally:
+        os.unlink(path)
+    assert (aplow, aphigh) == (853.04, 861.27)
+    assert table.shape == (3, 6)
+
+
+def test_parse_idcomp_returns_an_empty_table_for_a_file_that_is_not_a_list():
+    import tempfile
+    with tempfile.NamedTemporaryFile("w", suffix=".py", delete=False) as fh:
+        fh.write("import glob\nprint('not an idcomp file')\n")
+        path = fh.name
+    try:
+        aplow, aphigh, table = parse_idcomp(path)
+    finally:
+        os.unlink(path)
+    assert aplow is None and aphigh is None
+    assert table.shape == (0, 6)
 
 
 # --------------------------------------------------------------------------

@@ -165,6 +165,23 @@ def main(argv=None):
                  DEBUG_PLOTS=args.DEBUG_PLOTS)
 
 
+def output_stem(frame, object_name):
+    """Filename stem for one reduced frame: ``<frame>_<object>``.
+
+    OBJECT comes straight off the telescope and is not constrained to
+    anything: "* psi cyg", "V* BP Boo" and "HD  26764" are all real values in
+    these frames. The whole stem is sanitised, not just the frame name, because
+    an asterisk that reaches the filename is a glob wildcard to every shell and
+    tool that reads the spectra back -- ``plot.py 'done/e..._* psi_cyg.fits'``
+    expands to something else entirely -- and is not a legal filename on
+    Windows at all. Runs of replacements collapse to a single "_" so the names
+    stay readable.
+    """
+    stem = re.sub(r"\.fit$", "", frame) + "_" + object_name
+    stem = re.sub(r"[^\w.+-]", "_", stem)
+    return re.sub(r"_+", "_", stem).strip("_")
+
+
 def reduce_night(dir, idcomp_dir, fn_science=None,
                  idcomp_offset="auto",
                  frame_for_slice=None,
@@ -242,11 +259,9 @@ def reduce_night(dir, idcomp_dir, fn_science=None,
         fp = science[i]
         name = scname[i]
 
-        # replace non-alphanumeric characters, except "_", ".", "+", "-"
-        fp_save = re.sub(r'[^\w_.+-]', '_', fp)
-        fp_save = os.path.join(outdir, fp_save)
-        fp_save_fits = fp_save.replace(".fit", "_" + name + ".fits")
-        fp_save_ascii = fp_save.replace(".fit", "_" + name + ".dat")
+        fp_save = os.path.join(outdir, output_stem(fp, name))
+        fp_save_fits = fp_save + ".fits"
+        fp_save_ascii = fp_save + ".dat"
         if (save_as_fits and (not os.path.exists(fp_save_fits))) or \
            (save_as_ascii and (not os.path.exists(fp_save_ascii))):
             print("> reducing %s (%s)" % (fp, name))
