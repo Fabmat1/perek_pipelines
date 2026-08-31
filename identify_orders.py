@@ -681,6 +681,75 @@ def assign_orders_polyfit(orders, slicelist: list[SpectralSlice], thres_ydist = 
     return orders
 
 
+def repair_short_traces(orders, min_coverage=0.5, max_shift=30.0,
+                        verbose=False):
+    """Re-shape a trace that was fitted over too little of the detector.
+
+    A faint order yields few trace points, and the cubic then extrapolates
+    across most of the columns: on 20260829 order 1 was fitted over 18% of the
+    chip and wandered 12 rows off the star, against an aperture 4-5 rows wide,
+    so the extraction returned bias for 15% of the order.
+
+    The orders are parallel to under a row across 2000 columns, so a
+    well-traced neighbour supplies the shape, offset onto this order's own
+    points. Only the curvature outside the fitted range is borrowed.
+
+    `max_shift` rejects a donor whose implied offset is absurd, which would
+    mean the orders are mispaired rather than parallel.
+    """
+    if len(orders) < 3:
+        return 0
+
+    spans = {}
+    for o in orders:
+        x = np.asarray(getattr(o, "pixel_x", []), float)
+        spans[id(o)] = (x.min(), x.max(), len(x)) if x.size else (0.0, 0.0, 0)
+    width = max(hi for _, hi, _ in spans.values()) or 1.0
+
+    def coverage(o):
+        lo, hi, n = spans[id(o)]
+        return (hi - lo) / width if n else 0.0
+
+    nfixed = 0
+    for i, o in enumerate(orders):
+        if o.solution is None or coverage(o) >= min_coverage:
+            continue
+        x = np.asarray(o.pixel_x, float)
+        y = np.asarray(o.pixel_y, float)
+        good = np.asarray(getattr(o, "pixel_mask_good", np.ones(len(x), bool)))
+        if good.sum() < 4:
+            continue
+
+        # nearest neighbour that covers the detector well
+        donor = None
+        for j in sorted(range(len(orders)), key=lambda k: abs(k - i)):
+            if j == i or orders[j].solution is None:
+                continue
+            if coverage(orders[j]) >= min_coverage:
+                donor = orders[j]
+                break
+        if donor is None:
+            continue
+
+        shift = float(np.median(y[good] - polynomial(x[good], *donor.solution)))
+        if not np.isfinite(shift) or abs(shift) > max_shift:
+            continue
+        resid = y[good] - (polynomial(x[good], *donor.solution) + shift)
+        rms = float(np.sqrt(np.mean(resid ** 2)))
+        if rms > max(1.0, 5.0 * (o.rms or 0.0)):
+            continue            # not parallel: leave the order's own fit
+
+        o.solution = list(donor.solution)
+        o.solution[-1] = o.solution[-1] + shift
+        o.rms = rms
+        nfixed += 1
+        if verbose:
+            print("- order %s traced over only %.0f%% of the detector: shape "
+                  "taken from a neighbour (offset %+.1f px, rms %.2f px)"
+                  % (o.id, 100 * coverage(o), shift, rms))
+    return nfixed
+
+
 def find_orders(frame_for_slice,
                 sampling=200,
                 min_order_samples=6,
@@ -733,6 +802,8 @@ def find_orders(frame_for_slice,
     """
 
     if verbose: print(f"- {len(orders)} orders identified")
+
+    repair_short_traces(orders, verbose=verbose)
 
     times_sigma = 2
     if DEBUG_PLOTS:
