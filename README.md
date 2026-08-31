@@ -102,6 +102,13 @@ Use `--trace-stack N` to change how many frames are stacked, or
 frame can be scored -- a calibration-only directory, say -- the pipeline falls
 back to the flat.
 
+## Sky background
+
+The OES cannot measure the sky, which is dispersed into the orders along with
+the star and so is never subtracted. It is negligible for a bright target, but
+in the faintest blue orders it adds a floor that fills in absorption lines, so
+their depths are unreliable below a few tens of counts.
+
 ## ThAr line lists for the red orders
 
 `--thar-list` refines the wavelength solution against a ThAr atlas after the

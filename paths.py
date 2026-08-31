@@ -20,3 +20,6 @@ MURPHY_THAR_LIST = os.path.join(PACKAGE_DIR,
 
 # example night bundled with the repository
 DEFAULT_DATA_DIR = os.path.join(PACKAGE_DIR, "20240901")
+
+# Kurucz model of Vega: wavelength (nm, vacuum), flux, continuum flux
+DEFAULT_TEMPLATE = os.path.join(PACKAGE_DIR, "vegallpr25.20000resam13")

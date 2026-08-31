@@ -205,7 +205,7 @@ def normalize_single_order(args):
     (i, wl, flx, poly_order, ignore_windows, smooth_width, floor_width,
      edge_width, neighbours, runaway_range,
      extrapolated_out, extrapolate_max, steep_range, max_poly_order,
-     DEBUG_PLOTS) = args
+     blaze, blaze_min, DEBUG_PLOTS) = args
 
     keep = red_edge_keep(wl, flx, width=edge_width)
 
@@ -216,16 +216,41 @@ def normalize_single_order(args):
                         sigma_lower=8, sigma_upper=8, masked=True).mask
     mask = mask & mask2 & keep
 
+    # A known blaze is a factor of the continuum, not a correction to the flux:
+    # continuum = blaze * polynomial. Dividing the flux by it and normalising as
+    # usual is the same quotient in principle, but the polynomial then follows
+    # the blaze and re-absorbs it, and the division inflates the noisy edges.
+    if blaze is not None:
+        blaze = np.asarray(blaze, float)
+        good_blaze = np.isfinite(blaze) & (blaze >= blaze_min)
+        if good_blaze.sum() < poly_order + 5:
+            blaze = None
+        else:
+            mask = mask & good_blaze
+
+    fit_flx = flx if blaze is None else np.divide(
+        flx, blaze, out=np.full_like(flx, np.nan),
+        where=np.isfinite(blaze) & (blaze > 0))
+
     own_wl = wl[mask]
-    own_flx = median_filter(flx[mask], size=smooth_width, mode="nearest")
+    own_flx = median_filter(fit_flx[mask], size=smooth_width, mode="nearest")
 
     # Lower the degree where an order cannot support one. Below ~3900 A the
     # Balmer wings overlap and there is no continuum between them, so a cubic
     # has nothing to fit and bends to follow the lines; a straight line at
     # least stays put. Never raise it -- the extra freedom is spent running
     # away at the order ends, where the data stops.
+    #
+    # Measured on the flux as it arrives, blaze included: `steep_range` was
+    # calibrated that way, and de-blazing shifts the number enough to change
+    # the degree. Keeping it here means supplying a blaze changes the continuum
+    # shape and nothing else.
     poly_order = min(poly_order, max_poly_order)
-    dynamic = np.percentile(own_flx, 99) / max(np.percentile(own_flx, 1), 1e-9)
+    deg_mask = mask if blaze is None else (mask | (mask_intervals(
+        wl, ignore_windows) & red_edge_keep(wl, flx, width=edge_width)
+        & np.isfinite(flx)))
+    raw_flx = median_filter(flx[deg_mask], size=smooth_width, mode="nearest")
+    dynamic = np.percentile(raw_flx, 99) / max(np.percentile(raw_flx, 1), 1e-9)
     if dynamic > steep_range:
         poly_order = max(1, poly_order - 2)
 
@@ -236,7 +261,14 @@ def normalize_single_order(args):
                span[finite].max() / span[finite].min() > runaway_range)
 
     wl_fit, flx_fit = [own_wl], [own_flx]
-    for wl_n, flx_n in (neighbours or []) if runaway else []:
+    for wl_n, flx_n, blaze_n in (neighbours or []) if runaway else []:
+        # the neighbour carries its own blaze; divide it out before its flux
+        # joins a fit that is in de-blazed space
+        if blaze is not None and blaze_n is not None:
+            blaze_n = np.asarray(blaze_n, float)
+            flx_n = np.divide(flx_n, blaze_n,
+                              out=np.full_like(np.asarray(flx_n, float), np.nan),
+                              where=np.isfinite(blaze_n) & (blaze_n >= blaze_min))
         sel = ((wl_n >= wl.min()) & (wl_n <= wl.max())
                & np.isfinite(flx_n) & mask_intervals(wl_n, ignore_windows)
                & red_edge_keep(wl_n, flx_n, width=edge_width))
@@ -246,7 +278,7 @@ def normalize_single_order(args):
         both = mask & (wl >= wl_n[sel].min()) & (wl <= wl_n[sel].max())
         if both.sum() < 20:
             continue
-        own = np.median(flx[both])
+        own = np.median(fit_flx[both])
         scale = np.median(np.interp(wl[both], wl_n[sel], flx_n[sel])) / own \
             if own != 0 else 0.0
         if not np.isfinite(scale) or scale <= 0:
@@ -285,13 +317,27 @@ def normalize_single_order(args):
         keep = keep & (wl >= own_fitted.min() - extrapolate_max) \
                     & (wl <= own_fitted.max() + extrapolate_max)
 
+    # the polynomial was fitted to flux/blaze, so the continuum is their
+    # product -- the blaze shape is imposed rather than fitted
+    if blaze is not None:
+        flx_cont = flx_cont * np.where(np.isfinite(blaze), blaze, np.nan)
+        # below blaze_min the continuum is not trustworthy however good the
+        # fit; the neighbouring order covers those wavelengths near its peak
+        keep = keep & np.isfinite(flx_cont) & (blaze >= blaze_min)
+
     # broad median filter used as a floor under the polynomial continuum. Its
     # width is a fixed fraction of the order, not of however many pixels
     # survived masking above -- otherwise it varies from order to order.
+    # Skipped with a blaze: a blaze-shaped continuum legitimately falls to a
+    # few percent at the order edges, which the floor would clip back up.
     floor_size = max(1, int(len(flx) * floor_width))
     flx_smooth = median_filter(flx, size=floor_size, mode="nearest")
-    flx_cont = np.maximum(flx_cont, flx_smooth)
-    normalized_flx = flx / flx_cont
+    if blaze is None:
+        flx_cont = np.maximum(flx_cont, flx_smooth)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        normalized_flx = np.divide(flx, flx_cont,
+                                   out=np.full_like(flx, np.nan),
+                                   where=np.isfinite(flx_cont) & (flx_cont != 0))
 
     return (i, normalized_flx, flx_cont, keep,
             (wl, flx, flx_smooth, flx_cont, keep) if DEBUG_PLOTS else None)
@@ -320,6 +366,8 @@ def poly_normalization(wls, flxs,
                        extrapolate_max=8.0,
                        steep_range=6.0,
                        max_poly_order=4,
+                       blazes=None,
+                       blaze_min=0.05,
                        DEBUG_PLOTS=False,
                        n_processes=None,
                        errs=None,
@@ -340,20 +388,29 @@ def poly_normalization(wls, flxs,
     steep_range : orders whose flux spans more than this get a lower degree --
         they have no continuum to fit, so less freedom is safer.
     max_poly_order : hard ceiling on the continuum degree.
+    blazes : optional per-order blaze, normalised to its own peak, or None per
+        order. Where given the continuum becomes `blaze * polynomial`, so the
+        instrument's shape is imposed and only the residual is fitted.
+    blaze_min : pixels below this blaze are neither fitted nor normalised --
+        the order's extreme edges, which its neighbour covers far better.
     errs : per-order uncertainties, divided by the same continuum as the flux.
         Modified in place.
     """
+    if blazes is None:
+        blazes = [None] * len(wls)
+
     # the list is wavelength-sorted, so list neighbours are detector neighbours
     def near(i):
         if not use_neighbours:
             return []
-        return [(np.asarray(wls[j], float), np.asarray(flxs[j], float))
+        return [(np.asarray(wls[j], float), np.asarray(flxs[j], float),
+                 None if blazes[j] is None else np.asarray(blazes[j], float))
                 for j in (i - 1, i + 1) if 0 <= j < len(wls)]
 
     args_list = [(i, wl, flxs[i], poly_order, ignore_windows, smooth_width,
                   floor_width, edge_width, near(i), runaway_range,
                   extrapolated_out, extrapolate_max, steep_range,
-                  max_poly_order, DEBUG_PLOTS)
+                  max_poly_order, blazes[i], blaze_min, DEBUG_PLOTS)
                  for i, wl in enumerate(wls)]
     # `Pool(None)` asks for one worker per core, which ignores --ncpu and
     # oversubscribes the machine the flag exists to protect
@@ -744,7 +801,18 @@ def align_normalization(wave, flux, DEBUG_PLOTS=False):
 
 
 def merge_orders(olist: list[SpectralOrder], normalize=True, margin=2, max_wl=8900,
-                 resolution=30000, DEBUG_PLOTS=False, verbose=True):
+                 resolution=30000, blaze_correct=True,
+                 DEBUG_PLOTS=False, verbose=True):
+    # An order whose dispersion reversed inside the detector is not calibrated
+    # anywhere along its length, so it must not reach the merge.
+    # `enforce_invariant` sets the flag.
+    broken = [o.id for o in olist if not getattr(o, "dispersion_ok", True)]
+    if broken:
+        if verbose:
+            print("- excluding orders with a non-monotonic wavelength "
+                  "solution from the merge: %s" % broken)
+        olist = [o for o in olist if getattr(o, "dispersion_ok", True)]
+
     keep = [o for o in olist if o.wl.min() < max_wl]
     wave = [o.wl[margin:-margin] for o in keep]
     flux = [o.science[margin:-margin] for o in keep]
@@ -752,6 +820,9 @@ def merge_orders(olist: list[SpectralOrder], normalize=True, margin=2, max_wl=89
     # edge divided by an almost-empty flat both come out near unity after it.
     errs = [None if o.science_err is None else o.science_err[margin:-margin]
             for o in keep]
+    flat = [None if getattr(o, "flat", None) is None else o.flat[margin:-margin]
+            for o in keep]
+    oids = [o.id for o in keep]
 
     # sort orders by median wave
     wmed = [np.nanmedian(i) for i in wave]
@@ -760,8 +831,28 @@ def merge_orders(olist: list[SpectralOrder], normalize=True, margin=2, max_wl=89
     flux = [np.asarray(flux[i], dtype=float) for i in isort]
     errs = [None if errs[i] is None else np.asarray(errs[i], dtype=float)
             for i in isort]
+    flat = [None if flat[i] is None else np.asarray(flat[i], dtype=float)
+            for i in isort]
+    oids = [oids[i] for i in isort]
     if all(e is None for e in errs):
         errs = None
+
+    # Below ~4000 A the flat holds about a count, so it removes the pixel
+    # response but leaves the star's blaze behind, and no low-order polynomial
+    # follows a blaze. `blaze_model` supplies one for those orders.
+    blazes = None
+    if blaze_correct:
+        try:
+            from blaze_model import blazes_for_orders
+            blazes, applied = blazes_for_orders(wave, flat, flux, ids=oids)
+            if verbose and applied:
+                print(f"- blaze model supplied for orders {applied}")
+            if not applied:
+                blazes = None
+        except Exception as exc:            # never fail a reduction over this
+            if verbose:
+                print(f"- blaze model unavailable ({exc}); continuing without")
+            blazes = None
 
     if DEBUG_PLOTS:
         for w, f in zip(wave, flux):
@@ -776,6 +867,7 @@ def merge_orders(olist: list[SpectralOrder], normalize=True, margin=2, max_wl=89
     keeps = None
     if normalize:
         flux, keeps = poly_normalization(wave, flux, errs=errs,
+                                         blazes=blazes,
                                          DEBUG_PLOTS=DEBUG_PLOTS)
 #        flux = legendre_normalization(wave, flux, DEBUG_PLOTS=DEBUG_PLOTS)
     else:

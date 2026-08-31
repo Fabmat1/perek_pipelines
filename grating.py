@@ -83,7 +83,7 @@ def order_numbers(centre_wavelengths, valid=None):
 
 
 def enforce_invariant(orders, thar=None, verbose=False, tol=5.0,
-                      min_orders=12):
+                      min_orders=12, max_nonmonotonic=0.02):
     """Check every solved order against the grating relation, and refit strays.
 
     Each order is fitted on its own, so nothing stops one of them drifting --
@@ -97,6 +97,11 @@ def enforce_invariant(orders, thar=None, verbose=False, tol=5.0,
     an order has its wavelength scale replaced by the grating prediction,
     keeping whatever curvature its own fit found but restoring the scale and
     zero point the other fifty orders agree on.
+
+    Every order also gets a `dispersion_ok` flag from a monotonicity test. A
+    relation that reverses inside the detector has the wrong shape rather than
+    the wrong scale, so rescaling cannot repair it; `max_nonmonotonic` is the
+    tolerated fraction of steps running against the trend.
 
     Returns the number of orders corrected.
     """
@@ -124,6 +129,29 @@ def enforce_invariant(orders, thar=None, verbose=False, tol=5.0,
     model = fit_grating(m[trusted], wc[trusted], disp[trusted])
 
     resid = m * wc - np.polyval(model["p_wl"], m)
+
+    # A cubic through a dozen lines can fold inside the detector. Such an
+    # order still has a normal *median* dispersion, so the m^2*dispersion test
+    # above passes it; only the sign changes reveal it. Rescaling cannot help,
+    # so mark it and let the merge drop it.
+    nonmono = []
+    for o in good:
+        wl = np.asarray(getattr(o, "wl", None), float)
+        if wl is None or wl.size < 3:
+            continue
+        dw = np.diff(wl)
+        fin = np.isfinite(dw)
+        if fin.sum() < 3:
+            continue
+        up, dn = int(np.sum(dw[fin] > 0)), int(np.sum(dw[fin] < 0))
+        frac_wrong = min(up, dn) / float(up + dn)
+        o.dispersion_ok = frac_wrong <= max_nonmonotonic
+        if not o.dispersion_ok:
+            nonmono.append((o.id, frac_wrong, float(np.nanmax(wl) - np.nanmin(wl))))
+    if verbose and nonmono:
+        for oid, fw, span in nonmono:
+            print("- order %s dispersion is not monotonic (%.0f%% of steps run "
+                  "the wrong way, span %.0f A): excluded" % (oid, 100 * fw, span))
     # Floor the scale. `scatter_wl` says how well a quadratic describes the
     # orders it was fitted to, and on a good night that can be well under an
     # Angstrom-order -- which would make this check fire on differences far
