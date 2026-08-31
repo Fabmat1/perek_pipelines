@@ -80,6 +80,15 @@ def load_thar_list(*paths):
 
 
 def parse_idcomp(file_path):
+    """Read one IRAF ``identify`` database file.
+
+    IRAF appends a record every time the aperture is saved, so a file can hold
+    several: the 2023 lists were trimmed to the last record before they were
+    committed, the 2026 ones from the observatory were not. Each record
+    supersedes the one before it, so only the last is kept -- concatenating
+    them would feed the fit the same line several times over at slightly
+    different centres.
+    """
     with open(file_path, 'r') as file:
         lines = file.readlines()
 
@@ -94,7 +103,11 @@ def parse_idcomp(file_path):
 
         # Extract aplow and aphigh values
         if line.startswith('aplow'):
+            # start of a new record: drop whatever the previous one held
             aplow = float(line.split()[1])
+            aphigh = None
+            table_data = []
+            in_table = False
         elif line.startswith('aphigh'):
             aphigh = float(line.split()[1])
 
@@ -116,7 +129,10 @@ def parse_idcomp(file_path):
                 # Table ends if we encounter a non-digit line
                 in_table = False
 
-    return aplow, aphigh, np.array(table_data)
+    if not table_data:
+        # pixel, fitted wavelength, catalogue wavelength, weight, ...
+        return aplow, aphigh, np.empty((0, 6), dtype=float)
+    return aplow, aphigh, np.array(table_data, dtype=float)
 
 def fit_comparison(linetable, comparison, pixel_window=8, DEBUG_PLOTS=False,
                    raw=None, saturation=60000.0):
@@ -695,13 +711,31 @@ def find_dispersion(orders, biases, comps,
 
     times_sigma = 2
 
+    # Anything in the directory that parses as an identify record is a line
+    # list. The names are not a convention we control -- the 2023 lists are
+    # "idiazcomp.0001", the 2026 ones from the observatory are "idtzc01" --
+    # so matching on the name would have silently found nothing and left the
+    # night with no wavelength solution at all.
     raw_lists = {}
-    fp_idcomp = sorted(os.listdir(idcomp_dir))
-    for file in fp_idcomp:
-        if "idiazcomp" in file:
-            aplo, aphi, table = parse_idcomp(idcomp_dir + "/" + file)
-            avg_ap = (aplo + aphi) / 2
-            raw_lists[avg_ap] = table
+    skipped = []
+    for file in sorted(os.listdir(idcomp_dir)):
+        path = os.path.join(idcomp_dir, file)
+        if not os.path.isfile(path):
+            continue
+        try:
+            aplo, aphi, table = parse_idcomp(path)
+        except (ValueError, UnicodeDecodeError):
+            aplo = aphi = None
+        if aplo is None or aphi is None or len(table) == 0:
+            skipped.append(file)
+            continue
+        raw_lists[(aplo + aphi) / 2] = table
+    if not raw_lists:
+        raise ValueError("no idcomp line lists found in %s" % idcomp_dir)
+    if verbose:
+        print("- %d idcomp line lists from %s%s"
+              % (len(raw_lists), idcomp_dir,
+                 " (ignored %s)" % ", ".join(skipped) if skipped else ""))
 
     if isinstance(idcomp_offset, str) and idcomp_offset == "auto":
         idcomp_offset, _, _ = solve_idcomp_offset(

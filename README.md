@@ -44,8 +44,10 @@ uv run python template.py 20250903 --science e202509030022 --plot
 
 ## Order identification
 
-Each order has to be matched to the reference line list (`idcomp_2307`) that
-gives it its wavelength solution. The match is made by position on the
+Each order has to be matched to a reference line list (`idcomp_2307` by
+default, but see below) that gives it its wavelength solution. Any directory
+of IRAF `identify` records will do; the filenames are not read, so the
+observatory's own naming works as it arrives. The match is made by position on the
 detector, so it depends on how far the spectrograph has moved in the
 cross-dispersion direction since the reference was taken. That shift is
 measured from the data for every night and reported as it runs:
@@ -70,6 +72,60 @@ identifiable at all.
 
 Pass `--idcomp-offset <px>` to force a particular shift instead of measuring
 it.
+
+## Which line list to use, and why it depends on the year
+
+Two reference lists are bundled:
+
+```
+idcomp_2307   53 orders, 1615 lines, 3811-8772 A   taken 2023-07
+idcomp_2026   50 orders,  881 lines, 3967-8962 A   taken 2026-08
+```
+
+They are not interchangeable, and the difference is much larger than the
+line counts suggest. Between September 2025 and August 2026 the order block
+did not just move across the detector, it changed scale: matched order for
+order, the two lists differ by 1 px at the blue end and 13 px at the red one,
+which no single `--idcomp-offset` can absorb.
+
+What that costs was measured by scoring the wavelength solution against the
+full Lovis & Pepe + Murphy ThAr atlas -- thousands of lines, against the
+fourteen to thirty a list seeds an order with -- on one frame from each night
+we hold raw data for. Per order, the median offset of the arc lines from their
+catalogue wavelengths:
+
+```
+                    idcomp_2307        idcomp_2026
+20240901             0.0013 A           0.074 A
+20250903             0.0019 A           0.121 A
+20260829             0.081  A           0.0014 A
+```
+
+So each list is right for its own epoch and wrong by fifty to a hundred times
+that for the other, which in velocity is the difference between 0.3 km/s and
+10 km/s of scatter within an order. Nothing in the run warns about it: the
+wrong list still identifies every order, still passes the grating-relation
+check, and reports an idcomp residual of 0.16 px against 0.07 px for the right
+one -- comfortably inside the threshold that would complain.
+
+`--thar-list` does not rescue it. Refining against half the atlas and scoring
+against the half held out, the 2023 list on the 2026 night goes from 0.081 A to
+0.059 A: the seeds are wrong by enough that the refinement locks onto the wrong
+catalogue line about as often as the right one.
+
+**Use `--idcomp-dir idcomp_2026` for data from 2026 onwards.** The default
+stays `idcomp_2307` because it is what the bundled example night needs, and
+because it is the right list for everything in the archive up to at least
+September 2025. Exactly when the spectrograph moved is not pinned down -- we
+have no raw frames between 20250903 and 20260826 -- so a night from that gap
+is worth reducing both ways before it is trusted.
+
+The 2026 list is also 150 A shorter in the blue: it starts at 3963 A against
+3811 A, which is four orders, and takes Ca II K (3934 A), H8 and H9 with it. It
+gains one order in the red instead, out to 8966 A. If the blue matters, the
+list wants extending blueward at the telescope; seeding those orders from the
+2023 list is not an option, because their apertures sit 25 px away from where
+the 2026 list puts the rest of the block.
 
 ## Which frame the orders are traced on
 

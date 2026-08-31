@@ -8,3 +8,10 @@ __pycache__/
 *.so
 /done/
 .DS_Store
+/spectra_perek/
+/2026*
+/done*
+reduce*
+snr_vs_expval*
+fit_balmer_rv.py
+
