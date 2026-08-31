@@ -29,9 +29,9 @@ from tools import shared, publish_shared, polynomial
 def _norm_args(wl, flx, ignore_windows, neighbours=(), extrapolated_out=True):
     """The positional argument tuple `normalize_single_order` expects."""
     return (0, wl, flx, 3, ignore_windows, 31, 0.25,
-            1.5, list(neighbours), 3.0,
+            1.5, [(w, f, None) for w, f in neighbours], 3.0,
             extrapolated_out, 8.0, 6.0, 4,
-            False)
+            None, 0.20, False)
 
 
 def _fake_order(npix=64, ncol=200, centre=40.0, width=4.0):

@@ -251,6 +251,22 @@ def wavelength_to_pixel(wavelengths, params, x, polynomial):
     return f(wavelengths)
 
 
+def _monotonic(wl, max_wrong=0.0):
+    """True if `wl` runs one way across the whole detector.
+
+    `max_wrong` is the tolerated fraction of steps against the trend.
+    """
+    dw = np.diff(np.asarray(wl, float))
+    fin = np.isfinite(dw)
+    if fin.sum() < 2:
+        return True
+    up = int(np.sum(dw[fin] > 0))
+    dn = int(np.sum(dw[fin] < 0))
+    if up + dn == 0:
+        return False
+    return min(up, dn) / float(up + dn) <= max_wrong
+
+
 def fit_dispersion(x, y, yerr, thar_list=None, DEBUG_PLOTS=False):
 
     # sort for the fit and the residual plot, but remember the permutation:
@@ -268,6 +284,34 @@ def fit_dispersion(x, y, yerr, thar_list=None, DEBUG_PLOTS=False):
     params, errs, mask_good = curve_fit_reject(x, y, polynomial,
                                                thres=thres, thres_max=thres_max,
                                                **kwargs)
+
+    # A dispersion relation cannot turn round, but the cubic is fitted to as
+    # few as a dozen lines and will put a stationary point inside the detector
+    # if they cluster. Such a fit has a normal median dispersion, so only the
+    # sign changes reveal it. Lower the degree until it is monotonic; a line
+    # never folds, so this terminates.
+    npix = int(np.nanmax(x)) + 1 if np.isfinite(np.nanmax(x)) else 2048
+    grid = np.arange(max(npix, 2), dtype=float)
+    if not _monotonic(polynomial(grid, *params)):
+        # `polynomial` takes a fixed four coefficients, so refit with polyfit
+        # on the already-accepted lines and pad back to four.
+        keep = mask_good if mask_good.sum() >= 4 else np.ones(len(x), bool)
+        w = 1.0 / np.where(yerr[keep] > 0, yerr[keep], np.inf)
+        for deg in (2, 1):
+            if keep.sum() < deg + 2:
+                continue
+            try:
+                coef = np.polyfit(x[keep], y[keep], deg, w=w)
+            except Exception:
+                continue
+            trial = np.concatenate([np.zeros(4 - (deg + 1)), coef])
+            if _monotonic(polynomial(grid, *trial)):
+                params = trial
+                errs = np.full(4, np.nan)
+                warnings.warn(
+                    "dispersion fit was not monotonic across the detector; "
+                    "degree lowered to %d" % deg)
+                break
 
     ypoly = polynomial(x, *params)
     # root mean squared
