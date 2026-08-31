@@ -14,6 +14,19 @@ whatever curvature its own fit found.
 """
 import numpy as np
 
+#: Physical order numbers reachable by an echelle: outside this range a
+#: neighbour-spacing estimate is measuring something other than two adjacent
+#: orders. The OES runs m = 40-93 on the two bundled reference lists.
+M_MIN, M_MAX = 10.0, 300.0
+
+#: `K/lambda` has to land this close to an integer for the order to be placed.
+#: On the bundled reference lists the worst of the 103 orders misses by 0.02,
+#: so this is a factor of ten of headroom -- and an order that misses by more
+#: than this cannot be called one order rather than its neighbour anyway.
+M_TOLERANCE = 0.25
+
+#: fewest orders the invariant can be measured from
+MIN_FOR_INVARIANT = 4
 
 
 def fit_grating(order_numbers, centre_wavelengths, dispersions):
@@ -37,48 +50,64 @@ def fit_grating(order_numbers, centre_wavelengths, dispersions):
                 mean_wl=float(np.mean(m * wc)))
 
 
-def order_numbers(centre_wavelengths, valid=None):
+def invariant(centre_wavelengths):
+    """The echelle invariant `K = m*lambda`, from the order spacing alone.
+
+    For adjacent orders `m1*lam1 = (m1-1)*lam2`, so `m1 = lam2/(lam2 - lam1)`
+    with no integer search and no assumption about where the block starts.
+    Taken as a median over every adjacent pair, because a pair is only wrong
+    if one of its two members is: a few diverged orders, or a few missing
+    ones, cannot move it. Returns NaN if it cannot be measured.
+    """
+    lam = np.sort(np.asarray(centre_wavelengths, float))
+    if lam.size < MIN_FOR_INVARIANT:
+        return np.nan
+    with np.errstate(divide="ignore", invalid="ignore"):
+        m_local = lam[1:] / np.diff(lam)
+    good = np.isfinite(m_local) & (m_local > M_MIN) & (m_local < M_MAX)
+    if good.sum() < 3:
+        return np.nan
+    return float(np.median(m_local[good] * lam[:-1][good]))
+
+
+def order_numbers(centre_wavelengths, valid=None, tol=M_TOLERANCE):
     """Physical order numbers, from the assignment that makes m*lambda flat.
 
-    A single runaway order is enough to wreck this if it is allowed to vote: a
-    fit that has diverged can report a central wavelength of 10^7 A, and the
-    search then picks whatever `m0` makes *that* look least bad. So the scale
-    is set by a robust statistic over the orders that agree, not by the mean
-    over all of them.
+    Returns a float array in input order, NaN for any order whose m could not
+    be established -- which the caller must not guess at.
+
+    `m` is read off each order's own wavelength as `m = K/lambda`, not from its
+    rank in the sorted list. Rank is wrong in two situations that both turn up
+    on ordinary nights. An order whose fit diverged takes a rank it does not
+    own, shifting every order on one side of it by one; and an order that
+    failed to solve is absent from the list altogether, so a consecutive run of
+    m steps straight over the gap. Neither is visible afterwards, because the
+    whole block shifts together and `m*lambda` stays as smooth as it ever was.
+
+    A single runaway order is also enough to wreck the scale if it is allowed
+    to vote -- a fit that has diverged can report a central wavelength of
+    10^7 A -- so K comes from a median over pairs rather than a fit to all of
+    them, and `valid` can exclude known-bad orders from setting it.
     """
     wc = np.asarray(centre_wavelengths, float)
-    idx = np.argsort(wc)[::-1]          # descending lambda == ascending m
-    w = wc[idx]
+    out = np.full(wc.shape, np.nan)
 
-    if valid is None:
-        # an order whose centre is far from the run of its neighbours is not
-        # measuring the instrument; keep it out of the scale determination
-        med = np.median(w)
-        mad = np.median(np.abs(w - med)) * 1.4826
-        valid_sorted = np.isfinite(w) & (w > 0)
-        if np.isfinite(mad) and mad > 0:
-            valid_sorted &= np.abs(w - med) < 20 * mad
-    else:
-        valid_sorted = np.asarray(valid, bool)[idx]
+    usable = np.isfinite(wc) & (wc > 0)
+    sets_scale = usable
+    if valid is not None:
+        sets_scale = usable & np.asarray(valid, bool)
+        if sets_scale.sum() < MIN_FOR_INVARIANT:
+            sets_scale = usable
 
-    if valid_sorted.sum() < 5:
-        valid_sorted = np.isfinite(w) & (w > 0)
+    K = invariant(wc[sets_scale])
+    if not np.isfinite(K):
+        return out
 
-    best = None
-    for m0 in range(20, 200):
-        m = m0 + np.arange(len(w))
-        mw = (m * w)[valid_sorted]
-        if not np.all(np.isfinite(mw)) or np.median(mw) <= 0:
-            continue
-        # median absolute deviation, so a survivor outlier cannot dominate
-        s = np.median(np.abs(mw - np.median(mw))) / np.median(mw)
-        if best is None or s < best[0]:
-            best = (s, m)
-    if best is None:
-        return np.arange(len(w), dtype=float)
-    _, m = best
-    out = np.empty(len(w))
-    out[idx] = m
+    with np.errstate(divide="ignore", invalid="ignore"):
+        m = K / np.where(usable, wc, np.nan)
+    placed = np.isfinite(m) & (np.abs(m - np.round(m)) <= tol) \
+        & (np.round(m) >= 1)
+    out[placed] = np.round(m[placed])
     return out
 
 
@@ -158,12 +187,21 @@ def enforce_invariant(orders, thar=None, verbose=False, tol=5.0,
     # below the accuracy of the wavelength solution itself. A real order is not
     # located better than a few tenths of an Angstrom, so do not pretend to
     # test it more tightly than that.
-    scale = max(model["scatter_wl"], 0.2 * float(np.median(m)))
+    scale = max(model["scatter_wl"], 0.2 * float(np.nanmedian(m)))
     if not np.isfinite(scale) or scale <= 0:
         return 0
 
     nfixed = 0
+    unplaced = []
     for o, mm, r in zip(good, m, resid):
+        if not np.isfinite(mm):
+            # Its centre does not sit where any order's does, so there is no
+            # saying which order to restore it to. Guessing is what seeding an
+            # unsolved order from its neighbours tried and lost on: one order
+            # out is ~10 A at the red end and still looks entirely plausible.
+            o.dispersion_ok = False
+            unplaced.append(o.id)
+            continue
         if abs(r) <= tol * scale:
             continue
         wl = np.asarray(o.wl, float)
@@ -181,7 +219,12 @@ def enforce_invariant(orders, thar=None, verbose=False, tol=5.0,
                   "(%.1f A): scale restored from the other orders"
                   % (o.id, abs(r) / scale, abs(r) / mm))
 
-    if verbose and nfixed == 0:
+    if verbose and unplaced:
+        print("- order%s %s cannot be placed in the order block "
+              "(centre wavelength is not one order's away from any other): "
+              "excluded" % ("s" if len(unplaced) > 1 else "",
+                            ", ".join(str(u) for u in unplaced)))
+    if verbose and nfixed == 0 and not unplaced:
         print("- all %d orders consistent with the grating relation "
               "(m*lambda = %.0f +- %.0f)"
               % (len(good), model["mean_wl"], scale))
