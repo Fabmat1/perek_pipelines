@@ -6,8 +6,6 @@ import pyresample_spectres
 def resample(wave_out, wave_in, flux_in, fill=0.0, verbose=False):
     nwave_in = len(wave_in)
     nwave_out = len(wave_out)
-    # nothing to resample onto: the Fortran routine rejects a zero-length
-    # output array, so return the empty result directly
     if nwave_out == 0 or nwave_in == 0:
         return np.zeros(nwave_out, dtype='d')
     # no need to resample if output array is much longer than input

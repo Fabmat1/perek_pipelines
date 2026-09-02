@@ -11,34 +11,14 @@ from grating import enforce_invariant
 from multiprocessing import Pool, cpu_count
 from tqdm import tqdm
 from scipy.interpolate import interp1d
+from scipy.signal import find_peaks
 
 
 two_log_two = 2 * np.sqrt(2 * np.log(2))
 
 
 def load_thar_list(*paths):
-    """Read one or more ThAr line lists into the DataFrame the fit expects.
-
-    Two formats are understood:
-
-    * the cleaned Lovis & Pepe CSV, which already has a ``wave_air`` column;
-    * the Murphy et al. (2007) atlas, whitespace-separated, whose second
-      column is the air wavelength (its first column is the wavenumber, and
-      1e8/wavenumber recovers the *vacuum* value -- the two differ by the
-      refractive index of air, ~2.8e-4, which is 1.4 A at 5000 A and would
-      quietly bias every wavelength if the wrong column were used).
-
-    Lovis & Pepe ends at 6912 A, so the reddest OES orders have no lines in it
-    at all. Passing both merges them: lines closer than 0.01 A are treated as
-    the same line and only the first list's value is kept.
-
-    Note when comparing runs: adding lines *lowers* the reported resolution,
-    because R is measured from the fitted width of the calibration lines
-    themselves. With six lines an order is calibrated on the few brightest and
-    narrowest features; with twenty-six the sample includes normal-width lines
-    and the median widens. The lower number is the more honest estimate of the
-    instrument, and the fit it comes from is far better constrained.
-    """
+    """Read one or more ThAr line lists into the DataFrame the fit expects."""
     import pandas as pd
 
     frames = []
@@ -50,13 +30,6 @@ def load_thar_list(*paths):
         if "," in head and "wave_air" in head:
             frames.append(pd.read_csv(path))
             continue
-        # Murphy: wavenumber, air wavelength, uncertainty, species, flag.
-        # The third column is carried through as `wave_err_raw` and is
-        # deliberately *not* called an Angstrom uncertainty: its values run
-        # 1.4-4.5, which is far too large to be Angstroms and is consistent
-        # with either 1e-3 cm^-1 or m/s. Nothing reads it. Check the paper
-        # before using it as a fit weight -- taking it for Angstroms would
-        # weight every line by a number three orders of magnitude too big.
         arr = np.loadtxt(path, usecols=(0, 1, 2))
         frames.append(pd.DataFrame({"wave_air": arr[:, 1],
                                     "wave_vac": 1e8 / arr[:, 0],
@@ -80,15 +53,7 @@ def load_thar_list(*paths):
 
 
 def parse_idcomp(file_path):
-    """Read one IRAF ``identify`` database file.
-
-    IRAF appends a record every time the aperture is saved, so a file can hold
-    several: the 2023 lists were trimmed to the last record before they were
-    committed, the 2026 ones from the observatory were not. Each record
-    supersedes the one before it, so only the last is kept -- concatenating
-    them would feed the fit the same line several times over at slightly
-    different centres.
-    """
+    """Read one IRAF ``identify`` database file."""
     with open(file_path, 'r') as file:
         lines = file.readlines()
 
@@ -136,15 +101,7 @@ def parse_idcomp(file_path):
 
 def fit_comparison(linetable, comparison, pixel_window=8, DEBUG_PLOTS=False,
                    raw=None, saturation=60000.0):
-    """Fit the arc lines of one order.
-
-    `raw` is the same order's arc in counts, before the running-maximum
-    normalisation. It is used only to drop saturated lines: a clipped line has
-    a flat top, so its fitted centre is set by wherever the plateau happens to
-    be brightest rather than by the line, and its width is overestimated. Which
-    lines saturate depends on the lamp and the exposure, not on the line, so
-    this has to be decided per exposure rather than from a fixed list.
-    """
+    """Fit the arc lines of one order."""
 #    DEBUG_PLOTS = True
 
     line_wls = (linetable[:, 1] + linetable[:, 2]) / 2
@@ -194,10 +151,6 @@ def fit_comparison(linetable, comparison, pixel_window=8, DEBUG_PLOTS=False,
         actual_positions.append(params[1])
         actual_errors.append(errs[1])
         fwhm_pix.append(params[2]*two_log_two)
-        # skipping a saturated line above would otherwise leave `line_wls`
-        # longer than the fitted arrays, silently pairing every later
-        # measurement with the wrong catalogue wavelength. Keep indices, not
-        # values: two lines can share a pixel position.
         kept.append(idx)
         if DEBUG_PLOTS:
             plt.plot(pwin, Gaussian_res(pwin, *params), color="red", zorder=20)
@@ -242,9 +195,6 @@ def mask_good_lines(actual_positions, fwhm_pix,
     if (np.sum(mask_good) < 5):
         raise Exception("Not enough calibration lines in order %s" % order_id)
 
-    # threshold = np.percentile(actual_errors, 0.9)
-    # actual_positions = actual_positions[actual_errors <= threshold]
-    # actual_errors = actual_errors[actual_errors <= threshold]
 
     if DEBUG_PLOTS:
         plt.scatter(actual_positions[~mask_good], fwhm_pix[~mask_good], zorder=10, color="gray")
@@ -268,10 +218,7 @@ def wavelength_to_pixel(wavelengths, params, x, polynomial):
 
 
 def _monotonic(wl, max_wrong=0.0):
-    """True if `wl` runs one way across the whole detector.
-
-    `max_wrong` is the tolerated fraction of steps against the trend.
-    """
+    """True if `wl` runs one way across the whole detector."""
     dw = np.diff(np.asarray(wl, float))
     fin = np.isfinite(dw)
     if fin.sum() < 2:
@@ -286,9 +233,6 @@ def _monotonic(wl, max_wrong=0.0):
 def fit_dispersion(x, y, yerr, thar_list=None, npix_detector=2048,
                    DEBUG_PLOTS=False):
 
-    # sort for the fit and the residual plot, but remember the permutation:
-    # the mask returned below has to line up with the caller's arrays, not with
-    # the sorted copies made here
     isort = np.argsort(x)
     x = x[isort]
     y = y[isort]
@@ -302,19 +246,10 @@ def fit_dispersion(x, y, yerr, thar_list=None, npix_detector=2048,
                                                thres=thres, thres_max=thres_max,
                                                **kwargs)
 
-    # A dispersion relation cannot turn round, but the cubic is fitted to as
-    # few as a dozen lines and will put a stationary point inside the detector
-    # if they cluster. Such a fit has a normal median dispersion, so only the
-    # sign changes reveal it. Lower the degree until it is monotonic; a line
-    # never folds, so this terminates.
-    # over the whole detector, not just as far as the reddest line: an order
-    # whose lines cover a third of the chip folds beyond them unnoticed
     npix = max(int(np.nanmax(x)) + 1, npix_detector) \
         if np.isfinite(np.nanmax(x)) else npix_detector
     grid = np.arange(max(npix, 2), dtype=float)
     if not _monotonic(polynomial(grid, *params)):
-        # `polynomial` takes a fixed four coefficients, so refit with polyfit
-        # on the already-accepted lines and pad back to four.
         keep = mask_good if mask_good.sum() >= 4 else np.ones(len(x), bool)
         w = 1.0 / np.where(yerr[keep] > 0, yerr[keep], np.inf)
         for deg in (2, 1):
@@ -370,12 +305,6 @@ def fit_dispersion(x, y, yerr, thar_list=None, npix_detector=2048,
         plt.tight_layout()
         plt.show()
 
-    # `mask_good` indexes the sorted arrays; the caller still holds the
-    # unsorted ones. Undo the permutation so that applying the mask there
-    # keeps the lines the fit actually kept. Without this the clip silently
-    # discards a different set of lines than the one it rejected -- harmless
-    # while the input happens to be sorted by pixel, but the ThAr refinement
-    # appends its predicted lines with `vstack` and so does not.
     mask_orig = np.zeros_like(mask_good)
     mask_orig[isort] = mask_good
 
@@ -390,29 +319,13 @@ def solve_wavelength(linetable, order,
                      pixel_window=8,
                      thar_list=None,
                      max_iterations=3,
+                     seed_shift=0.0,
                      DEBUG_PLOTS=False):
-    """
-    Fit ThAr lines in a spectral order to solve the dispersion relation.
+    """Fit ThAr lines in a spectral order to solve the dispersion relation."""
 
-    Parameters
-    ----------
-    linetable : array-like
-        Initial guess of line positions.
-    order : object
-        Spectral order with .comparison array and .id attribute.
-    pixel_window : int
-        Pixel window to search around guessed positions.
-    thar_list : DataFrame
-        Reference ThAr line list (optional).
-    max_iterations : int
-        Maximum iterations for fitting with new ThAr lines.
-    DEBUG_PLOTS : bool
-        Whether to show debug plots.
-    """
-
-    # work on a copy: `linetable` is owned by the shared `linelists` dict and
-    # is mutated below, which would leak between orders in a sequential run
     linetable = np.array(linetable, dtype=float, copy=True)
+    if seed_shift:
+        linetable[:, 0] = linetable[:, 0] + seed_shift
 
     pixels = np.arange(len(order.comparison)) + 1
     too_wide_pix = 7
@@ -458,8 +371,6 @@ def solve_wavelength(linetable, order,
         ngood = np.sum(mask_good_disp)
         ngoods.append(ngood)
 
-        # Update pixel positions in linetable using current fit
-        # Only first 3 entries matter; first is pixel, second/third are wavelength
         linetable[:, 0] = wavelength_to_pixel((linetable[:, 1]+linetable[:, 2])/2,
                                               params, pixels, polynomial)
 
@@ -518,24 +429,117 @@ def solve_wavelength(linetable, order,
         plt.ylabel(r"$R = \lambda / \Delta \lambda$")
         plt.show()
 
+def solve_dispersion_shift(line_px, comparison, search=30.0, coarse=0.25,
+                           fine=0.02, min_lines=6):
+    """Measure the shift along dispersion between the seed positions and this
+    arc."""
+    comparison = np.asarray(comparison, dtype=float)
+    line_px = np.asarray(line_px, dtype=float)
+    line_px = line_px[np.isfinite(line_px)]
+    if len(line_px) < min_lines or len(comparison) < 50:
+        return 0.0, np.nan, np.nan
+
+    finite = comparison[np.isfinite(comparison)]
+    if len(finite) < 50:
+        return 0.0, np.nan, np.nan
+    height = np.percentile(finite, 80)
+    peaks, _ = find_peaks(np.nan_to_num(comparison, nan=-np.inf),
+                          height=height, distance=3)
+    if len(peaks) < min_lines:
+        return 0.0, np.nan, np.nan
+    peaks = peaks.astype(float) + 1.0        # fit_comparison counts from 1
+
+    def cost(shifts):
+        d = np.abs((line_px[:, None, None] + shifts[None, None, :])
+                   - peaks[None, :, None])
+        return np.median(d.min(axis=1), axis=0)
+
+    offs = np.arange(-search, search + coarse, coarse)
+    c = cost(offs)
+    best = offs[int(np.argmin(c))]
+
+    fine_offs = np.arange(best - coarse, best + coarse + fine, fine)
+    fc = cost(fine_offs)
+    shift = float(fine_offs[int(np.argmin(fc))])
+    residual = float(fc.min())
+
+    # how much better is this than the best genuinely different alignment?
+    spacing = np.median(np.diff(np.sort(peaks))) if len(peaks) > 2 else 10.0
+    others = c[np.abs(offs - best) > 0.5 * spacing]
+    quality = float(others.min() / residual) if len(others) and residual > 0 \
+        else np.inf
+
+    return shift, residual, quality
+
+
+def solve_dispersion_shifts(id_order_pairs, orders, linelists, avg_aps,
+                            search=30.0, max_scatter=6.0, verbose=False):
+    """Per-order dispersion shift, with the orders keeping each other honest.
+"""
+    raw = {}
+    ap = {}
+    for idx_id, idx_order in id_order_pairs:
+        o = orders[idx_order]
+        comp = getattr(o, "comparison", None)
+        if comp is None:
+            continue
+        table = linelists[avg_aps[idx_id]]
+        shift, residual, quality = solve_dispersion_shift(
+            np.asarray(table, dtype=float)[:, 0], comp, search=search)
+        if np.isfinite(residual) and quality > 1.5:
+            raw[idx_order] = shift
+            ap[idx_order] = getattr(o, "pixel_y_cen", float(idx_order))
+
+    if not raw:
+        if verbose:
+            print("- dispersion shift: not measurable, seeds used as they are")
+        return {}
+
+    idxs = np.array(sorted(raw))
+    vals = np.array([raw[i] for i in idxs])
+    pos = np.array([ap[i] for i in idxs])
+
+    med = np.median(vals)
+    scatter = 1.4826 * np.median(np.abs(vals - med))
+    keep = np.abs(vals - med) <= max(3 * scatter, max_scatter)
+    if np.sum(keep) >= 4:
+        coef = np.polyfit(pos[keep], vals[keep], 1)
+        smooth = np.polyval(coef, pos)
+        # only override the orders that disagree with the trend
+        bad = np.abs(vals - smooth) > max(3 * scatter, max_scatter)
+        vals = np.where(bad, smooth, vals)
+    else:
+        bad = ~keep
+        vals = np.where(bad, med, vals)
+
+    if verbose:
+        print("- dispersion shift = %+.1f px (range %+.1f..%+.1f over %d "
+              "orders, %d replaced by the trend)"
+              % (np.median(vals), vals.min(), vals.max(), len(vals),
+                 int(np.sum(bad))))
+        if abs(np.median(vals)) > 4:
+            print("  the idcomp seeds are further from the arc than "
+                  "fit_comparison can reach on its own; removing the shift "
+                  "first is what keeps this solution tied to the data")
+
+    return {int(i): float(v) for i, v in zip(idxs, vals)}
+
+
 def process_dispersion(args):
-    """
-    wrapper for solving dispersion relations using multiprocessing
-    """
+    """wrapper for solving dispersion relations using multiprocessing"""
     j, idx_id, idx_order, o, DEBUG_PLOTS = args
     key = shared("avg_aps")[idx_id]
     linelist_o = shared("linelists")[key]
     thar_list = shared("thar_list")
+    seed_shift = shared("seed_shifts", {}).get(idx_order, 0.0)
 
     # only plot one solution
     debug_solve = DEBUG_PLOTS and (j == 3)
 
     try:
-        solve_wavelength(linelist_o, o, DEBUG_PLOTS=debug_solve, thar_list=thar_list)
+        solve_wavelength(linelist_o, o, DEBUG_PLOTS=debug_solve,
+                         thar_list=thar_list, seed_shift=seed_shift)
     except Exception as exc:
-        # too few usable lines in this order, or a fit that will not converge.
-        # leave o.wl as None: the caller drops orders without a solution rather
-        # than losing the whole night over one unusable order at the edge.
         warnings.warn("no dispersion solution for order %s: %s" % (o.id, exc))
         return idx_order, o
     o.pix = np.arange(len(o.wl))
@@ -553,20 +557,8 @@ def _nearest_signed(ap_measure, ap_shifted):
 
 def _plot_idcomp_offset(ap_idcomp, ap_measure, offs, cost, offset, residual,
                         quality, spacing):
-    """Show how the idcomp offset was chosen, and what the alternatives look like.
-
-    Top: the scan. Every candidate shift of the reference apertures, and how
-    well the detected orders line up with them. The correct shift sits in a
-    deep, narrow well; the shallow minima roughly one order spacing away are
-    the off-by-one alignments, which are exactly the ones that used to be
-    picked silently by a hardcoded offset.
-
-    Bottom: the alignment itself. At the chosen offset every order sits within
-    a fraction of a pixel of a reference aperture. Shifted by one order spacing
-    the orders no longer land on the apertures -- and because the spacing
-    varies across the detector, the mismatch grows across the frame instead of
-    being a constant, which is what makes the correct shift identifiable.
-    """
+    """Show how the idcomp offset was chosen, and what the alternatives look
+    like."""
     figsize = np.array([8, 6])
     fig, axs = plt.subplots(2, 1, figsize=figsize)
 
@@ -588,9 +580,6 @@ def _plot_idcomp_offset(ap_idcomp, ap_measure, offs, cost, offset, residual,
                      "than any other" % quality)
     axs[0].legend(fontsize=8)
 
-    # --- bottom: this alignment vs the off-by-one ones -------------------
-    # orders beyond the ends of the reference set have no aperture to match and
-    # would otherwise set the scale for the whole panel
     inside = ((np.asarray(ap_measure) > np.min(ap_idcomp) + offset - spacing)
               & (np.asarray(ap_measure) < np.max(ap_idcomp) + offset + spacing))
     alt_resid = []
@@ -620,36 +609,8 @@ def _plot_idcomp_offset(ap_idcomp, ap_measure, offs, cost, offset, residual,
 
 def solve_idcomp_offset(ap_idcomp, ap_measure, search=None, coarse=0.5, fine=0.02,
                         verbose=False, DEBUG_PLOTS=False):
-    """Measure the cross-dispersion shift between the idcomp reference and this night.
-
-    The idcomp line lists are tied to the aperture positions of the night they
-    were taken on. The spectrograph shifts in the cross-dispersion direction
-    between runs, so orders can only be paired with their line list after that
-    shift is applied. It used to be a hardcoded constant, which quietly pairs
-    orders with a *neighbouring* aperture once the drift grows comparable to the
-    order spacing (~15 px) -- the reduction still completes, but every order
-    carries the wrong line list and the wavelength solution is wrong.
-
-    Here the shift is measured from the data: scan candidate offsets and keep
-    the one minimising the median distance from each detected order to the
-    nearest reference aperture. Using the median makes this insensitive to
-    spurious order detections, and the minimum is sharp because the order
-    spacing varies across the detector -- a wrong-by-one alignment cannot be
-    absorbed by a rigid shift, so it leaves a much larger residual.
-
-    Returns
-    -------
-    offset : float
-        Shift in pixels to add to the reference aperture positions.
-    residual : float
-        Median distance from an order to its reference aperture, in pixels.
-    quality : float
-        Residual of the best rejected alternative divided by ``residual``.
-        Values near 1 mean the alignment is ambiguous.
-
-    With ``DEBUG_PLOTS`` the scan is shown together with the alignment it
-    produces, next to the off-by-one alignments it rejected.
-    """
+    """Measure the cross-dispersion shift between the idcomp reference and this
+    night."""
     ap_idcomp = np.asarray(ap_idcomp, dtype=float)
     ap_measure = np.asarray(ap_measure, dtype=float)
 
@@ -711,11 +672,6 @@ def find_dispersion(orders, biases, comps,
 
     times_sigma = 2
 
-    # Anything in the directory that parses as an identify record is a line
-    # list. The names are not a convention we control -- the 2023 lists are
-    # "idiazcomp.0001", the 2026 ones from the observatory are "idtzc01" --
-    # so matching on the name would have silently found nothing and left the
-    # night with no wavelength solution at all.
     raw_lists = {}
     skipped = []
     for file in sorted(os.listdir(idcomp_dir)):
@@ -747,11 +703,6 @@ def find_dispersion(orders, biases, comps,
     linelists = {ap + idcomp_offset: table for ap, table in raw_lists.items()}
     avg_aps = np.array(list(linelists.keys()))
 
-#    if DEBUG_PLOTS:
-#        plt.imshow(flats)
-#        for key in linelists.keys():
-#            plt.scatter([len(spectrum) / 2], [key], marker="x", zorder=2, color="red")
-#        plt.show()
 
     # find the best-matching orders
     id_order_pairs = pair_generation(avg_aps, ap_measure, thres_max=np.inf)
@@ -765,7 +716,6 @@ def find_dispersion(orders, biases, comps,
         results = list(tqdm(pool.imap(extract_order_for_calib, args), total=len(args)))
     for idx_order, o in results:
         orders[idx_order] = o
-
     """
     for p in id_order_pairs:
         idx_order = p[1]
@@ -776,11 +726,14 @@ def find_dispersion(orders, biases, comps,
         o.apply_corrections(comparison=True)
     """
 
+    seed_shifts = solve_dispersion_shifts(id_order_pairs, orders, linelists,
+                                          avg_aps, verbose=verbose)
+
     if verbose: print("- solving dispersion relations")
     args = [(j, p[0], p[1], orders[p[1]], DEBUG_PLOTS) \
         for j, p in enumerate(id_order_pairs)]
     calib_data = {"avg_aps": avg_aps, "linelists": linelists,
-                  "thar_list": thar_list}
+                  "thar_list": thar_list, "seed_shifts": seed_shifts}
 
     if DEBUG_PLOTS:
         # Sequential processing when DEBUG_PLOTS is enabled (matplotlib compatibility)
@@ -797,16 +750,10 @@ def find_dispersion(orders, biases, comps,
     for idx_order, o in results:
         orders[idx_order] = o
 
-    # Each order above was fitted in isolation. The spectrograph does not work
-    # that way -- m*lambda is the same for every order to a part in 10^4 -- so
-    # use that to catch and repair any order whose own fit has drifted. The
-    # sparsest orders have thirteen lines against four free parameters and are
-    # the ones this protects.
     try:
         enforce_invariant(orders, verbose=verbose)
     except Exception as exc:
         warnings.warn("grating-relation check skipped: %s" % exc)
-
     """
     for j, p in enumerate(id_order_pairs):
         idx_id = p[0]

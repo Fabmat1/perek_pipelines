@@ -1,32 +1,10 @@
-"""Remove the scattered light that fills the gaps between the orders.
-
-The grating throws a diffuse halo across the detector. In the flat it reads
-~10 counts where no order falls, rising to ~30 just below the reddest orders
-and decaying outwards with a ~170 px scale length. It is scattered light, not
-dark current: it points away from the brightest orders, and the 25 s flat
-carries more of it than a 300 s science exposure.
-
-It is 2-3% of a red order peak and can be ignored there, but in the blue the
-lamp is so faint that the halo is comparable to the signal -- the bluest orders
-peak at 13 counts over a floor of 10. Flat division then divides by mostly
-halo, leaving the blaze in and the order ends drooping against their
-neighbours.
-
-The halo is measured between the orders, so it must be subtracted before
-extraction collapses those pixels away. Below ~4000 A this rescues nothing --
-the flat's order edges hold no lamp signal to recover -- but it fixes the
-region just above, where real signal is buried under the halo.
-"""
+"""Remove the scattered light that fills the gaps between the orders."""
 import numpy as np
 from scipy.ndimage import median_filter
 
 
 def _order_centres(orders, column, nrow, min_separation=3.0):
-    """Order centres in one column, sorted, near-duplicates dropped.
-
-    Two traces that have converged would otherwise contribute a "midpoint"
-    lying on an order, which would then be read as background.
-    """
+    """Order centres in one column, sorted, near-duplicates dropped."""
     y = []
     for o in orders:
         if o.solution is None:
@@ -47,23 +25,7 @@ def _order_centres(orders, column, nrow, min_separation=3.0):
 
 def background(image, orders, colstep=32, halfwin=3, pad=3, tail=4,
                smooth_columns=7, quantile=25.0):
-    """Model the scattered-light halo under `image`.
-
-    Sampled between adjacent orders, at the 25th percentile of each gap: the
-    mean sits too high because two bright neighbours' wings meet in the middle,
-    but the outright minimum is biased low by ~1.35 sigma at any level (~30
-    counts under the red orders, and negative on a frame whose background is
-    genuinely near zero).
-
-    Beyond the outermost orders it is sampled at `tail` increasing distances to
-    follow the decay; holding it flat at the last value leaves tens of counts
-    of error under the reddest orders.
-
-    Every `colstep`-th column is measured and the rest interpolated -- the halo
-    is a shallow dome (~6 counts at the detector edge against ~11 in the
-    middle), so sampling every column would only add noise. Profiles are
-    median-filtered across columns to reject cosmics landing in a gap.
-    """
+    """Model the scattered-light halo under `image`."""
     image = np.asarray(image, dtype=float)
     nrow, ncol = image.shape
 

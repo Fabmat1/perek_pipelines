@@ -1,12 +1,4 @@
-"""Regression tests for the reduction pipeline.
-
-Runs under pytest if it is installed, and as a plain script if it is not:
-
-    python tests/test_pipeline.py
-
-Everything here is synthetic -- no frames are read -- so the whole file runs in
-well under a second and can be run before every commit.
-"""
+"""Regression tests for the reduction pipeline."""
 import os
 import sys
 
@@ -18,15 +10,13 @@ from echelle_reduction import (normalize_single_order, _fit_continuum,
                                get_detector_noise, red_edge_keep)
 from identify_orders import trace_windows, FALLBACK_WINDOWS
 from orders import SpectralOrder, gaussian_pixel_weights_2d
-from calibrate import fit_dispersion, parse_idcomp
+from calibrate import (fit_dispersion, parse_idcomp,
+                       solve_dispersion_shift, solve_dispersion_shifts)
 from tools import shared, publish_shared, polynomial
 import grating
 from template import output_stem
+from paths import select_idcomp_dir
 
-
-# --------------------------------------------------------------------------
-# helpers
-# --------------------------------------------------------------------------
 
 def _norm_args(wl, flx, ignore_windows, neighbours=(), extrapolated_out=True):
     """The positional argument tuple `normalize_single_order` expects."""
@@ -46,14 +36,8 @@ def _fake_order(npix=64, ncol=200, centre=40.0, width=4.0):
     return o
 
 
-# --------------------------------------------------------------------------
-# Fix 1: an ignore window on an order's end must not delete the order's tail
-# --------------------------------------------------------------------------
-
 def test_ignore_window_at_order_end_keeps_pixels_without_a_neighbour():
-    """The O2 A-band case: window (7590, 7660) covers the red end of an order
-    running to 7631, and no other order reaches there. Those 33 A were being
-    dropped outright, leaving a hole in the merged spectrum."""
+    """The O2 A-band case:"""
     wl = np.linspace(7505.0, 7631.0, 2000)
     flx = np.ones_like(wl) * 100.0
     flx[wl > 7590] *= 0.3                       # deep telluric absorption
@@ -90,8 +74,7 @@ def test_ignore_window_at_order_end_drops_pixels_when_a_neighbour_covers_them():
 
 
 def test_interior_ignore_window_never_drops_anything():
-    """H-alpha sits in an ignore window in the middle of its order. Masking it
-    from the continuum fit must not remove it from the spectrum."""
+    """H-alpha sits in an ignore window in the middle of its order."""
     wl = np.linspace(6532.0, 6642.0, 2000)
     flx = np.ones_like(wl) * 100.0
     flx[(wl > 6555) & (wl < 6570)] *= 0.4
@@ -102,10 +85,6 @@ def test_interior_ignore_window_never_drops_anything():
     halpha = (wl > 6540.0) & (wl < 6590.0)
     assert keep[halpha].all(), "H-alpha was deleted from its own order"
 
-
-# --------------------------------------------------------------------------
-# Fix 2: photon noise
-# --------------------------------------------------------------------------
 
 def test_extracted_variance_matches_analytic_sum_of_squared_weights():
     gain, read_noise = 2.0, 10.0
@@ -128,9 +107,7 @@ def test_extracted_variance_matches_analytic_sum_of_squared_weights():
 
 
 def test_extraction_weights_sum_to_one_so_variance_needs_sum_of_squares():
-    """The extracted value is a weighted mean, not a sum. Treating it as a raw
-    pixel count -- as `var = |science| + ...` did -- overstates the noise by
-    1/sum(w^2), which for this aperture is several-fold."""
+    """The extracted value is a weighted mean, not a sum."""
     ny, nx = 80, 20
     o = _fake_order(ncol=nx)
     _, _, weights = o.aperture(ny, nx)
@@ -188,14 +165,9 @@ def test_get_detector_noise_reads_header_and_falls_back(tmpdir=None):
     assert get_detector_noise(np.zeros((4, 4))) == (1.0, 0.0)
 
 
-# --------------------------------------------------------------------------
-# the sorted-mask fix in fit_dispersion
-# --------------------------------------------------------------------------
-
 def test_fit_dispersion_mask_lines_up_with_unsorted_input():
     """`fit_dispersion` sorts internally; the mask it returns has to index the
-    caller's unsorted arrays. The ThAr refinement appends predicted lines with
-    vstack, so the input really is unsorted by then."""
+    caller's unsorted arrays."""
     rng = np.random.default_rng(1)
     x = np.arange(50, 2000, 40, dtype=float)
     y = polynomial(x, 1e-9, -1e-6, 0.05, 4000.0)
@@ -212,10 +184,6 @@ def test_fit_dispersion_mask_lines_up_with_unsorted_input():
     assert not mask[bad], "the clipped line is not the one that was rejected"
     assert mask.sum() >= len(x) - 3
 
-
-# --------------------------------------------------------------------------
-# trace-frame window measurement
-# --------------------------------------------------------------------------
 
 def _synthetic_profile(ny, rows, amps):
     p = np.zeros(ny)
@@ -263,10 +231,6 @@ def test_trace_windows_falls_back_when_nothing_is_detectable():
     assert win == FALLBACK_WINDOWS
 
 
-# --------------------------------------------------------------------------
-# smaller guards
-# --------------------------------------------------------------------------
-
 def test_shared_raises_on_a_missing_key_but_honours_an_explicit_default():
     publish_shared({"present": 1})
     assert shared("present") == 1
@@ -302,34 +266,24 @@ def test_red_edge_keep_cuts_only_the_red_end():
     assert wl[keep].max() < wl.max() - 1.4
 
 
-# --------------------------------------------------------------------------
-# output filenames
-# --------------------------------------------------------------------------
-
 def test_output_stem_strips_glob_characters_from_the_object_name():
-    # "* psi cyg" is a real OBJECT value; an asterisk in the filename is a
-    # wildcard to every shell and tool that reads the spectra back
-    stem = output_stem("e202608290033.fit", "*_psi_cyg")
+    stem = output_stem("e202608290033.fit", "*_alp_xyz")
     assert "*" not in stem
-    assert stem == "e202608290033_psi_cyg"
+    assert stem == "e202608290033_alp_xyz"
 
 
 def test_output_stem_keeps_the_designation_of_a_variable_star():
-    assert output_stem("e202608270038.fit", "V*_BP_Boo") == "e202608270038_V_BP_Boo"
+    assert output_stem("e202608270038.fit", "V*_AB_Xyz") == "e202608270038_V_AB_Xyz"
 
 
 def test_output_stem_leaves_ordinary_names_alone():
-    assert output_stem("e202409010033.fit", "BD+26_2766") == "e202409010033_BD+26_2766"
+    assert output_stem("e202409010033.fit", "BD+00_0000") == "e202409010033_BD+00_0000"
 
 
 def test_output_stem_only_drops_the_trailing_extension():
     # ".fit" also appears inside the name here
-    assert output_stem("fit.fit", "HD_1") == "fit_HD_1"
+    assert output_stem("fit.fit", "XY_1") == "fit_XY_1"
 
-
-# --------------------------------------------------------------------------
-# idcomp line lists
-# --------------------------------------------------------------------------
 
 _IDCOMP_RECORD = """begin\tidentify tzc01 - Ap 1
 \taplow\t%(lo).2f
@@ -350,8 +304,6 @@ def _idcomp_text(records):
 
 
 def test_parse_idcomp_keeps_only_the_last_record():
-    # IRAF appends a record per save; the 2026 lists ship with four or five of
-    # them, and concatenating them would feed the fit the same line repeatedly
     import tempfile
     text = _idcomp_text([(853.04, 861.27, ["4027.0091", "4024.8025"]),
                          (853.04, 861.27, ["4027.0091", "4024.8025",
@@ -380,24 +332,6 @@ def test_parse_idcomp_returns_an_empty_table_for_a_file_that_is_not_a_list():
     assert table.shape == (0, 6)
 
 
-# --------------------------------------------------------------------------
-# the grating relation
-#
-# `order_numbers` used to assign m by an order's *rank* in the sorted list,
-# which is wrong whenever the list is not one unbroken run of real orders --
-# and it usually is not. A diverged fit takes a rank it does not own, and an
-# order that failed to solve is absent altogether, so a consecutive run of m
-# steps over the gap. Either way the whole block shifts together and m*lambda
-# stays smooth, so nothing downstream notices; `enforce_invariant` then
-# measured every order against a model built on wrong m and "restored" the
-# scale of ten healthy orders by 140-207 A each.
-# --------------------------------------------------------------------------
-
-# Real orders: the median wavelength and median dispersion of each of the 53
-# apertures in `idcomp_2307`, from a cubic through its own line list. Embedded
-# rather than read so the suite still touches no files, and real rather than
-# synthetic because the whole question is how close to an integer K/lambda
-# lands on the actual instrument -- the worst of these misses by 0.02.
 _CENTRES = (
     8678.625, 8473.728, 8276.686, 8088.606, 7908.878, 7736.961,
     7572.368, 7414.629, 7262.925, 7118.081, 6978.527, 6844.344,
@@ -434,11 +368,7 @@ class _Order:
 
 
 def _real_orders(skip=(), npix=2048):
-    """The reference block as orders, reddest first, `skip` left out.
-
-    A slight curvature is folded in so the shape-preserving refit is actually
-    exercised; the median stays on the tabulated centre either way.
-    """
+    """The reference block as orders, reddest first, `skip` left out."""
     x = np.arange(npix, dtype=float) - npix / 2.0
     curve = (x ** 2 - float(np.mean(x ** 2))) / npix ** 2
     out = []
@@ -463,9 +393,7 @@ def test_invariant_recovers_m_lambda_from_the_bundled_reference_list():
 
 
 def test_invariant_is_unmoved_by_a_diverged_order():
-    """A cubic through a dozen seed lines can report a centre of 10^7 A. It
-    lands in two of fifty-two adjacent pairs, so a median over pairs cannot
-    see it -- which is the whole reason for measuring K that way."""
+    """A cubic through a dozen seed lines can report a centre of 10^7 A."""
     clean = grating.invariant(_CENTRES)
     with_runaway = grating.invariant(list(_CENTRES) + [1.0e7])
     assert abs(with_runaway - clean) / clean < 1e-6, \
@@ -474,8 +402,7 @@ def test_invariant_is_unmoved_by_a_diverged_order():
 
 def test_invariant_is_unmoved_by_orders_missing_from_the_list():
     """Unsolved orders are dropped before `enforce_invariant` sees them, so the
-    list arrives with holes in it. A pair spanning a hole reports half the true
-    m, but only a minority of pairs do."""
+    list arrives with holes in it."""
     kept = [c for i, c in enumerate(_CENTRES) if i not in (7, 8, 20, 33, 34)]
     assert abs(grating.invariant(kept) - grating.invariant(_CENTRES)) < 50.0
 
@@ -494,9 +421,7 @@ def test_order_numbers_are_consecutive_on_the_bundled_reference_list():
 
 
 def test_order_numbers_survive_an_order_missing_from_the_middle():
-    """The gap regression. Assigning m by rank walks straight over a missing
-    order, so every order past the gap comes out one too low -- and m*lambda
-    stays smooth across the shifted block, so no later check catches it."""
+    """The gap regression."""
     full = grating.order_numbers(_CENTRES)
     gap_at = 25
     kept = [c for i, c in enumerate(_CENTRES) if i != gap_at]
@@ -507,9 +432,7 @@ def test_order_numbers_survive_an_order_missing_from_the_middle():
 
 
 def test_order_numbers_of_healthy_orders_are_unmoved_by_a_diverged_neighbour():
-    """The runaway regression. A centre of 10^7 A sorts to the top of the list
-    and used to take m = 41 from the order that owns it, pushing all ten bluer
-    orders up by one."""
+    """The runaway regression."""
     full = grating.order_numbers(_CENTRES)
     hurt = list(_CENTRES)
     hurt[10] = 1.0e7
@@ -521,8 +444,7 @@ def test_order_numbers_of_healthy_orders_are_unmoved_by_a_diverged_neighbour():
 
 
 def test_order_numbers_refuses_to_place_a_diverged_order():
-    """No integer is better than a wrong one: at the red end one order is only
-    ~10 A, so a plausible-looking m can be a whole order out."""
+    """No integer is better than a wrong one:"""
     hurt = list(_CENTRES)
     hurt[10] = 1.0e7
     hurt[20] = 0.5 * (_CENTRES[20] + _CENTRES[21])   # halfway to its neighbour
@@ -543,8 +465,7 @@ def test_order_numbers_follow_the_input_order_not_the_sorted_one():
 
 
 def test_order_numbers_honours_the_valid_mask_for_the_scale():
-    """`valid` keeps an order from setting K. It still gets an m if it has
-    one -- excluding it from the vote is not the same as discarding it."""
+    """`valid` keeps an order from setting K."""
     hurt = list(_CENTRES)
     hurt[3] = 6.0e6
     valid = np.ones(len(hurt), bool)
@@ -593,9 +514,7 @@ def test_enforce_invariant_leaves_a_consistent_night_alone():
 
 
 def test_enforce_invariant_restores_a_stray_zero_point():
-    """The one thing the module is for: an order whose fit drifted gets the
-    scale the other fifty agree on. 2.9 A at 5.6 sigma is what a real night
-    reported, so a 3 A shift has to be caught and reduced."""
+    """The one thing the module is for:"""
     orders = _real_orders()
     stray = 20
     truth = orders[stray].wl.copy()
@@ -607,9 +526,7 @@ def test_enforce_invariant_restores_a_stray_zero_point():
 
 
 def test_enforce_invariant_touches_only_the_stray():
-    """The regression that mattered: with m assigned by rank, one diverged
-    order shifted ten healthy ones and every one of them was rewritten -- by
-    140 to 207 A, silently, on a night that otherwise reduced cleanly."""
+    """The regression that mattered:"""
     orders = _real_orders()
     orders[10].wl = orders[10].wl * 30.0
     before = {o.id: o.wl.copy() for o in orders}
@@ -622,8 +539,7 @@ def test_enforce_invariant_touches_only_the_stray():
 
 def test_enforce_invariant_drops_a_diverged_order_instead_of_replacing_its_scale():
     """Its centre is not one order's spacing from anything, so there is no
-    telling which order to restore it to. It is flagged for the merge to drop
-    -- the same choice the pipeline makes for an order that never solved."""
+    telling which order to restore it to."""
     orders = _real_orders()
     orders[10].wl = orders[10].wl * 30.0
     before = orders[10].wl.copy()
@@ -638,15 +554,12 @@ def test_enforce_invariant_drops_a_diverged_order_instead_of_replacing_its_scale
 
 def test_enforce_invariant_flags_a_non_monotonic_order():
     """A relation that folds inside the detector has the wrong shape, not the
-    wrong scale, so no rescaling repairs it. Its median dispersion is normal,
-    which is why only the sign changes reveal it."""
+    wrong scale, so no rescaling repairs it."""
     orders = _real_orders()
     folded = 30
     x = np.arange(len(orders[folded].wl), dtype=float)
     disp = _DISPERSIONS[folded]
     period = len(x) / 8.0
-    # a wobble steep enough to reverse some steps, symmetric so the centre --
-    # and so the order number, and so the scale test -- is unaffected
     wobble = 2.0 * abs(disp) * period / (2 * np.pi)
     orders[folded].wl = orders[folded].wl + wobble * np.sin(2 * np.pi * x / period)
 
@@ -727,6 +640,90 @@ def test_enforce_invariant_is_not_confused_by_a_gap_in_the_order_list():
     assert grating.enforce_invariant(orders) == 0
     assert all(np.array_equal(o.wl, b) for o, b in zip(orders, before))
     assert all(o.dispersion_ok for o in orders)
+
+
+def _synthetic_arc(line_px, npix=2048, sigma=1.6):
+    """An arc with a Gaussian line at each position, on a low pedestal."""
+    x = np.arange(npix) + 1.0
+    arc = np.full(npix, 0.02)
+    for c in line_px:
+        arc += np.exp(-0.5 * ((x - c) / sigma) ** 2)
+    return arc
+
+
+def test_idcomp_set_is_chosen_by_the_night_and_not_by_the_default():
+    assert select_idcomp_dir("2024-09-01").endswith("idcomp_2307")
+    assert select_idcomp_dir("2025-09-03").endswith("idcomp_2307")
+    assert select_idcomp_dir("2026-08-29").endswith("idcomp_2026")
+    # a full timestamp works as well as a bare date
+    assert select_idcomp_dir("2026-08-29T22:19:09").endswith("idcomp_2026")
+    # and the boundary is where it says it is
+    assert select_idcomp_dir("2025-12-31").endswith("idcomp_2307")
+    assert select_idcomp_dir("2026-01-01").endswith("idcomp_2026")
+
+
+def test_dispersion_shift_recovers_a_drift_larger_than_the_fit_window():
+    rng = np.random.default_rng(0)
+    true_px = np.sort(rng.uniform(60, 1990, 22))
+    arc = _synthetic_arc(true_px)
+    seeds = true_px - 14.0
+    shift, residual, quality = solve_dispersion_shift(seeds, arc)
+    assert abs(shift - 14.0) < 0.3
+    assert residual < 0.5
+    assert quality > 2
+
+
+def test_dispersion_shift_is_zero_when_the_seeds_already_match():
+    rng = np.random.default_rng(1)
+    true_px = np.sort(rng.uniform(60, 1990, 22))
+    arc = _synthetic_arc(true_px)
+    shift, residual, _ = solve_dispersion_shift(true_px, arc)
+    assert abs(shift) < 0.2
+    assert residual < 0.5
+
+
+def test_dispersion_shift_gives_up_rather_than_guessing():
+    # too few seeds to place anything: return no shift, not a random one
+    arc = _synthetic_arc([100.0, 400.0, 900.0])
+    shift, residual, _ = solve_dispersion_shift(np.array([90.0, 390.0]), arc)
+    assert shift == 0.0
+    assert np.isnan(residual)
+
+
+class _FakeOrder:
+    def __init__(self, comparison, pixel_y_cen):
+        self.comparison = comparison
+        self.pixel_y_cen = pixel_y_cen
+        self.id = int(pixel_y_cen)
+
+
+def test_dispersion_shifts_replace_an_order_that_disagrees_with_the_detector():
+    rng = np.random.default_rng(2)
+    orders, linelists, avg_aps, pairs = [], {}, [], []
+    for i in range(8):
+        true_px = np.sort(rng.uniform(60, 1990, 20))
+        drift = 10.0 + 0.5 * i                     # a smooth trend
+        arc = _synthetic_arc(true_px)
+        orders.append(_FakeOrder(arc, 800.0 + 15.0 * i))
+        table = np.zeros((len(true_px), 6))
+        table[:, 0] = true_px - drift
+        avg_aps.append(800.0 + 15.0 * i)
+        linelists[avg_aps[i]] = table
+        pairs.append((i, i))
+    shifts = solve_dispersion_shifts(pairs, orders, linelists,
+                                     np.array(avg_aps))
+    assert len(shifts) == 8
+    for i in range(8):
+        assert abs(shifts[i] - (10.0 + 0.5 * i)) < 0.4
+
+
+def test_dispersion_shifts_returns_nothing_when_no_order_is_measurable():
+    orders = [_FakeOrder(np.full(2048, 0.02), 900.0)]
+    table = np.zeros((3, 6))
+    table[:, 0] = [100.0, 400.0, 900.0]
+    shifts = solve_dispersion_shifts([(0, 0)], orders, {900.0: table},
+                                     np.array([900.0]))
+    assert shifts == {}
 
 
 # --------------------------------------------------------------------------

@@ -6,26 +6,11 @@ from multiprocessing import Pool, cpu_count
 from scipy.optimize import curve_fit
 from resample_backend import resample
 
-# ---------------------------------------------------------------------------
-# Sharing bulk data with Pool workers.
-#
-# Python 3.14 switched the default start method on Linux from "fork" to
-# "forkserver", so workers no longer inherit the parent's memory copy-on-write.
-# Anything placed in a task tuple is then pickled through a pipe once per task,
-# which for whole 2048x2048 detector frames dominates the run time. Passing the
-# frames as `initargs` instead sends them once per worker process.
-# ---------------------------------------------------------------------------
 
 _WORKER_DATA = {}
 
 def _default_ncpu():
-    """Every core, unless PEREK_NCPU says otherwise.
-
-    This is what the pipeline did before the worker count was made
-    configurable, and it is the right default for the machine the reduction
-    normally runs on. `--ncpu` exists to turn it *down* on a shared box; it
-    only takes effect when it is actually passed.
-    """
+    """Every core, unless PEREK_NCPU says otherwise."""
     env = os.environ.get("PEREK_NCPU")
     if env:
         try:
@@ -43,13 +28,7 @@ _NCPU = _default_ncpu()
 
 
 def set_ncpu(n):
-    """Set the worker count for every pool the pipeline opens.
-
-    Also exported to the environment. Workers started with "spawn" -- the
-    default on Windows and macOS -- re-import this module rather than
-    inheriting the parent's memory, so a module-level variable alone would
-    reset to the default inside them.
-    """
+    """Set the worker count for every pool the pipeline opens."""
     global _NCPU
     _NCPU = max(1, int(n))
     os.environ["PEREK_NCPU"] = str(_NCPU)
@@ -65,10 +44,7 @@ def _init_worker(payload):
 
 
 def shared_pool(payload, processes=None):
-    """A Pool whose workers can reach `payload` (a dict) via `shared()`.
-
-    `processes` defaults to the value set by `set_ncpu`.
-    """
+    """A Pool whose workers can reach `payload` (a dict) via `shared()`."""
     if processes is None:
         processes = _NCPU
     return Pool(processes=max(1, int(processes)),
@@ -76,10 +52,7 @@ def shared_pool(payload, processes=None):
 
 
 def publish_shared(payload):
-    """Make `payload` visible to `shared()` in the current process.
-
-    Needed when the same worker function is called directly instead of through
-    a `shared_pool` (e.g. the sequential DEBUG_PLOTS path)."""
+    """Make `payload` visible to `shared()` in the current process."""
     _init_worker(payload)
 
 
@@ -87,13 +60,7 @@ _MISSING = object()
 
 
 def shared(key, default=_MISSING):
-    """Read a value published to the workers by `shared_pool`.
-
-    A worker can ask for an optional payload by passing `default` explicitly.
-    Without one a missing key raises, because the alternative is a typo'd key
-    silently handing back None and the caller reducing the night without
-    whatever it was asking for.
-    """
+    """Read a value published to the workers by `shared_pool`."""
     value = _WORKER_DATA.get(key, _MISSING)
     if value is _MISSING:
         if default is _MISSING:
@@ -120,8 +87,6 @@ def fill_nan(y):
     y = np.array(y, dtype=float)
     nans = np.isnan(y)
     if not nans.any() or nans.all():
-        # nothing to do, or nothing to interpolate from -- np.interp raises
-        # on an empty set of sample points
         return y
     x = lambda z: z.nonzero()[0]
     y[nans]= np.interp(x(nans), x(~nans), y[~nans])
@@ -130,12 +95,7 @@ def fill_nan(y):
 
 # sort and mask the sections based on flux thresholds
 def mask_section(section, tlo=0.05, thi=0.05, return_mask=False):
-    """Drop the lowest `tlo` and highest `thi` fraction of `section`.
-
-    Selection is by rank rather than by comparing against the values at those
-    ranks: with ties (a flat section) a value comparison rejects every element
-    at once, and with tlo=0 it still discarded the single lowest element.
-    """
+    """Drop the lowest `tlo` and highest `thi` fraction of `section`."""
     section = np.asarray(section)
     lsec = len(section)
     lo_idx = int(tlo * lsec)
@@ -246,12 +206,6 @@ def curve_fit_reject(x, y, function, thres=2, thres_max=None, **kwargs):
             yfit = y
             kwargs_fit = kwargs.copy()
         else:
-            # too few points survived clipping: keep the previous fit.
-            # (also happens for a near-exact fit, where mad_std == 0)
-            # curve_fit needs at least as many points as the function has free
-            # parameters, so count them rather than assuming 3: the cubic used
-            # for the dispersion has 4, and the sparsest red line lists (9
-            # lines before masking) really do clip below that.
             try:
                 nparam = function.__code__.co_argcount - 1
             except AttributeError:
@@ -259,8 +213,6 @@ def curve_fit_reject(x, y, function, thres=2, thres_max=None, **kwargs):
             if np.sum(mask) < max(3, nparam):
                 return params, errs, mask
             else:
-                # index the last axis: `x` is 1D for the usual fits, but a
-                # 2D model is passed its coordinates as (2, npoint)
                 xfit = x[..., mask]
                 yfit = y[mask]
                 for key in kwargs:
