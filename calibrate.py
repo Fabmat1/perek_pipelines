@@ -283,7 +283,8 @@ def _monotonic(wl, max_wrong=0.0):
     return min(up, dn) / float(up + dn) <= max_wrong
 
 
-def fit_dispersion(x, y, yerr, thar_list=None, DEBUG_PLOTS=False):
+def fit_dispersion(x, y, yerr, thar_list=None, npix_detector=2048,
+                   DEBUG_PLOTS=False):
 
     # sort for the fit and the residual plot, but remember the permutation:
     # the mask returned below has to line up with the caller's arrays, not with
@@ -306,7 +307,10 @@ def fit_dispersion(x, y, yerr, thar_list=None, DEBUG_PLOTS=False):
     # if they cluster. Such a fit has a normal median dispersion, so only the
     # sign changes reveal it. Lower the degree until it is monotonic; a line
     # never folds, so this terminates.
-    npix = int(np.nanmax(x)) + 1 if np.isfinite(np.nanmax(x)) else 2048
+    # over the whole detector, not just as far as the reddest line: an order
+    # whose lines cover a third of the chip folds beyond them unnoticed
+    npix = max(int(np.nanmax(x)) + 1, npix_detector) \
+        if np.isfinite(np.nanmax(x)) else npix_detector
     grid = np.arange(max(npix, 2), dtype=float)
     if not _monotonic(polynomial(grid, *params)):
         # `polynomial` takes a fixed four coefficients, so refit with polyfit
@@ -447,6 +451,7 @@ def solve_wavelength(linetable, order,
                               y=line_wls,
                               yerr=actual_errors,
                               thar_list=thar_list,
+                              npix_detector=len(pixels),
                               DEBUG_PLOTS=DEBUG_PLOTS)
         params = disp["params"]
         mask_good_disp = disp["mask_good"]
