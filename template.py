@@ -306,7 +306,17 @@ def reduce_night(dir, idcomp_dir, fn_science=None,
                 with fits.open(os.path.join(dir, fp)) as hdul:
                     header = hdul[0].header
                 if s["bjd"] is not None:
-                    header["BJD"] = s["bjd"]
+                    header["BJD"] = (s["bjd"],
+                                     "Barycentric JD (TDB), exposure midpoint")
+                # BARYCORR is the echelle (.ech) name for this quantity. There
+                # it is the correction still *to be* applied to an observatory
+                # frame wavelength scale, so BARYAPPL says whether ours already
+                # carries it
+                if s.get("barycorr") is not None:
+                    header["BARYCORR"] = (s["barycorr"],
+                                          "Barycentric RV correction [km/s]")
+                header["BARYAPPL"] = (bool(s.get("barycorr_applied", False)),
+                                      "BARYCORR applied to the wavelengths")
                 # FITS cannot store a NaN card value
                 if np.isfinite(SNR):
                     header["SNR"] = SNR

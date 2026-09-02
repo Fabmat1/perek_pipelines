@@ -83,6 +83,11 @@ def get_barycorr(frame):
     comute:
      - barycentric correction to the radial velocity
      - barycentrically corrected JD (-> BJD)
+
+    Both are referred to the *midpoint* of the exposure. The barycentric
+    velocity drifts by up to ~1 m/s per minute, so taking the start of one of
+    this instrument's 20-45 min integrations is a systematic error of several
+    m/s rather than a rounding one.
     """
 
     with fits.open(frame) as hdul:
@@ -104,8 +109,25 @@ def get_barycorr(frame):
         DEC = header['DEC']
         coord = SkyCoord(ra=RA, dec=DEC, unit=(u.hourangle, u.deg))
 
-        # Observation time
-        otime = Time(header["DATE-OBS"]+"T"+header["UT"], format='isot', scale='utc', location=location)
+        # Observation time: DATE-OBS is a bare date here and UT holds the start
+        # of the exposure, but tolerate a DATE-OBS that already carries the time
+        date_obs = str(header["DATE-OBS"]).strip()
+        if "T" in date_obs:
+            tstr = date_obs
+        else:
+            tstr = date_obs + "T" + str(header["UT"]).strip()
+        otime = Time(tstr, format='isot', scale='utc', location=location)
+
+        # ... moved to the middle of the integration
+        exptime = header.get("EXPTIME", header.get("DARKTIME", None))
+        try:
+            exptime = float(exptime)
+        except (TypeError, ValueError):
+            exptime = None
+        if exptime is not None and np.isfinite(exptime) and exptime > 0:
+            otime = otime + 0.5 * exptime * u.s
+        else:
+            print("> no usable EXPTIME: barycorr taken at the start of the exposure")
 
         # Radial velocity correction (barycentric)
         radvel_corr = coord.radial_velocity_correction(obstime=otime)
@@ -1290,7 +1312,8 @@ def extract_spectrum(spectrum, flats, comps, biases, idcomp_offset="auto",
                                             DEBUG_PLOTS=DEBUG_PLOTS,
                                             verbose=verbose)
 
-    if apply_barycorr and (radvel is not None):
+    barycorr_applied = bool(apply_barycorr and (radvel is not None))
+    if barycorr_applied:
         wave_merged = wlshift(wave_merged, radvel)
 
     # construct resolving power column
@@ -1318,7 +1341,11 @@ def extract_spectrum(spectrum, flats, comps, biases, idcomp_offset="auto",
             "error": noise,
             "res": res_merged,
             "orders": orders,
-            "bjd": bjd}
+            "bjd": bjd,
+            # the correction itself, and whether the wavelengths above are in
+            # the barycentric frame or still the observatory's
+            "barycorr": radvel,
+            "barycorr_applied": barycorr_applied}
 
     return dout
 
