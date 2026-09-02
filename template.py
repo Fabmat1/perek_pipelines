@@ -7,6 +7,7 @@ for _var in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS",
 
 import re
 import sys
+import multiprocessing
 import time
 import argparse
 import numpy as np
@@ -343,4 +344,7 @@ def reduce_night(dir, idcomp_dir, fn_science=None,
 
 
 if __name__ == "__main__":
+    # Windows re-imports this module in every worker; freeze_support() is what
+    # keeps a frozen build from re-running the reduction instead
+    multiprocessing.freeze_support()
     main()

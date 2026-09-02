@@ -96,14 +96,19 @@ def read_spectrum_file(fp):
     err = df.iloc[:,2]
     return wave, flux, err
 
-def plot_spectrum(wave, flux, err, title):
+def plot_spectrum(wave, flux, err, title, wr=None):
+    ax = plt.gca()
     plt.title(title)
     plt.plot(wave, flux, color="black")
     plt.plot(wave, err, color="tab:gray")
+    if wr is not None:
+        plt.xlim(wr)
+        ax.relim()
+        ax.autoscale_view(scalex=False, scaley=True)
     plt.xlabel("Wavelength / Angstrom")
     plt.ylabel("Normalised flux")
-    ymin, ymax = plt.gca().get_ylim()
-    plt.gca().set_ylim(max(0,ymin), max(ymax, 1.2))
+    ymin, ymax = ax.get_ylim()
+    ax.set_ylim(max(0, ymin), max(ymax, 1.2))
     plt.tight_layout()
     plt.show()
 
@@ -111,7 +116,12 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("files", help="File pattern or list of files")
     parser.add_argument("--no-plots", action="store_true", help="Disable plotting")
+    parser.add_argument('-wr',"--wave_range", nargs=2,
+                    default=None, type=float,
+                    help="wavelength range")
     args = parser.parse_args()
+
+    wr = args.wave_range
 
     fps = args.files
     show_plots = not args.no_plots
@@ -135,7 +145,7 @@ def main():
         median_snr = np.nanmedian(snr)
         print("%33s %.1f" % (fp, median_snr))
         if show_plots:
-            plot_spectrum(wave, flux, err, fp)
+            plot_spectrum(wave, flux, err, fp, wr=wr)
 
 if __name__ == "__main__":
     main()

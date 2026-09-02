@@ -12,6 +12,7 @@ from identify_orders import trace_windows, FALLBACK_WINDOWS
 from orders import SpectralOrder, gaussian_pixel_weights_2d
 from calibrate import (fit_dispersion, parse_idcomp,
                        solve_dispersion_shift, solve_dispersion_shifts)
+import tools
 from tools import shared, publish_shared, polynomial
 import grating
 from template import output_stem
@@ -229,6 +230,68 @@ def test_trace_windows_falls_back_when_nothing_is_detectable():
     win, measured = trace_windows(flat_noise)
     assert not measured
     assert win == FALLBACK_WINDOWS
+
+
+def _echo_payload(key):
+    """Pool worker: hand back what `shared()` sees for one key."""
+    value = shared(key)
+    if isinstance(value, np.ndarray):
+        return value.shape, value.dtype.str, float(np.sum(value))
+    return value
+
+
+def test_a_payload_survives_the_trip_through_shared_memory():
+    """Shapes, dtypes and nesting have to come back exactly as they went in.
+
+    Payloads go to the workers as raw bytes in a shared block now, not as a
+    pickle, so this is the round trip the whole pool rests on."""
+    payload = {"zerod": np.array(3.5),
+               "empty": np.zeros(0),
+               "f32": np.arange(6, dtype=np.float32).reshape(2, 3),
+               "bools": np.array([True, False]),
+               "nested": {"pairs": [(1, 2), np.arange(3)]},
+               "plain": "not an array"}
+    shm = tools._publish_segment(payload)
+    try:
+        back = tools._attach_segment(shm.name)
+        assert back["zerod"].shape == ()
+        assert back["empty"].shape == (0,)
+        assert back["f32"].dtype == np.float32
+        np.testing.assert_array_equal(back["f32"], payload["f32"])
+        np.testing.assert_array_equal(back["bools"], payload["bools"])
+        np.testing.assert_array_equal(back["nested"]["pairs"][1], np.arange(3))
+        assert back["nested"]["pairs"][0] == (1, 2)
+        assert back["plain"] == "not an array"
+        assert not back["f32"].flags.writeable   # the block is shared
+    finally:
+        tools._release_segments()
+        shm.close()
+        shm.unlink()
+
+
+def test_the_pool_sees_each_payload_and_not_the_one_before_it():
+    """The pool outlives a payload, so a stale block must not leak into it."""
+    ncpu = tools.get_ncpu()
+    tools.set_ncpu(2)
+    try:
+        with tools.shared_pool({"img": np.arange(10, dtype=float)}) as pool:
+            first = pool.map(_echo_payload, ["img"] * 3)
+        with tools.shared_pool({"img": np.arange(10, dtype=float) + 100}) as pool:
+            second = list(pool.imap(_echo_payload, ["img"] * 3))
+    finally:
+        tools.set_ncpu(ncpu)
+    assert first == [((10,), "<f8", 45.0)] * 3
+    assert second == [((10,), "<f8", 1045.0)] * 3
+
+
+def test_one_worker_runs_in_this_process_instead_of_opening_a_pool():
+    ncpu = tools.get_ncpu()
+    tools.set_ncpu(1)
+    try:
+        with tools.shared_pool({"img": np.arange(4, dtype=float)}) as pool:
+            assert list(pool.imap(_echo_payload, ["img"])) == [((4,), "<f8", 6.0)]
+    finally:
+        tools.set_ncpu(ncpu)
 
 
 def test_shared_raises_on_a_missing_key_but_honours_an_explicit_default():

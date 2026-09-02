@@ -8,7 +8,6 @@ from tools import (Gaussian_res, polynomial, curve_fit_reject, pair_generation,
                    shared_pool, shared, publish_shared)
 from orders import extract_order_for_calib
 from grating import enforce_invariant
-from multiprocessing import Pool, cpu_count
 from tqdm import tqdm
 from scipy.interpolate import interp1d
 from scipy.signal import find_peaks

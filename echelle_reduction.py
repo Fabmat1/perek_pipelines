@@ -11,7 +11,6 @@ from scipy.ndimage import (minimum_filter, maximum_filter,
 from scipy.ndimage import gaussian_filter1d
 from scipy.optimize import curve_fit
 
-from multiprocessing import Pool, cpu_count
 from tqdm import tqdm
 
 import astropy.units as u
@@ -388,7 +387,7 @@ def poly_normalization(wls, flxs,
                  for i, wl in enumerate(wls)]
     if n_processes is None:
         n_processes = get_ncpu()
-    with Pool(max(1, int(n_processes))) as pool:
+    with shared_pool({}, processes=n_processes) as pool:
         if show_progress and len(args_list) > 10:
             results = list(tqdm(pool.imap(normalize_single_order, args_list),
                                total=len(args_list)))

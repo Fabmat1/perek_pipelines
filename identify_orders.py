@@ -7,7 +7,6 @@ from matplotlib.colors import LogNorm
 from scipy.optimize import curve_fit
 from scipy.ndimage import (minimum_filter, maximum_filter)
 
-from multiprocessing import Pool, cpu_count
 from tqdm import tqdm
 
 from tools import (mask_section, Gaussian, fill_nan, pair_generation,
