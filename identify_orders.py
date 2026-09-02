@@ -16,8 +16,6 @@ from orders import SpectralOrder
 
 two_log_two = 2 * np.sqrt(2 * np.log(2))
 
-# background-removal window shared by slice_analysis and blue_order_signal, so
-# the two measure the order profile the same way
 MIN_WINDOW_DEFAULT = 15
 
 class SpectralSlice:
@@ -51,20 +49,11 @@ class SpectralSlice:
 def slice_analysis(pixel, slice_x, slice_y, MIN_WINDOW=MIN_WINDOW_DEFAULT, MAX_WINDOW=15, NOISE_MEASURE_SECTION_WIDTH=0.05,
                    NOISE_CUTOFF=20, CUTTOFF_MARGIN=5, ORDER_GAUSS_THRESHOLD=0.6,
                    idx_peak_min=700, idx_peak_max=1750, DEBUG_PLOTS=False):
-    """
-    Locate the orders in one cross-dispersion cut of the frame.
-
-    idx_peak_min, idx_peak_max : rows between which real orders are expected.
-        Tuned for the 2048-row OES detector; pass explicit values for others.
-    """
+    """Locate the orders in one cross-dispersion cut of the frame."""
     if len(slice_x) != len(slice_y):
         raise ValueError("slice_x and slice_y must have the same length, got "
                          "%d and %d" % (len(slice_x), len(slice_y)))
 
-#    if abs(pixel-1714) < 2:
-#        DEBUG_PLOTS = True
-#    else:
-#        DEBUG_PLOTS = False
 
     # remove "bias"
     bias_lvl = minimum_filter(slice_y, size=MIN_WINDOW)
@@ -95,8 +84,6 @@ def slice_analysis(pixel, slice_x, slice_y, MIN_WINDOW=MIN_WINDOW_DEFAULT, MAX_W
                          "x=%s (%d pixels above cutoff)"
                          % (pixel, len(noise_indices)))
 
-    # hot pixels or other artefacts are usually isolated
-    # -> find groups of high-flux pixels (the orders)
     def group_consecutive(arr):
         diffs = np.diff(arr)
         # identify the points where the difference is not 1, meaning the sequence breaks
@@ -279,25 +266,15 @@ def process_slice(args):
     # slice_y runs along the cross-dispersion axis, so slice_x indexes rows
     slice_x = np.arange(frame_for_slice.shape[0])
     debug_slice = (i == 0) and DEBUG_PLOTS
-    # the columns summed above are centred on `pixel`, so that is the x the
-    # trace should be anchored at
     slice = slice_analysis(pixel, slice_x, slice_y, DEBUG_PLOTS=debug_slice)
     return slice
 
-# Fallback cross-dispersion windows, in rows, for the detector this pipeline
-# was developed on. They are only used when the layout cannot be measured from
-# the frames themselves; see `trace_windows`.
 FALLBACK_WINDOWS = {"blue": (770, 800), "red": (1620, 1670),
                     "noise": (100, 600), "cols": (900, 1150)}
 
 
 def column_profile(frame, bias=None, cols=None, col_frac=0.12):
-    """Cross-dispersion profile of one frame, background removed.
-
-    Averaged over a slice of columns near the middle of the dispersion axis --
-    wide enough to beat the noise down, narrow enough that the orders have not
-    curved appreciably across it.
-    """
+    """Cross-dispersion profile of one frame, background removed."""
     frame = np.asarray(frame, dtype=float)
     if bias is not None:
         frame = frame - np.asarray(bias, dtype=float)
@@ -310,33 +287,12 @@ def column_profile(frame, bias=None, cols=None, col_frac=0.12):
 
 
 def trace_windows(profiles, flat_profile=None, verbose=False):
-    """Where on the detector to measure blue signal, red signal and noise.
-
-    Measured from the data rather than assumed. The previous version hard-coded
-    the rows of one detector (blue at 770-800, red at 1620-1670, noise at
-    100-600), which is silently wrong on any other chip, binning or readout
-    window -- and this runs on the default trace path, so a mismatch would
-    quietly degrade every frame ranking rather than fail.
-
-    `profiles` are the per-frame cross-dispersion profiles; their elementwise
-    maximum shows every order that any frame caught, including the bluest ones
-    no single frame may have. `flat_profile` orients the result: the flat lamp
-    falls away towards the blue, so the faint end of the order block is the
-    blue end. Without it the windows are still returned, oriented by the
-    fallback's convention (blue at low row numbers).
-
-    Falls back to `FALLBACK_WINDOWS` if the orders cannot be located.
-    """
+    """Where on the detector to measure blue signal, red signal and noise."""
     if not profiles:
         return dict(FALLBACK_WINDOWS), False
     ref = np.max(np.vstack(profiles), axis=0)
     ny = len(ref)
 
-    # Rows carrying an order, against the scatter of the empty ones. The MAD
-    # can be exactly zero here and still be a perfectly good profile:
-    # `column_profile` subtracts a running minimum, so a clean stretch between
-    # orders comes out flat at zero. Fall back to a fraction of the profile's
-    # own dynamic range in that case rather than giving up on the measurement.
     med = np.median(ref)
     mad = 1.4826 * np.median(np.abs(ref - med))
     peak = float(np.max(ref) - med)
@@ -362,8 +318,6 @@ def trace_windows(profiles, flat_profile=None, verbose=False):
     end_a = (lo, min(hi, lo + width))
     end_b = (max(lo, hi - width), hi)
 
-    # the flat is bright in the red and dark in the blue, so the end where it
-    # holds less light is the blue one
     blue, red = end_a, end_b
     if flat_profile is not None and len(flat_profile) == ny:
         fa = float(np.median(flat_profile[end_a[0]:end_a[1]]))
@@ -388,11 +342,7 @@ def trace_windows(profiles, flat_profile=None, verbose=False):
 
 
 def window_signal(profile, rows, noise_rows):
-    """Peak of `profile` in `rows`, in units of its scatter in `noise_rows`.
-
-    Frames that cannot be scored (wrong shape, no signal) get -inf so they sort
-    last rather than raising.
-    """
+    """Peak of `profile` in `rows`, in units of its scatter in `noise_rows`."""
     ny = len(profile)
     if rows[1] > ny or noise_rows[1] > ny or rows[0] >= rows[1] \
             or noise_rows[0] >= noise_rows[1]:
@@ -408,18 +358,7 @@ def window_signal(profile, rows, noise_rows):
 
 def blue_order_signal(frame, bias=None, row_lo=None, row_hi=None,
                       col_lo=None, col_hi=None, noise_lo=None, noise_hi=None):
-    """How well the bluest orders stand out in one frame, in units of noise.
-
-    The bluest orders are the first to be lost when tracing, because the flat
-    lamp has almost no output there: on the 2026 detector it peaks around 20
-    counts at row 780 against 20000 at row 1400. Which science frame the orders
-    are traced on therefore decides how far into the blue the reduction
-    reaches, and optical brightness is a poor guide -- a red star with a long
-    exposure can be brighter overall and still leave the blue orders invisible.
-
-    Kept for one-off use on a single frame; `select_trace_frames` measures the
-    windows from the whole set instead of relying on these defaults.
-    """
+    """How well the bluest orders stand out in one frame, in units of noise."""
     w = FALLBACK_WINDOWS
     rows = (w["blue"][0] if row_lo is None else row_lo,
             w["blue"][1] if row_hi is None else row_hi)
@@ -436,23 +375,7 @@ def blue_order_signal(frame, bias=None, row_lo=None, row_hi=None,
 
 def select_trace_frames(frames, bias=None, nstack=4, verbose=False,
                         flat=None):
-    """Pick the frames to trace the orders on.
-
-    Ranking purely on blue signal picks hot blue stars, and those are faint in
-    the reddest orders: on 20260826 it reached 3834 A but lost everything
-    redward of 8540 A, because the reddest order was no longer visible in any
-    trace frame. So take the best blue frame first -- that is what sets how far
-    into the blue the reduction reaches -- and then fill the stack with the
-    frames that best cover the red end.
-
-    Each frame is read once and reduced to a cross-dispersion profile; the
-    windows the scores are measured in come from those profiles rather than
-    from hard-coded rows, so the ranking survives a change of detector,
-    binning or readout window. `flat` orients blue against red.
-
-    Returns up to `nstack` frames, or an empty list if none can be scored;
-    callers fall back to the flat, which is what the pipeline did before.
-    """
+    """Pick the frames to trace the orders on."""
     profiles, kept = [], []
     for f in frames:
         arr = f
@@ -683,20 +606,7 @@ def assign_orders_polyfit(orders, slicelist: list[SpectralSlice], thres_ydist = 
 
 def repair_short_traces(orders, min_coverage=0.5, max_shift=30.0,
                         verbose=False):
-    """Re-shape a trace that was fitted over too little of the detector.
-
-    A faint order yields few trace points, and the cubic then extrapolates
-    across most of the columns: on 20260829 order 1 was fitted over 18% of the
-    chip and wandered 12 rows off the star, against an aperture 4-5 rows wide,
-    so the extraction returned bias for 15% of the order.
-
-    The orders are parallel to under a row across 2000 columns, so a
-    well-traced neighbour supplies the shape, offset onto this order's own
-    points. Only the curvature outside the fitted range is borrowed.
-
-    `max_shift` rejects a donor whose implied offset is absurd, which would
-    mean the orders are mispaired rather than parallel.
-    """
+    """Re-shape a trace that was fitted over too little of the detector."""
     if len(orders) < 3:
         return 0
 
@@ -771,9 +681,6 @@ def find_orders(frame_for_slice,
 
     norders = len(orders)
     idx = np.arange(norders)
-    # start from the middle, alternate each side (use later for starting parameters)
-#    idx = norders // 2 + (idx + 1) // 2 * (-1) ** idx
-    # fit orders with polynomials
     for i in idx:
         o = orders[i]
         if len(o) > min_order_samples:
@@ -781,12 +688,6 @@ def find_orders(frame_for_slice,
 
     # remove bad orders
     orders = [o for o in orders if o.solution is not None]
-
-#    if DEBUG_PLOTS:
-#        for o in orders:
-#            plt.hist(o.rms, bins=10)
-#        plt.show()
-
     """
     # re-assign slices based on first polynomial fit
     orders = assign_orders_polyfit(orders, slices, max_slice, **kwargs)

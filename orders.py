@@ -8,12 +8,8 @@ from matplotlib import pyplot as plt
 from scipy.special import erf
 
 def gaussian_pixel_weights(y_pixels, y0, sigma):
-    """
-    Compute normalized pixel-integrated Gaussian weights for each pixel index in y_pixels.
-    y_pixels: array of pixel indices (integers)
-    y0: center of the Gaussian (float)
-    sigma: Gaussian sigma (float)
-    """
+    """Compute normalized pixel-integrated Gaussian weights for each pixel
+    index in y_pixels."""
     y_low = (y_pixels - 0.5 - y0) / (np.sqrt(2) * sigma)
     y_high = (y_pixels + 0.5 - y0) / (np.sqrt(2) * sigma)
     weights = 0.5 * (erf(y_high) - erf(y_low))
@@ -23,13 +19,7 @@ def gaussian_pixel_weights(y_pixels, y0, sigma):
     return weights
 
 def gaussian_pixel_weights_2d(y_pixels, y0, sigma, valid):
-    """
-    Row-wise version of ``gaussian_pixel_weights``.
-
-    ``y_pixels`` is (ncolumn, naperture); ``y0`` and ``sigma`` are column
-    vectors. Entries where ``valid`` is False are given zero weight and are
-    excluded from the per-row normalisation.
-    """
+    """Row-wise version of ``gaussian_pixel_weights``."""
     y_low = (y_pixels - 0.5 - y0) / (np.sqrt(2) * sigma)
     y_high = (y_pixels + 0.5 - y0) / (np.sqrt(2) * sigma)
     weights = 0.5 * (erf(y_high) - erf(y_low))
@@ -62,12 +52,7 @@ class SpectralOrder:
         self.comparison_orig = None
         self.bias = None
 
-        # Photon noise, from the counts as extracted -- before normalisation
-        # rescales everything to order unity.
         self.science_err = None
-        # Variance of the extracted science spectrum in ADU^2, filled in by
-        # `extract_variance_along_order` from the raw frame and the detector
-        # gain and read noise.
         self.science_var = None
 
         self.wl = None
@@ -85,8 +70,6 @@ class SpectralOrder:
     def generate_polynomial_solution(self, yerr_default=1.5, verbose=True, DEBUG_PLOTS=False):
         # yerr_default -> maximum rms (in pix) for an acceptable fit
 
-#        params, errs = curve_fit(polynomial, self.pixel_x, self.pixel_y, sigma=self.pixel_y_err)
-#        errs = np.sqrt(np.diag(errs))
 
         x = self.pixel_x
         y = self.pixel_y
@@ -141,7 +124,6 @@ class SpectralOrder:
 
             plt.tight_layout()
             plt.show()
-
         """
         # estimate reduced chi2
         nfree = 4
@@ -185,17 +167,7 @@ class SpectralOrder:
             self.pixel_mask_good = np.array(list(self.pixel_mask_good))
 
     def aperture(self, ny, nx, times_sigma=2):
-        """Pixel indices and weights of the extraction aperture.
-
-        Returns ``(columns, y_pixels, weights)``: one row per detector column,
-        the cross-dispersion pixel indices in that column, and the weight each
-        carries. The weights are normalised to sum to 1 per column, so the
-        extracted value is a weighted *mean* over the aperture, not a sum --
-        which is what the variance propagation has to account for.
-
-        Split out of `extract_along_order` so that the flux and its variance
-        are guaranteed to use the same aperture.
-        """
+        """Pixel indices and weights of the extraction aperture."""
         if self.solution is None:
             raise Exception("Generate a solution first!")
         if self.w_fcn is None:
@@ -219,13 +191,9 @@ class SpectralOrder:
         y_min = y_ind_round - np.minimum(ywidth, y_ind_round - y_min)
         y_max = y_ind_round + np.minimum(ywidth, y_max - y_ind_round)
 
-        # pixel indices along cross-dispersion, one row per column. The aperture
-        # is at most 2*ywidth wide, so pad to that and mask the unused entries.
         offsets = np.arange(2 * ywidth)
         y_pixels = y_min[:, None] + offsets[None, :]
         in_aperture = y_pixels < y_max[:, None]
-        # apertures running off the detector are clipped rather than wrapped
-        # around to the opposite edge (negative indices) or raising IndexError
         in_aperture &= (y_pixels >= 0) & (y_pixels < ny)
 
         # compute proper Gaussian-integrated weights
@@ -245,28 +213,7 @@ class SpectralOrder:
 
     def extract_variance_along_order(self, raw, bias, gain, read_noise,
                                      times_sigma=2):
-        """Variance of the extracted science spectrum, in ADU^2 per pixel.
-
-        `raw` is the science frame as read off the detector -- before the bias
-        and before the scattered-light halo are taken off. Both matter: the
-        shot noise is set by every electron that was actually collected, so
-        subtracting the halo removes signal but not the noise it brought with
-        it, and in the bluest orders the halo is comparable to the star.
-
-        Per detector pixel, in ADU,
-
-            var = (raw - bias) / gain + (read_noise / gain)^2
-
-        with `gain` in e-/ADU and `read_noise` in e-. The pixels are then
-        combined with the square of the extraction weights, because the
-        extracted value is a weighted mean: var(sum w*c) = sum w^2 * var(c).
-        For the OES aperture sum(w^2) is about 0.1, so treating the extracted
-        value as a single pixel count overstates the noise threefold.
-
-        The bias frame's own noise is neglected: it is a coadd of ten or more
-        zero exposures, so it contributes read_noise/sqrt(N) before the same
-        sum(w^2) suppression.
-        """
+        """Variance of the extracted science spectrum, in ADU^2 per pixel."""
         raw = np.asarray(raw, dtype=float)
         bias = np.asarray(bias, dtype=float)
         ny, nx = raw.shape
@@ -275,8 +222,6 @@ class SpectralOrder:
 
         yc = np.clip(y_pixels, 0, ny - 1)
         counts = raw[yc, columns[:, None]] - bias[yc, columns[:, None]]
-        # a pixel that reads below bias collected no photons; its variance is
-        # the read noise alone rather than something negative
         var_pix = np.maximum(counts, 0.0) / gain + (read_noise / gain) ** 2
         self.science_var = np.einsum("ij,ij->i", var_pix, np.square(weights))
         return self.science_var
@@ -335,9 +280,8 @@ class SpectralOrder:
                           flat_noise_target=0.02, max_win_flat=601,
                           DEBUG_PLOTS=False):
         """`gain` in e-/ADU and `read_noise` in e- are only used by the
-        fallback in the science-error branch; the real propagation happens in
-        `extract_variance_along_order`, which sees the raw frame. Both should
-        come from the frame header (GAIN, READNOIS), not from a default."""
+        fallback in the science-error branch; the real propagation happens
+        in `extract_variance_along_order`, which sees the raw frame."""
 
         DEBUG_PLOTS = False
 
@@ -367,21 +311,12 @@ class SpectralOrder:
             plt.show()
 
         if self.flat is not None:
-            # Measured scatter, not sqrt(counts): the flat is averaged over a
-            # night, over the aperture and by this filter, so Poisson noise
-            # overstates it 38x in the blue.
             norm_flat = median_filter(self.flat, size=med_win_size)
             resid = self.flat - norm_flat
             flat_sigma = 1.4826 * np.median(np.abs(resid - np.median(resid)))
             if not np.isfinite(flat_sigma) or flat_sigma <= 0:
                 flat_sigma = 0.0
 
-            # Widen the filter where the lamp is faint. In the bluest orders
-            # the flat holds under a count per pixel, so at the default width
-            # its own noise (35%) exceeds the star's (3-8%) and the division
-            # injects the structure it is meant to remove. The width needed to
-            # get the flat's noise below `flat_noise_target` goes as (S/N)^-2:
-            # ~550 px at 0.7 counts, 43 px by 3.7 counts, the default in the red.
             level = float(np.median(norm_flat))
             if flat_sigma > 0 and level > 0:
                 want = (1.253 * flat_sigma / (flat_noise_target * level)) ** 2
@@ -392,35 +327,13 @@ class SpectralOrder:
             self.flat = norm_flat
 
         if (self.science is not None) and (self.flat is not None):
-            # The flat is the divisor, so where it holds few counts the
-            # quotient is poorly determined however bright the star is.
             with np.errstate(divide="ignore", invalid="ignore"):
                 if self.science_var is not None:
                     var_sci = np.asarray(self.science_var, dtype=float)
                 else:
-                    # No raw frame was handed to `extract_variance_along_order`
-                    # (calibration-only paths, or a caller that predates it).
-                    # Fall back to shot noise on the extracted counts, which is
-                    # the right shape even if the scale is approximate.
                     var_sci = np.abs(self.science) / gain \
                         + (read_noise / gain) ** 2
-                # Not the noise of the divisor. The science is divided by the
-                # *median-filtered* flat, so the flat's structure on scales
-                # shorter than the filter is never corrected and stays in the
-                # spectrum: `flat_sigma` is the size of what is left behind,
-                # and that is what this term carries. (Read as divisor noise it
-                # would be too big by sqrt(med_win_size) -- the median of 25
-                # pixels is far better determined than one pixel.)
-                #
-                # On a bright star this dominates the science shot noise about
-                # thirty to one, so the error bars are set by the flat, not by
-                # photon statistics. Measured against the scatter of a
-                # line-free continuum on alp Cyg the total still comes out
-                # about 2x small, so treat the absolute scale as provisional;
-                # it wants calibrating on a clean-continuum star.
                 var_flat = np.full_like(norm_flat, flat_sigma ** 2)
-                # a zero in the flat gives 0/0 -> nan, which `fill_nan` would
-                # later interpolate over as if it were data
                 ratio = np.divide(self.science, norm_flat,
                                   out=np.full_like(norm_flat, np.inf),
                                   where=norm_flat != 0)
@@ -442,8 +355,6 @@ class SpectralOrder:
             self.comparison_orig = fill_nan(self.comparison_orig)
 
             self.comparison -= minimum_filter(self.comparison, size=min_win_size)
-            # Never 0/0: across a lineless stretch the running min equals the
-            # running max, and `fill_nan` would interpolate the nans as data.
             peak = maximum_filter(self.comparison, size=max_win_size)
             noise = np.median(np.abs(self.comparison))
             if not np.isfinite(noise) or noise <= 0:
@@ -456,9 +367,7 @@ class SpectralOrder:
             self.comparison = fill_nan(self.comparison)
 
 def extract_order(o_args):
-    """Pool worker. The detector frames come from the shared worker payload
-    (keys "spectrum", "flats", "biases", "comps") so that they are not
-    re-pickled for every order."""
+    """Pool worker."""
     o, times_sigma = o_args
     spectrum, flats = shared("spectrum"), shared("flats")
     biases, comps = shared("biases"), shared("comps")
@@ -468,19 +377,12 @@ def extract_order(o_args):
     o.extract_along_order(flats, "flat", times_sigma=times_sigma)
     o.extract_along_order(biases, "bias", times_sigma=times_sigma)
     o.extract_along_order(comps, "comp", times_sigma=times_sigma)
-    # from the frame as read off the detector, so that the shot noise of the
-    # scattered light that was subtracted out is still counted
     raw = shared("spectrum_raw", None)
     if raw is not None:
         o.extract_variance_along_order(raw, biases, gain, read_noise,
                                        times_sigma=times_sigma)
     o.apply_corrections(comparison=True, gain=gain, read_noise=read_noise,
                         DEBUG_PLOTS=False)
-    # o.plot_frame_1d("science")
-    # o.plot_frame_1d("flat")
-    # o.plot_frame_1d("bias")
-    # o.plot_frame_1d("comp")
-    # o.plot_frame_1d("comp_orig")
     return o
 
 def extract_order_for_calib(args):

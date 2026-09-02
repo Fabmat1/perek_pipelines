@@ -1,28 +1,10 @@
-"""Keep every order consistent with the grating equation.
-
-Each order's dispersion relation is fitted on its own, so nothing stops one of
-them drifting -- and the sparsest carry only about a dozen lines against a
-four-parameter cubic, which is little constraint. But the spectrograph ties them
-together: for an echelle `m * lambda` and `m^2 * dispersion` are both smooth,
-low-order functions of the order number, holding to about one part in 10^4
-across all 52 orders.
-
-An order that disagrees with its neighbours by more than a few times that
-scatter is not measuring the instrument, it is fitting its own noise. Its scale
-and zero point are then replaced by what the other orders predict, keeping
-whatever curvature its own fit found.
-"""
+"""Keep every order consistent with the grating equation."""
 import numpy as np
 
-#: Physical order numbers reachable by an echelle: outside this range a
-#: neighbour-spacing estimate is measuring something other than two adjacent
-#: orders. The OES runs m = 40-93 on the two bundled reference lists.
+#: order numbers an echelle can reach; the OES runs m = 40-93
 M_MIN, M_MAX = 10.0, 300.0
 
-#: `K/lambda` has to land this close to an integer for the order to be placed.
-#: On the bundled reference lists the worst of the 103 orders misses by 0.02,
-#: so this is a factor of ten of headroom -- and an order that misses by more
-#: than this cannot be called one order rather than its neighbour anyway.
+#: how close K/lambda must land to an integer to place an order
 M_TOLERANCE = 0.25
 
 #: fewest orders the invariant can be measured from
@@ -30,12 +12,7 @@ MIN_FOR_INVARIANT = 4
 
 
 def fit_grating(order_numbers, centre_wavelengths, dispersions):
-    """Model `m*lambda` and `m^2*dispersion` against order number.
-
-    Both are nearly constant, so a quadratic in `m` absorbs the residual trend
-    and extrapolates a few orders safely. Returns the two coefficient sets and
-    the scatter of each, which set the tolerances used later.
-    """
+    """Model `m*lambda` and `m^2*dispersion` against order number."""
     m = np.asarray(order_numbers, float)
     wc = np.asarray(centre_wavelengths, float)
     disp = np.asarray(dispersions, float)
@@ -51,14 +28,7 @@ def fit_grating(order_numbers, centre_wavelengths, dispersions):
 
 
 def invariant(centre_wavelengths):
-    """The echelle invariant `K = m*lambda`, from the order spacing alone.
-
-    For adjacent orders `m1*lam1 = (m1-1)*lam2`, so `m1 = lam2/(lam2 - lam1)`
-    with no integer search and no assumption about where the block starts.
-    Taken as a median over every adjacent pair, because a pair is only wrong
-    if one of its two members is: a few diverged orders, or a few missing
-    ones, cannot move it. Returns NaN if it cannot be measured.
-    """
+    """The echelle invariant `K = m*lambda`, from the order spacing alone."""
     lam = np.sort(np.asarray(centre_wavelengths, float))
     if lam.size < MIN_FOR_INVARIANT:
         return np.nan
@@ -71,24 +41,7 @@ def invariant(centre_wavelengths):
 
 
 def order_numbers(centre_wavelengths, valid=None, tol=M_TOLERANCE):
-    """Physical order numbers, from the assignment that makes m*lambda flat.
-
-    Returns a float array in input order, NaN for any order whose m could not
-    be established -- which the caller must not guess at.
-
-    `m` is read off each order's own wavelength as `m = K/lambda`, not from its
-    rank in the sorted list. Rank is wrong in two situations that both turn up
-    on ordinary nights. An order whose fit diverged takes a rank it does not
-    own, shifting every order on one side of it by one; and an order that
-    failed to solve is absent from the list altogether, so a consecutive run of
-    m steps straight over the gap. Neither is visible afterwards, because the
-    whole block shifts together and `m*lambda` stays as smooth as it ever was.
-
-    A single runaway order is also enough to wreck the scale if it is allowed
-    to vote -- a fit that has diverged can report a central wavelength of
-    10^7 A -- so K comes from a median over pairs rather than a fit to all of
-    them, and `valid` can exclude known-bad orders from setting it.
-    """
+    """Physical order numbers, from the assignment that makes m*lambda flat."""
     wc = np.asarray(centre_wavelengths, float)
     out = np.full(wc.shape, np.nan)
 
@@ -114,26 +67,7 @@ def order_numbers(centre_wavelengths, valid=None, tol=M_TOLERANCE):
 def enforce_invariant(orders, thar=None, verbose=False, tol=5.0,
                       min_orders=12, max_nonmonotonic=0.02):
     """Check every solved order against the grating relation, and refit strays.
-
-    Each order is fitted on its own, so nothing stops one of them drifting --
-    and the sparsest carry only thirteen lines against a four-parameter cubic,
-    which is little constraint. But the spectrograph ties them together:
-    `m*lambda` and `m^2*dispersion` are both smooth, low-order functions of the
-    order number, measured here to about one part in 10^4 across 52 orders.
-
-    An order that disagrees with its neighbours by more than `tol` times that
-    scatter is not measuring the instrument, it is fitting its own noise. Such
-    an order has its wavelength scale replaced by the grating prediction,
-    keeping whatever curvature its own fit found but restoring the scale and
-    zero point the other fifty orders agree on.
-
-    Every order also gets a `dispersion_ok` flag from a monotonicity test. A
-    relation that reverses inside the detector has the wrong shape rather than
-    the wrong scale, so rescaling cannot repair it; `max_nonmonotonic` is the
-    tolerated fraction of steps running against the trend.
-
-    Returns the number of orders corrected.
-    """
+"""
     good = [o for o in orders if getattr(o, "wl", None) is not None]
     if len(good) < min_orders:
         return 0
@@ -142,10 +76,6 @@ def enforce_invariant(orders, thar=None, verbose=False, tol=5.0,
     disp = np.array([float(np.median(np.diff(o.wl))) for o in good])
     m = order_numbers(wc)
 
-    # The model has to be built from the orders that agree with each other. A
-    # diverged fit -- ten seed lines against a four-parameter cubic is enough
-    # to allow one -- would otherwise set the very scale it is then tested
-    # against, and the check would pass it.
     mw = m * wc
     med = np.median(mw)
     mad = np.median(np.abs(mw - med)) * 1.4826
@@ -159,10 +89,6 @@ def enforce_invariant(orders, thar=None, verbose=False, tol=5.0,
 
     resid = m * wc - np.polyval(model["p_wl"], m)
 
-    # A cubic through a dozen lines can fold inside the detector. Such an
-    # order still has a normal *median* dispersion, so the m^2*dispersion test
-    # above passes it; only the sign changes reveal it. Rescaling cannot help,
-    # so mark it and let the merge drop it.
     nonmono = []
     for o in good:
         wl = np.asarray(getattr(o, "wl", None), float)
@@ -181,12 +107,6 @@ def enforce_invariant(orders, thar=None, verbose=False, tol=5.0,
         for oid, fw, span in nonmono:
             print("- order %s dispersion is not monotonic (%.0f%% of steps run "
                   "the wrong way, span %.0f A): excluded" % (oid, 100 * fw, span))
-    # Floor the scale. `scatter_wl` says how well a quadratic describes the
-    # orders it was fitted to, and on a good night that can be well under an
-    # Angstrom-order -- which would make this check fire on differences far
-    # below the accuracy of the wavelength solution itself. A real order is not
-    # located better than a few tenths of an Angstrom, so do not pretend to
-    # test it more tightly than that.
     scale = max(model["scatter_wl"], 0.2 * float(np.nanmedian(m)))
     if not np.isfinite(scale) or scale <= 0:
         return 0
@@ -195,10 +115,6 @@ def enforce_invariant(orders, thar=None, verbose=False, tol=5.0,
     unplaced = []
     for o, mm, r in zip(good, m, resid):
         if not np.isfinite(mm):
-            # Its centre does not sit where any order's does, so there is no
-            # saying which order to restore it to. Guessing is what seeding an
-            # unsolved order from its neighbours tried and lost on: one order
-            # out is ~10 A at the red end and still looks entirely plausible.
             o.dispersion_ok = False
             unplaced.append(o.id)
             continue

@@ -1,20 +1,6 @@
-"""Reduce one or more nights of Perek echelle data.
-
-By default this reduces the example night bundled with the repository, so it
-can be run without any arguments:
-
-    python template.py
-
-To reduce your own data, point it at the directories holding the FITS frames:
-
-    python template.py /path/to/20250903
-    python template.py 20250903 20250904 20251003 --ncpu 7
-    python template.py 20250903 --science e202509030022 --plot
-"""
+"""Reduce one or more nights of Perek echelle data."""
 import os
 
-# OpenBLAS/MKL/Accelerate read these once, at numpy import time, and otherwise
-# start a thread per core underneath each of our worker processes.
 for _var in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS",
              "NUMEXPR_NUM_THREADS", "VECLIB_MAXIMUM_THREADS"):
     os.environ.setdefault(_var, "1")
@@ -33,7 +19,7 @@ from resample_backend import BACKEND
 from calibrate import load_thar_list
 from tools import set_ncpu, get_ncpu
 from paths import (DEFAULT_IDCOMP_DIR, DEFAULT_THAR_LIST, DEFAULT_DATA_DIR,
-                   MURPHY_THAR_LIST)
+                   MURPHY_THAR_LIST, select_idcomp_dir)
 
 
 def parse_args(argv=None):
@@ -49,9 +35,13 @@ def parse_args(argv=None):
     p.add_argument("-s", "--science", default=None, metavar="NAME",
                    help="only reduce science frames whose filename contains "
                         "NAME (default: all of them)")
-    p.add_argument("--idcomp-dir", default=DEFAULT_IDCOMP_DIR,
-                   help="directory with idcomp line identifications "
-                        "(default: the bundled idcomp_2307)")
+    p.add_argument("--idcomp-dir", default="auto",
+                   help="directory with idcomp line identifications, or "
+                        "\"auto\" to pick the bundled set that matches the "
+                        "night's date. The sets are not interchangeable: the "
+                        "wrong one shifts the whole wavelength scale by tens "
+                        "of km/s without failing or warning "
+                        "(default: %(default)s)")
     p.add_argument("--idcomp-offset", default="auto", metavar="PX",
                    help="cross-dispersion shift in pixels between the idcomp "
                         "reference and this night; \"auto\" measures it from "
@@ -67,8 +57,6 @@ def parse_args(argv=None):
                         "the blue cutoff is set by the best frame, the rest "
                         "guard against cosmics and a bad pick "
                         "(default: %(default)s)")
-    # takes a value always: an optional-argument form (nargs="?"/"*") is
-    # ambiguous against the data_dir positionals, which eat the value
     p.add_argument("--thar-list", default=None, metavar="LIST",
                    help='refine the wavelength solution against ThAr line '
                         'lists. Requires a value: "both" (or "lovis,murphy") '
@@ -106,12 +94,10 @@ def main(argv=None):
     args = parse_args(argv)
 
     data_dirs = args.data_dir or [DEFAULT_DATA_DIR]
-    # check every night up front: a typo in the last one should not surface
-    # an hour into the run
     for d in data_dirs:
         if not os.path.isdir(d):
             sys.exit("data directory does not exist: %s" % d)
-    if not os.path.isdir(args.idcomp_dir):
+    if args.idcomp_dir != "auto" and not os.path.isdir(args.idcomp_dir):
         sys.exit("idcomp directory does not exist: %s" % args.idcomp_dir)
 
     frame_for_slice = args.frame_for_slice
@@ -152,7 +138,10 @@ def main(argv=None):
     for d in data_dirs:
         if len(data_dirs) > 1:
             print("> night %s" % d.rstrip(os.sep))
-        reduce_night(d, args.idcomp_dir,
+        idcomp_dir = args.idcomp_dir
+        if idcomp_dir == "auto":
+            idcomp_dir = idcomp_dir_for_night(d, verbose=args.verbose)
+        reduce_night(d, idcomp_dir,
                      fn_science=args.science,
                      idcomp_offset=idcomp_offset,
                      frame_for_slice=frame_for_slice,
@@ -169,14 +158,37 @@ def main(argv=None):
                      fatal_if_empty=len(data_dirs) == 1)
 
 
-def output_stem(frame, object_name):
-    """Filename stem for one reduced frame: ``<frame>_<object>``.
+def night_date(dir):
+    """DATE-OBS of the night, taken from the first frame that carries one."""
+    for file in sorted(os.listdir(dir)):
+        if not file.endswith(".fit"):
+            continue
+        try:
+            with fits.open(os.path.join(dir, file)) as hdul:
+                date_obs = hdul[0].header.get("DATE-OBS")
+        except Exception:
+            continue
+        if date_obs:
+            return str(date_obs)
+    return None
 
-    OBJECT comes straight off the telescope and is unconstrained ("* psi cyg",
-    "HD  26764"), so the whole stem is sanitised: an asterisk in a filename is
-    a glob wildcard to every shell that reads the spectra back, and is not a
-    legal filename on Windows at all.
-    """
+
+def idcomp_dir_for_night(dir, verbose=True):
+    """Resolve --idcomp-dir auto for one night."""
+    date_obs = night_date(dir)
+    if date_obs is None:
+        if verbose:
+            print("- no DATE-OBS in %s; using the default idcomp set" % dir)
+        return DEFAULT_IDCOMP_DIR
+    chosen = select_idcomp_dir(date_obs)
+    if verbose:
+        print("- idcomp set for %s: %s" % (date_obs[:10],
+                                           os.path.basename(chosen)))
+    return chosen
+
+
+def output_stem(frame, object_name):
+    """Filename stem for one reduced frame:"""
     stem = re.sub(r"\.fit$", "", frame) + "_" + object_name
     stem = re.sub(r"[^\w.+-]", "_", stem)
     return re.sub(r"_+", "_", stem).strip("_")
@@ -203,15 +215,10 @@ def reduce_night(dir, idcomp_dir, fn_science=None,
 
     science = []
     scname = []
-    # every science frame of the night, whether or not --science selected it:
-    # the orders are traced on the frames with the most blue signal, and that
-    # is a property of the night, not of the frame being reduced
     all_science = []
 
     for file in sorted(os.listdir(dir)):
         if file.endswith(".fit"):
-            # read eagerly and close: astropy memory-maps by default, and a
-            # full night of frames would keep every file handle open
             with fits.open(os.path.join(dir, file)) as hdul:
                 header = dict(hdul[0].header)
                 ftype = header["OBJECT"]
@@ -233,8 +240,6 @@ def reduce_night(dir, idcomp_dir, fn_science=None,
             msg = "did not find %s in %s" % (fn_science, dir)
         else:
             msg = "no science frames found in %s" % dir
-        # with several nights queued, an empty one is skipped rather than
-        # taking the others down with it
         if fatal_if_empty:
             sys.exit(msg)
         print("> skipping %s: %s" % (dir, msg))
@@ -242,8 +247,6 @@ def reduce_night(dir, idcomp_dir, fn_science=None,
 
     os.makedirs(outdir, exist_ok=True)
 
-    # Resolve "auto" once: the trace frames describe the night, so choosing
-    # them per science frame would only repeat the same measurement.
     trace_frames = None
     if frame_for_slice == "auto":
         bias_ref = np.median(biases, axis=0) if len(biases) else None
@@ -254,8 +257,6 @@ def reduce_night(dir, idcomp_dir, fn_science=None,
             bias=bias_ref, nstack=trace_stack, verbose=verbose,
             flat=flat_ref)
         if not trace_frames:
-            # nothing scorable: fall back to the flat, which is what
-            # find_orders uses when it is handed nothing
             if verbose:
                 print("- no usable science frame to trace on; using the flat")
             trace_frames = None
@@ -308,10 +309,6 @@ def reduce_night(dir, idcomp_dir, fn_science=None,
                 if s["bjd"] is not None:
                     header["BJD"] = (s["bjd"],
                                      "Barycentric JD (TDB), exposure midpoint")
-                # BARYCORR is the echelle (.ech) name for this quantity. There
-                # it is the correction still *to be* applied to an observatory
-                # frame wavelength scale, so BARYAPPL says whether ours already
-                # carries it
                 if s.get("barycorr") is not None:
                     header["BARYCORR"] = (s["barycorr"],
                                           "Barycentric RV correction [km/s]")

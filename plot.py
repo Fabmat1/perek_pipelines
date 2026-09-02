@@ -9,25 +9,8 @@ from astropy.coordinates import SkyCoord
 import astropy.units as u
 
 def group_close_stars_with_bjd(fps, max_sep_arcsec=30):
-    """
-    Read RA/Dec and BJD from a list of FITS files and group stars closer than max_sep_arcsec.
-    
-    Parameters
-    ----------
-    fps : list of str
-        List of FITS file paths.
-    max_sep_arcsec : float
-        Maximum separation in arcseconds to consider stars as a group.
-    
-    Returns
-    -------
-    groups : list of dict
-        Each dict has keys:
-            'files' : list of FITS file paths in the group
-            'bjds'  : list of BJD values corresponding to the files
-    coords : SkyCoord
-        SkyCoord object of all stars.
-    """
+    """Read RA/Dec and BJD from a list of FITS files and group stars closer
+    than max_sep_arcsec."""
     coords_list = []
     files_list = []
     bjds_list = []
@@ -132,17 +115,12 @@ def main():
 
     fps = args.files
     show_plots = not args.no_plots
-    # an existing path wins over pattern expansion: older reductions wrote the
-    # OBJECT name into the filename unsanitised, so "e202608290033_*_psi_cyg
-    # .fits" is a real file rather than a pattern
     if os.path.exists(fps):
         fps = [fps]
     else:
         fps = sorted(glob(fps))
     print(fps)
 
-#    groups, coords = group_close_stars_with_bjd(fps, max_sep_arcsec=30)
-#    for g in groups: print(g)
 
     for fp in fps:
         if "fits" in fp:
