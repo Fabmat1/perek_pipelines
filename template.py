@@ -1,24 +1,20 @@
-"""Reduce a night of Perek echelle data.
+"""Reduce one or more nights of Perek echelle data.
 
 By default this reduces the example night bundled with the repository, so it
 can be run without any arguments:
 
     python template.py
 
-To reduce your own data, point it at the directory holding the FITS frames:
+To reduce your own data, point it at the directories holding the FITS frames:
 
     python template.py /path/to/20250903
+    python template.py 20250903 20250904 20251003 --ncpu 7
     python template.py 20250903 --science e202509030022 --plot
 """
 import os
 
-# Pin the linear-algebra libraries to a single thread. This has to happen
-# before numpy is imported: OpenBLAS, MKL and Accelerate read these variables
-# once, at load time, and otherwise each starts a thread per core. That nests
-# underneath our own process pool -- ncpu workers times one thread per core
-# each -- and the threads then contend rather than compute. The names cover the
-# backends numpy is built against on Linux, macOS and Windows; setting one that
-# does not apply is harmless.
+# OpenBLAS/MKL/Accelerate read these once, at numpy import time, and otherwise
+# start a thread per core underneath each of our worker processes.
 for _var in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS",
              "NUMEXPR_NUM_THREADS", "VECLIB_MAXIMUM_THREADS"):
     os.environ.setdefault(_var, "1")
@@ -44,8 +40,9 @@ def parse_args(argv=None):
     p = argparse.ArgumentParser(
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("data_dir", nargs="?", default=DEFAULT_DATA_DIR,
-                   help="directory with the .fit frames of one night "
+    p.add_argument("data_dir", nargs="*", default=[DEFAULT_DATA_DIR],
+                   help="one or more directories with the .fit frames, one "
+                        "per night; they are reduced one after another "
                         "(default: the bundled example night)")
     p.add_argument("-o", "--outdir", default="done",
                    help="where to write reduced spectra (default: %(default)s)")
@@ -70,9 +67,8 @@ def parse_args(argv=None):
                         "the blue cutoff is set by the best frame, the rest "
                         "guard against cosmics and a bad pick "
                         "(default: %(default)s)")
-    # takes a value always, and a comma-separated one for several lists:
-    # an optional-argument form (nargs="?"/"*") is ambiguous against the
-    # positional data_dir, which argparse resolves by eating the directory
+    # takes a value always: an optional-argument form (nargs="?"/"*") is
+    # ambiguous against the data_dir positionals, which eat the value
     p.add_argument("--thar-list", default=None, metavar="LIST",
                    help='refine the wavelength solution against ThAr line '
                         'lists. Requires a value: "both" (or "lovis,murphy") '
@@ -109,8 +105,12 @@ def parse_args(argv=None):
 def main(argv=None):
     args = parse_args(argv)
 
-    if not os.path.isdir(args.data_dir):
-        sys.exit("data directory does not exist: %s" % args.data_dir)
+    data_dirs = args.data_dir or [DEFAULT_DATA_DIR]
+    # check every night up front: a typo in the last one should not surface
+    # an hour into the run
+    for d in data_dirs:
+        if not os.path.isdir(d):
+            sys.exit("data directory does not exist: %s" % d)
     if not os.path.isdir(args.idcomp_dir):
         sys.exit("idcomp directory does not exist: %s" % args.idcomp_dir)
 
@@ -149,33 +149,33 @@ def main(argv=None):
         except ValueError:
             sys.exit('--idcomp-offset must be a number or "auto"')
 
-    reduce_night(args.data_dir, args.idcomp_dir,
-                 fn_science=args.science,
-                 idcomp_offset=idcomp_offset,
-                 frame_for_slice=frame_for_slice,
-                 trace_stack=args.trace_stack,
-                 outdir=args.outdir,
-                 normalize=args.normalize,
-                 remove_scattered=args.remove_scattered,
-                 verbose=args.verbose,
-                 save_as_fits=args.save_as_fits,
-                 save_as_ascii=args.save_as_ascii,
-                 thar_list=thar_list,
-                 plot_spectra=args.plot_spectra,
-                 DEBUG_PLOTS=args.DEBUG_PLOTS)
+    for d in data_dirs:
+        if len(data_dirs) > 1:
+            print("> night %s" % d.rstrip(os.sep))
+        reduce_night(d, args.idcomp_dir,
+                     fn_science=args.science,
+                     idcomp_offset=idcomp_offset,
+                     frame_for_slice=frame_for_slice,
+                     trace_stack=args.trace_stack,
+                     outdir=args.outdir,
+                     normalize=args.normalize,
+                     remove_scattered=args.remove_scattered,
+                     verbose=args.verbose,
+                     save_as_fits=args.save_as_fits,
+                     save_as_ascii=args.save_as_ascii,
+                     thar_list=thar_list,
+                     plot_spectra=args.plot_spectra,
+                     DEBUG_PLOTS=args.DEBUG_PLOTS,
+                     fatal_if_empty=len(data_dirs) == 1)
 
 
 def output_stem(frame, object_name):
     """Filename stem for one reduced frame: ``<frame>_<object>``.
 
-    OBJECT comes straight off the telescope and is not constrained to
-    anything: "* psi cyg", "V* BP Boo" and "HD  26764" are all real values in
-    these frames. The whole stem is sanitised, not just the frame name, because
-    an asterisk that reaches the filename is a glob wildcard to every shell and
-    tool that reads the spectra back -- ``plot.py 'done/e..._* psi_cyg.fits'``
-    expands to something else entirely -- and is not a legal filename on
-    Windows at all. Runs of replacements collapse to a single "_" so the names
-    stay readable.
+    OBJECT comes straight off the telescope and is unconstrained ("* psi cyg",
+    "HD  26764"), so the whole stem is sanitised: an asterisk in a filename is
+    a glob wildcard to every shell that reads the spectra back, and is not a
+    legal filename on Windows at all.
     """
     stem = re.sub(r"\.fit$", "", frame) + "_" + object_name
     stem = re.sub(r"[^\w.+-]", "_", stem)
@@ -194,7 +194,8 @@ def reduce_night(dir, idcomp_dir, fn_science=None,
                  save_as_fits=True,
                  save_as_ascii=True,
                  plot_spectra=False,
-                 DEBUG_PLOTS=False):
+                 DEBUG_PLOTS=False,
+                 fatal_if_empty=True):
 
     flats = []
     biases = []
@@ -209,8 +210,8 @@ def reduce_night(dir, idcomp_dir, fn_science=None,
 
     for file in sorted(os.listdir(dir)):
         if file.endswith(".fit"):
-            # read eagerly and close: astropy memory-maps by default, and a full
-            # night of frames would otherwise keep every file handle open
+            # read eagerly and close: astropy memory-maps by default, and a
+            # full night of frames would keep every file handle open
             with fits.open(os.path.join(dir, file)) as hdul:
                 header = dict(hdul[0].header)
                 ftype = header["OBJECT"]
@@ -229,8 +230,15 @@ def reduce_night(dir, idcomp_dir, fn_science=None,
 
     if len(science) == 0:
         if fn_science is not None:
-            sys.exit("did not find %s in %s" % (fn_science, dir))
-        sys.exit("no science frames found in %s" % dir)
+            msg = "did not find %s in %s" % (fn_science, dir)
+        else:
+            msg = "no science frames found in %s" % dir
+        # with several nights queued, an empty one is skipped rather than
+        # taking the others down with it
+        if fatal_if_empty:
+            sys.exit(msg)
+        print("> skipping %s: %s" % (dir, msg))
+        return
 
     os.makedirs(outdir, exist_ok=True)
 
@@ -239,17 +247,15 @@ def reduce_night(dir, idcomp_dir, fn_science=None,
     trace_frames = None
     if frame_for_slice == "auto":
         bias_ref = np.median(biases, axis=0) if len(biases) else None
-        # the flat tells blue from red: it falls away towards the blue, so the
-        # faint end of the order block is the one that sets the blue cutoff
+        # the flat tells blue from red: it falls away towards the blue
         flat_ref = np.median(flats, axis=0) if len(flats) else None
         trace_frames = select_trace_frames(
             [os.path.join(dir, sc) for sc in all_science],
             bias=bias_ref, nstack=trace_stack, verbose=verbose,
             flat=flat_ref)
         if not trace_frames:
-            # calibration-only night, or nothing scorable: the flat is the
-            # only thing left to trace on, which is what find_orders uses
-            # when it is handed nothing
+            # nothing scorable: fall back to the flat, which is what
+            # find_orders uses when it is handed nothing
             if verbose:
                 print("- no usable science frame to trace on; using the flat")
             trace_frames = None
@@ -306,7 +312,6 @@ def reduce_night(dir, idcomp_dir, fn_science=None,
                     header["SNR"] = SNR
                 primary_hdu = fits.PrimaryHDU(header=header)
                 fits_cols = [fits.Column(name=key, array=s[key], format='D') for key in s if type(s[key]) == np.ndarray]
-                # the name is always in captials
                 table_hdu = fits.BinTableHDU.from_columns(fits_cols, name="SCIENCE")
                 hdul = fits.HDUList([primary_hdu, table_hdu])
                 hdul.writeto(fp_save_fits, overwrite=True)
