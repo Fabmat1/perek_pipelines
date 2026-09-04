@@ -17,6 +17,7 @@ from tools import shared, publish_shared, polynomial
 import grating
 from template import output_stem
 from paths import select_idcomp_dir
+from blaze_model import blazes_for_orders, residual_continuum
 
 
 def _norm_args(wl, flx, ignore_windows, neighbours=(), extrapolated_out=True):
@@ -85,6 +86,18 @@ def test_interior_ignore_window_never_drops_anything():
 
     halpha = (wl > 6540.0) & (wl < 6590.0)
     assert keep[halpha].all(), "H-alpha was deleted from its own order"
+
+
+def test_an_ignore_window_covering_a_whole_order_drops_it_instead_of_crashing():
+    wl = np.linspace(3876.0, 3941.0, 2000)
+    flx = np.ones_like(wl) * 100.0
+
+    i, norm, cont, keep, _ = normalize_single_order(
+        _norm_args(wl, flx, [(3860.0, 3960.0)]))
+
+    assert not keep.any()
+    # the errors are divided by it, so it still has to be safe
+    assert np.isfinite(cont).all() and (cont != 0).all()
 
 
 def test_extracted_variance_matches_analytic_sum_of_squared_weights():
@@ -790,6 +803,56 @@ def test_dispersion_shifts_returns_nothing_when_no_order_is_measurable():
 
 
 # --------------------------------------------------------------------------
+
+def _blaze_orders(nord=8, npix=600):
+    """Orders on the grating invariant, with bright flats."""
+    wls, flats, sci, ids = [], [], [], []
+    for k in range(nord):
+        m = 40 - k
+        centre = 355800.0 / m
+        wls.append(np.linspace(centre * 0.994, centre * 1.006, npix))
+        flats.append(np.full(npix, 500.0))
+        sci.append(np.full(npix, 100.0))
+        ids.append(k + 1)
+    return wls, flats, sci, ids
+
+
+def test_residual_continuum_is_supplied_for_bright_flat_orders():
+    wls, flats, sci, ids = _blaze_orders()
+    out, applied = blazes_for_orders(wls, flats, sci, ids=ids)
+    assert applied
+    for b in out:
+        if b is None:
+            continue
+        good = b[np.isfinite(b)]
+        # a bright flat records the blaze, so only the mismatch is left
+        assert 0.5 < good.min() and good.max() < 1.5
+
+
+def test_residual_false_restores_the_old_faint_flat_only_behaviour():
+    wls, flats, sci, ids = _blaze_orders()
+    _, applied = blazes_for_orders(wls, flats, sci, ids=ids, residual=False)
+    assert applied == []
+
+
+def test_residual_continuum_declines_across_the_order():
+    wls, _, _, _ = _blaze_orders(nord=1)
+    c = residual_continuum(wls[0], 40, 355800.0)
+    assert c is not None
+    good = c[np.isfinite(c)]
+    assert good[0] > good[-1]
+
+
+def test_residual_continuum_is_not_extrapolated_past_the_measured_phases():
+    wl = np.linspace(9200.0, 9300.0, 600)      # X ~ +1.4, off the end
+    assert residual_continuum(wl, 40, 355800.0) is None
+
+    # an order straddling the edge keeps only the measured part
+    centre = 355800.0 / 40
+    straddle = np.linspace(centre * 0.980, centre * 1.020, 600)
+    c = residual_continuum(straddle, 40, 355800.0)
+    assert c is not None and not np.isfinite(c).all()
+
 
 def _main():
     tests = [(n, f) for n, f in sorted(globals().items())

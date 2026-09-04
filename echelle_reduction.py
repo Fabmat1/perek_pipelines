@@ -244,6 +244,12 @@ def normalize_single_order(args):
         else:
             mask = mask & good_blaze
 
+    # an ignore window wider than the order leaves nothing to fit; blue orders
+    # are only ~65 A, narrower than an A star's Balmer wings
+    if mask.sum() < poly_order + 2:
+        return (i, np.full_like(flx, np.nan), np.ones_like(flx),
+                np.zeros(len(flx), dtype=bool), None)
+
     fit_flx = flx if blaze is None else np.divide(
         flx, blaze, out=np.full_like(flx, np.nan),
         where=np.isfinite(blaze) & (blaze > 0))
@@ -739,7 +745,8 @@ def merge_orders(olist: list[SpectralOrder], normalize=True, margin=2, max_wl=89
             from blaze_model import blazes_for_orders
             blazes, applied = blazes_for_orders(wave, flat, flux, ids=oids)
             if verbose and applied:
-                print(f"- blaze model supplied for orders {applied}")
+                print(f"- blaze model supplied for {len(applied)} of "
+                      f"{len(wave)} orders")
             if not applied:
                 blazes = None
         except Exception as exc:            # never fail a reduction over this
